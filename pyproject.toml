@@ -1,0 +1,17 @@
+[project]
+name = "mho-model-harness-optimization"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "harbor[modal]",
+  "terminal-bench==0.2.18",
+  "litellm",
+  "python-dotenv",
+  "pyyaml",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+harbor = { git = "https://github.com/harbor-framework/harbor.git", rev = "c178c20710c362ef806c5d5d18852f95b21ca34b" }
