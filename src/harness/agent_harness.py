@@ -17,7 +17,7 @@ config/mini.yaml, tools/, agents/default.py), which the meta-loop mutates. This 
 pure plumbing and is identical for every candidate.
 
 Run it:
-    harbor run --agent harness.harbor_run:AgentHarness \
+    harbor run --agent src.harness.agent_harness:AgentHarness \
         --ak mini_fork_local=runs/run_<id>/candidate_<id>/micro-swe-agent -d terminal-bench@2.0 ...
     # or set MICRO_SCAFFOLD_DIR in the env instead of --ak mini_fork_local=...
 """
