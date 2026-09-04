@@ -52,6 +52,11 @@ INFERENCE_ENGINE_TP="${INFERENCE_ENGINE_TP:-2}"
 # Colocated with Megatron training on the same GPUs, so vLLM must leave headroom
 # for policy weights/optimizer/activations -- 0.8 OOMs the engine core at startup.
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.4}"
+# Skip vLLM torch.compile + CUDA-graph capture. The Qwen3.5 compile path on this
+# cu13/torch-2.11/vLLM-0.28 stack segfaults the engine core during profile_run
+# (this is the instability the original DAPO recipe's enforce_eager guarded against).
+# NOTE: SkyRL force-disables this when LoRA weight sync is active (config.py ~1767).
+ENFORCE_EAGER="${ENFORCE_EAGER:-true}"
 
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
@@ -109,6 +114,7 @@ singularity exec --nv --writable-tmpfs \
                 generator.inference_engine.num_engines=${NUM_INFERENCE_ENGINES} \
                 generator.inference_engine.tensor_parallel_size=${INFERENCE_ENGINE_TP} \
                 generator.inference_engine.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION} \
+                generator.inference_engine.enforce_eager=${ENFORCE_EAGER} \
                 generator.inference_engine.served_model_name=${SERVED_MODEL_NAME} \
                 generator.batched=true \
                 generator.apply_overlong_filtering=${APPLY_OVERLONG_FILTERING} \
