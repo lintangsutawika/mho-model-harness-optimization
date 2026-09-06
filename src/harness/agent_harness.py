@@ -25,6 +25,9 @@ Run it:
 from __future__ import annotations
 
 import os
+import tarfile
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -58,8 +61,31 @@ class AgentHarness(MiniSweAgent):
         if not (src / "pyproject.toml").exists():
             raise FileNotFoundError(f"scaffold {src} is not an installable package (no pyproject.toml)")
 
-        # Copy the candidate code into the sandbox.
-        await environment.upload_dir(src, _SCAFFOLD_SANDBOX_DIR)
+        # Ship the candidate into the sandbox as a single tarball rather than
+        # environment.upload_dir() (which stages via copytree + a two-`cp` merge and
+        # races under concurrent trials). The sandbox's writable-tmpfs is fuse-overlayfs,
+        # which is unreliable for filesystem MUTATIONS under concurrent load: a fresh
+        # `mkdir` can be momentarily invisible ("tar: <dir>: Cannot open"), and `rm -rf`
+        # spuriously fails ("rm: cannot remove '.../models': Is a directory"). So we do
+        # NEITHER: extract to a FRESH, unique dir per install via a single `tar` that
+        # creates the dir itself when extracting into the always-present /tmp. The
+        # sandbox is ephemeral (per-trial, delete=True), so nothing needs cleaning up,
+        # and `uv tool install` below points at this unique dir.
+        _parent = str(Path(_SCAFFOLD_SANDBOX_DIR).parent)          # /tmp
+        _uid = uuid.uuid4().hex
+        _leaf = f"{Path(_SCAFFOLD_SANDBOX_DIR).name}-{_uid}"       # micro-scaffold-<uid>
+        scaffold_dir = f"{_parent}/{_leaf}"                        # /tmp/micro-scaffold-<uid>
+        with tempfile.TemporaryDirectory() as _td:
+            tar_name = f"scaffold-{_uid}.tgz"
+            tar_path = Path(_td) / tar_name
+            with tarfile.open(tar_path, "w:gz") as _tf:
+                _tf.add(src, arcname=_leaf)
+            remote_tar = f"/tmp/{tar_name}"
+            await environment.upload_file(tar_path, remote_tar)
+        await self.exec_as_root(
+            environment,
+            command=f"set -eu; tar xzf {remote_tar} -C {_parent}",
+        )
 
         # Mirror harbor's own mini install (system deps + uv bootstrap), but install from
         # the uploaded snapshot. Same console-script name (`mini-swe-agent`) + the same
@@ -76,7 +102,7 @@ class AgentHarness(MiniSweAgent):
                 "  curl -LsSf https://astral.sh/uv/install.sh | sh; fi && "
                 'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; fi && '
                 'export PATH="$HOME/.local/bin:$PATH" && '
-                f"uv tool install {_SCAFFOLD_SANDBOX_DIR} "
+                f"uv tool install {scaffold_dir} "
                 "--with litellm --with orjson --with fastapi && "
                 "mini-swe-agent --help"
             ),
