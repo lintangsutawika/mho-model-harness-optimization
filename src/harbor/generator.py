@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -264,7 +265,40 @@ class HarborGenerator(GeneratorInterface):
         self._harbor_trial_config_template.setdefault("agent", {})[
             "model_name"
         ] = f"hosted_vllm/{ie_cfg.served_model_name}"
-        self._harbor_trial_config_template["agent"].setdefault("kwargs", {})["api_base"] = f"{self.base_url}/v1"
+        _api_base = f"{self.base_url}/v1"
+        _agent_kwargs_tmpl = self._harbor_trial_config_template["agent"].setdefault("kwargs", {})
+        _agent_kwargs_tmpl["api_base"] = _api_base
+        # MiniSweAgent has no api_base param -- it only derives the litellm base URL
+        # from env vars (OPENAI_BASE_URL/HOSTED_VLLM_API_BASE), which we can't set
+        # statically because the router port is assigned per run. Pass the base URL
+        # (and a placeholder key) straight to litellm via mini-swe-agent's model_kwargs
+        # config (-> `-c model.model_kwargs.api_base=...`), which the hosted_vllm
+        # provider honors. Without it litellm defaults to api.openai.com and 404s.
+        _model_kwargs = (
+            _agent_kwargs_tmpl.setdefault("config", {})
+            .setdefault("model", {})
+            .setdefault("model_kwargs", {})
+        )
+        _model_kwargs.setdefault("api_base", _api_base)
+        _model_kwargs.setdefault("api_key", os.environ.get("MSWEA_API_KEY", "dummy"))
+        # Cap per-call generation. Qwen3.5 is a reasoning model (long <think> blocks) and
+        # the agent sets no max_tokens, so a single completion can run toward max_model_len
+        # (65k) and never finish inside harbor's fixed 600s per-exec HTTP timeout -> the
+        # agent phase times out with an empty transcript. Bound it (override via env).
+        _agent_max_tokens = int(os.environ.get("AGENT_MAX_TOKENS", "32768"))
+        if _agent_max_tokens > 0:
+            _model_kwargs.setdefault("max_tokens", _agent_max_tokens)
+        # Belt-and-suspenders: harbor writes the model_kwargs config into the sandbox
+        # with `mkdir -p /tmp/mswea-config; cat > custom.yaml` and does NOT check the
+        # write succeeded -- when the sandbox's fuse-overlayfs mkdir race hits, the file
+        # is missing, harbor still passes `-c .../custom.yaml`, and the agent runs with
+        # no api_base -> litellm defaults to api.openai.com and 404s (intermittently).
+        # Also deliver the endpoint via env vars that litellm's hosted_vllm provider
+        # reads directly; harbor merges `environment.env` into EVERY sandbox exec
+        # (base.py `_merge_env`), so this path doesn't depend on the config file landing.
+        _env = self._harbor_trial_config_template.setdefault("environment", {}).setdefault("env", {})
+        _env.setdefault("HOSTED_VLLM_API_BASE", _api_base)
+        _env.setdefault("HOSTED_VLLM_API_KEY", os.environ.get("MSWEA_API_KEY", "dummy"))
 
         # Step-wise needs per-turn token IDs and logprobs from vLLM via Harbor.
         agent_kwargs = self._harbor_trial_config_template["agent"]["kwargs"]
