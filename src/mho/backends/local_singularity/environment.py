@@ -1,81 +1,25 @@
-"""Local external sandbox executor for SkyRL HarborGenerator.
+"""Writable-sandbox Singularity backend for harbor trials on this HPC.
 
-Runs as a SEPARATE process on the HPC node (outside the training container).
-Receives a harbor trial config dict over HTTP and runs the full harbor
-``Trial`` (agent + verifier + sandbox) on the host, returning a
-``TrialResult`` JSON. The agent reaches the training container's vLLM endpoint
-via the localhost ``api_base`` carried in the config (training and executor
-share the node).
-
-This is the "Modal-like but local" external backend: SkyRL posts trials here
-instead of running them in-process inside the training container.
-
-Writable-sandbox note: HPC nodes often lack ``user_allow_other`` in
-/etc/fuse.conf, so ``singularity exec --writable-tmpfs <sif>`` silently
-degrades to a read-only rootfs (underlay has no overlayfs) and harbor's
-in-container server cannot create its venv. To sidestep that, the sandbox
-image is extracted to a per-session DIRECTORY with ``singularity build
---sandbox`` and launched with ``--writable <dir>`` -- a plain directory needs
-neither a squashfuse mount nor overlayfs.
-
-Run (on the node; host uv env with `harbor` + the repo's `src/` on PYTHONPATH,
-and this module importable):
-    EXECUTOR_PORT=8900 PYTHONPATH=$REPO/src:$REPO/scripts/executor \
-        uv run --python 3.12 python -m executor_service
+harbor's stock SingularityEnvironment runs `singularity exec --writable-tmpfs <sif>`. On
+nodes without `user_allow_other` in /etc/fuse.conf that silently degrades to a read-only
+rootfs (no overlayfs), so harbor's in-sandbox server can't create its venv. This backend
+instead extracts the image to a per-session DIRECTORY (`singularity build --sandbox`) and
+runs it with `--writable <dir>` (needs neither squashfuse nor overlayfs), by transparently
+rewriting harbor's exec argv. Selected per trial via
+`environment.import_path = mho.backends.local_singularity.environment:WritableSingularityEnvironment`.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-from harbor.models.trial.config import TrialConfig
-from harbor.models.trial.result import TrialResult
-
-# harbor's Trial.create() imports the agent/verifier classes (e.g. harness.agent_harness:*)
-# in THIS process at trial time, so the repo's src/ (and this dir) must be importable no
-# matter the launch cwd/PYTHONPATH. Bootstrap sys.path from this file's location.
-import sys as _sys
-# Force src/ to the FRONT: `python -m` puts the repo ROOT on sys.path[0] (cwd), and the repo
-# root has its OWN `harness/` package (harbor_run/scaffold) that would shadow src/harness/
-# (agent_harness). Must precede the root even when already present, so remove-then-insert.
-_REPO_ROOT = Path(__file__).resolve().parents[2]  # scripts/executor/ -> repo root
-for _extra in (_REPO_ROOT / "scripts" / "executor", _REPO_ROOT / "src"):
-    _extra_s = str(_extra)
-    if _extra.is_dir():
-        while _extra_s in _sys.path:
-            _sys.path.remove(_extra_s)
-        _sys.path.insert(0, _extra_s)
-
-# Startup self-check (prints to the service log): proves whether the agent class is
-# importable in THIS process, so a failing trial's cause is obvious at boot, not per-request.
-try:
-    import importlib as _il
-    _il.import_module("harness.agent_harness")
-    print(f"[executor startup] OK: harness.agent_harness importable | repo={_REPO_ROOT}", flush=True)
-except Exception as _e:  # pragma: no cover
-    print(f"[executor startup] FAIL: harness.agent_harness NOT importable: {_e!r}\n"
-          f"  __file__={__file__}\n  repo={_REPO_ROOT}\n  sys.path={_sys.path}", flush=True)
-from harbor.trial.trial import Trial
 from harbor.environments.singularity.singularity import SingularityEnvironment
 
-log = logging.getLogger("harbor.executor_service")
-logging.basicConfig(level=logging.INFO)
-
-# harbor's mini-swe-agent wrapper resolves the model API key from MSWEA_API_KEY in THIS
-# (executor) process (agents/installed/mini_swe_agent.py: api_key_envs=("MSWEA_API_KEY",))
-# and errors "No API key found ..." if unset. The agent talks to local vLLM, which ignores
-# the value, so default a placeholder here rather than depending on the launch command.
-os.environ.setdefault("MSWEA_API_KEY", "dummy")
-
-app = FastAPI(title="harbor-local-external-executor")
+log = logging.getLogger("mho.backends.local_singularity.environment")
 
 _WRITABLE_REGISTRY: dict[str, Path] = {}
 
@@ -196,47 +140,3 @@ class WritableSingularityEnvironment(SingularityEnvironment):
             sbx = await _extract_writable_sandbox(sif)
             _WRITABLE_REGISTRY[str(sif)] = sbx
         return sif
-
-
-async def _run_trial(config: dict) -> TrialResult:
-    # The executor IS the sandbox host: pin the backend to our writable
-    # singularity environment regardless of what the training-side config said.
-    config = json.loads(json.dumps(config))  # defensively copy
-    env = config.setdefault("environment", {})
-    env["type"] = "singularity"
-    env["import_path"] = "executor_service:WritableSingularityEnvironment"
-    env.pop("mounts", None)
-    config.setdefault("timeout_multiplier", 1.0)
-    trial_config = TrialConfig.model_validate(config)
-    trial = await Trial.create(trial_config)
-    return await trial.run()
-
-
-@app.post("/trial")
-async def post_trial(request: Request) -> JSONResponse:
-    try:
-        config = await request.json()
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
-    try:
-        result = await _run_trial(config)
-        return JSONResponse(json.loads(result.model_dump_json()))
-    except Exception as e:  # noqa: BLE001
-        log.exception("trial failed")
-        return JSONResponse({"error": str(e), "type": type(e).__name__}, status_code=500)
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
-
-
-def main() -> None:
-    import uvicorn
-
-    port = int(os.environ.get("EXECUTOR_PORT", "8900"))
-    uvicorn.run(app, host="127.0.0.1", port=port)
-
-
-if __name__ == "__main__":
-    main()
