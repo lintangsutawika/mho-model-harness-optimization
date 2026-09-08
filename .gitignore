@@ -229,3 +229,7 @@ wandb/
 *.sif
 !scripts/build/
 !scripts/build/**
+
+# session notes (keep local, do not track)
+mho.txt
+notes.md
