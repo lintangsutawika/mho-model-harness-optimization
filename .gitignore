@@ -219,3 +219,13 @@ __marimo__/
 
 # meta-harness candidate snapshots
 runs/
+
+# --- mho: session artifacts / backups / envs (not source) ---
+*.bak
+uv.lock
+trials/
+wandb/
+.venv/
+*.sif
+!scripts/build/
+!scripts/build/**

@@ -55,6 +55,7 @@ def _prompt_text(messages: list) -> str:
 def prepare(
     out_dir: str | Path,
     max_tasks: int | None = None,
+    start: int = 0,
     split: str = "train",
     seed: int = 0,
     dataset_name: str = "BytedTsinghua-SIA/DAPO-Math-17k",
@@ -81,7 +82,7 @@ def prepare(
     ds = load_dataset(dataset_name, split=split)
     if max_tasks is not None:
         rng = __import__("random").Random(seed)
-        ds = ds.shuffle(seed=seed).select(range(min(max_tasks, len(ds))))
+        ds = ds.shuffle(seed=seed).select(range(start, min(start + max_tasks, len(ds))))
 
     n = 0
     for i, row in enumerate(ds):
@@ -160,6 +161,7 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dataset", default="BytedTsinghua-SIA/DAPO-Math-17k")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--start", type=int, default=0, help="row offset into the seed-shuffled split (for disjoint val)")
     args = p.parse_args()
     prepare(
         out_dir=args.out,
@@ -168,4 +170,5 @@ if __name__ == "__main__":
         seed=args.seed,
         dataset_name=args.dataset,
         overwrite=args.overwrite,
+        start=args.start,
     )

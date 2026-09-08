@@ -6,7 +6,7 @@
 #
 # Usage:
 #   scripts/eval/eval_terminal_bench_2.sh [AGENT_IMPORT] [TASK_SET] [RUNS] [N_CONCURRENT] [extra harbor flags...]
-#     AGENT_IMPORT  harbor agent module:Class (default: harness.harbor_run:AgentHarness,
+#     AGENT_IMPORT  harbor agent module:Class (default: harness.agent_harness:AgentHarness,
 #                   which installs the micro snapshot named by MINI_FORK_LOCAL /
 #                   MICRO_SCAFFOLD_DIR -- see harness/scaffold.py)
 #     TASK_SET      full | smoke | <single task id via -i is also fine as an extra flag>
@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-AGENT_IMPORT="${1:-${AGENT_IMPORT:-harness.harbor_run:AgentHarness}}"
+AGENT_IMPORT="${1:-${AGENT_IMPORT:-harness.agent_harness:AgentHarness}}"
 TASK_SET="${2:-${TASK_SET:-full}}"
 RUNS="${3:-${N_ATTEMPTS:-1}}"
 N_CONCURRENT="${4:-${N_CONCURRENT:-16}}"
@@ -35,7 +35,7 @@ EXTRA_FLAGS=("$@")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Make `harness.*` importable by the harbor agent factory (--agent <import path>).
-export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 # Local .env overrides the shell environment (keys, base URLs, Modal tokens).
 if [ -f "${REPO_DIR}/.env" ]; then set -a; . "${REPO_DIR}/.env"; set +a; fi
