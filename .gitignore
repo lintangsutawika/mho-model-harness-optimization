@@ -233,3 +233,6 @@ wandb/
 # session notes (keep local, do not track)
 mho.txt
 notes.md
+
+# build_train.sh-generated def (artifact)
+scripts/build/train-megatron.def
