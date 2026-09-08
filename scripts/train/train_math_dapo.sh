@@ -28,19 +28,23 @@ MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data
 MATH_TRAIN_DIR="${MATH_TRAIN_DIR:-${MATH_DATA_DIR}/train}"
 
 MAX_TRAIN="${MAX_TRAIN:-500}"
+# EVAL_BATCH_SIZE is the number of held-out instances actually evaluated -- it drives the
+# val-set size (below) AND the trainer eval batch, so "10" means 10 instances, not 50 in
+# chunks of 10.
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
 if [ ! -d "$MATH_TRAIN_DIR" ]; then
   # Host-side data prep only needs `datasets`. Use --no-project so uv does NOT resolve
   # this repo's pyproject (its megatron/vllm-router pins are for the SIF and fail to
   # install on a host with a different glibc); --with datasets supplies the one real dep.
-  uv run --no-project --with datasets src/harbor/prepare_math_tasks.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
+  uv run --no-project --with datasets src/mho/prepare_math_tasks.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
 fi
 
-# Held-out eval set: 50 tasks disjoint from train (seed-0 rows 500-549 of DAPO-Math-17k).
-MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test}"
-MAX_VAL="${MAX_VAL:-50}"
+# Held-out eval set = EVAL_BATCH_SIZE instances disjoint from train. The dir is keyed by the
+# count so changing EVAL_BATCH_SIZE regenerates it instead of reusing a stale set.
+MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test_${EVAL_BATCH_SIZE}}"
 if [ ! -d "$MATH_VAL_DIR" ]; then
-  # Disjoint from train: same seed-0 shuffle, rows [MAX_TRAIN, MAX_TRAIN+MAX_VAL).
-  uv run --no-project --with datasets src/harbor/prepare_math_tasks.py --out "$MATH_VAL_DIR" --split train --max-tasks "$MAX_VAL" --start "$MAX_TRAIN"
+  # Rows [MAX_TRAIN, MAX_TRAIN+EVAL_BATCH_SIZE) of the seed-0 shuffle (disjoint from train).
+  uv run --no-project --with datasets src/mho/prepare_math_tasks.py --out "$MATH_VAL_DIR" --split train --max-tasks "$EVAL_BATCH_SIZE" --start "$MAX_TRAIN"
 fi
 
 RUN_ID="${RUN_ID:-math}"
@@ -162,11 +166,10 @@ LR="${LR:-1e-6}"
 EPOCHS="${EPOCHS:-1}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-25}"
 POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-25}"
-EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
-# Pre-train eval gate. Set EVAL_BEFORE_TRAIN=false to skip the (slow) eval-before-train
-# and go straight to the first training step. Shrink it instead with MAX_VAL + EVAL_BATCH_SIZE
-# (e.g. MAX_VAL=10 EVAL_BATCH_SIZE=10). EVAL_INTERVAL controls periodic eval during training.
+# Pre-train eval gate. Set EVAL_BEFORE_TRAIN=false to skip the (slow) eval-before-train and
+# go straight to the first training step. Shrink the eval instead with EVAL_BATCH_SIZE (the
+# number of instances evaluated; defined near MAX_TRAIN). EVAL_INTERVAL = periodic eval steps.
 EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-true}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
 MAX_GENERATE_LENGTH="${MAX_GENERATE_LENGTH:-4096}"
@@ -190,9 +193,37 @@ USE_EXPANDABLE_SEGMENTS="${USE_EXPANDABLE_SEGMENTS:-false}"
 HARBOR_ENV_TYPE="${HARBOR_ENV_TYPE:-singularity}"
 # Local external sandbox executor (Modal-like, but local): when EXECUTOR_URL is
 # set, harbor trials are POSTed to a separate executor process on the node (see
-# scripts/executor/executor_service.py) instead of running in-process. Leave
-# unset to run trials in-process (original behavior).
+# src/mho/backends/local_singularity/service.py) instead of running in-process.
+# Leave unset to run trials in-process (original behavior).
 EXECUTOR_URL="${EXECUTOR_URL:-}"
+
+# When the local_singularity backend is selected, HarborGenerator POSTs each trial to the
+# external executor service, which must be running on THIS node (outside the training SIF)
+# before training starts. (Re)start it here so it always runs the current code; abort if it
+# doesn't come up (training can't proceed without it).
+if [ "${HARBOR_ENV_TYPE}" = "singularity" ] && [ -n "${EXECUTOR_URL}" ]; then
+  EXECUTOR_PYTHON="${EXECUTOR_PYTHON:-/home/aci18914wh/executor_env/.venv/bin/python}"
+  EXECUTOR_LOG="${EXECUTOR_LOG:-${HOME}/executor_svc.log}"
+  EXECUTOR_PORT="${EXECUTOR_PORT:-${EXECUTOR_URL##*:}}"; EXECUTOR_PORT="${EXECUTOR_PORT%%/*}"
+  echo "[executor] (re)starting local_singularity backend on ${EXECUTOR_URL} (log: ${EXECUTOR_LOG})"
+  pkill -9 -f 'mho.backends.local_singularity.service' 2>/dev/null || true
+  pkill -9 -f 'executor_service' 2>/dev/null || true   # legacy name, pre-refactor
+  sleep 2
+  PYTHONPATH="${REPO_DIR}/src" EXECUTOR_PORT="${EXECUTOR_PORT}" \
+    nohup "${EXECUTOR_PYTHON}" -m mho.backends.local_singularity.service \
+    > "${EXECUTOR_LOG}" 2>&1 &
+  for _i in $(seq 1 20); do
+    curl -sf --max-time 2 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  if curl -sf --max-time 3 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1; then
+    echo "[executor] healthy at ${EXECUTOR_URL}"
+    grep '\[executor startup\]' "${EXECUTOR_LOG}" 2>/dev/null | tail -1
+  else
+    echo "[executor] ERROR: did not become healthy; see ${EXECUTOR_LOG}" >&2
+    exit 1
+  fi
+fi
 
 # How the trainer runs INSIDE the SIF -- auto-selected from the image itself, so
 # BASE_SIF is the only knob you need to switch paths:
@@ -223,7 +254,7 @@ singularity exec --nv --writable-tmpfs \
     --env TMPDIR=/tmp_work \
     --env HF_HOME=/root/.cache/huggingface \
     --env CPATH= \
-    --env PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}/scripts/executor" \
+    --env PYTHONPATH="${REPO_DIR}/src" \
     --env MICRO_SCAFFOLD_DIR="${MINI_FORK_LOCAL}" \
     --env MSWEA_API_KEY="${MSWEA_API_KEY:-dummy}" \
     --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-16384}" \
