@@ -7,26 +7,50 @@ cd "$REPO_DIR"
 
 source .env
 
-# USER_DATA is defined in .env (sourced above); fall back only if unset.
+# Two storage roots, both from .env:
+#   BASE_DIR  = ephemeral tmp/cache (/scratch or $PBS_LOCALDIR) -> TMP_DIR / HF_DIR / caches
+#   USER_DATA = persistent run data (/data/user_data/lsutawik/... or /home/aci18914wh/...)
+#               -> data-harbor, runs_output (checkpoints/exports), scaffolds, run.log.
 USER_DATA="${USER_DATA:-/data/user_data/lsutawik}"
 
 UV_CACHE_PERSIST="${UV_CACHE_PERSIST:-${USER_DATA}/uv_cache}"
 mkdir -p "$UV_CACHE_PERSIST"
+
+# Host-writable SIF image cache for the external executor's docker->sif sandbox conversion.
+# PERSISTENT (next to BASE_SIF, not node-local) so a pre-seeded python_3.11-slim.sif -- built
+# from scripts/train/agent_sandbox.def (adds /usr/bin/python3 + tools harbor's bootstrap
+# needs) -- survives across jobs and is reused instead of re-pulling vanilla python:3.11-slim.
+# Passed into the SIF so train_entrypoint writes it into each trial's environment config.
+SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
+mkdir -p "$SIF_IMAGE_CACHE_DIR"
 
 MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data-harbor/DAPO-Math-17k}"
 MATH_TRAIN_DIR="${MATH_TRAIN_DIR:-${MATH_DATA_DIR}/train}"
 
 MAX_TRAIN="${MAX_TRAIN:-500}"
 if [ ! -d "$MATH_TRAIN_DIR" ]; then
-  .venv/bin/python src/harbor/prepare_math_tasks.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
+  # Host-side data prep only needs `datasets`. Use --no-project so uv does NOT resolve
+  # this repo's pyproject (its megatron/vllm-router pins are for the SIF and fail to
+  # install on a host with a different glibc); --with datasets supplies the one real dep.
+  uv run --no-project --with datasets src/harbor/prepare_math_tasks.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
 fi
 
-MATH_VAL_DIR="${MATH_VAL_DIR:-$MATH_TRAIN_DIR}"
+# Held-out eval set: 50 tasks disjoint from train (seed-0 rows 500-549 of DAPO-Math-17k).
+MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test}"
+MAX_VAL="${MAX_VAL:-50}"
+if [ ! -d "$MATH_VAL_DIR" ]; then
+  # Disjoint from train: same seed-0 shuffle, rows [MAX_TRAIN, MAX_TRAIN+MAX_VAL).
+  uv run --no-project --with datasets src/harbor/prepare_math_tasks.py --out "$MATH_VAL_DIR" --split train --max-tasks "$MAX_VAL" --start "$MAX_TRAIN"
+fi
 
 RUN_ID="${RUN_ID:-math}"
 CAND_ID="${CAND_ID:-0}"
 RUNS_ROOT="${RUNS_ROOT:-${USER_DATA}/mho-model-harness-optimization/runs}"
-export MINI_FORK_LOCAL="$RUNS_ROOT/run_${RUN_ID}/candidate_${CAND_ID}/micro-swe-agent"
+# The harness (micro-swe-agent scaffold) deployed into each trial sandbox. Point it at any
+# scaffold dir directly (MINI_FORK_LOCAL=/path/to/micro-swe-agent), or leave it to the
+# RUN_ID/CAND_ID convention below. If the dir is missing it's materialized from
+# MICRO_SCAFFOLD_BASE; if you pass an existing dir, materialize is skipped and it's used as-is.
+export MINI_FORK_LOCAL="${MINI_FORK_LOCAL:-$RUNS_ROOT/run_${RUN_ID}/candidate_${CAND_ID}/micro-swe-agent}"
 if [ ! -d "$MINI_FORK_LOCAL" ]; then
 MICRO_SCAFFOLD_BASE="${MICRO_SCAFFOLD_BASE:-$REPO_DIR/../micro-swe-agent}" \
     PYTHONPATH=src .venv/bin/python -m harness.scaffold materialize \
@@ -54,6 +78,18 @@ MAX_CKPTS_TO_KEEP="${MAX_CKPTS_TO_KEEP:-2}"
 HF_SAVE_INTERVAL="${HF_SAVE_INTERVAL:-10}"
 mkdir -p "$EXPORT_PATH"
 
+# Mirror all output to the terminal AND a canonical log at ${RUN_DIR}/run.log (fresh each
+# run) via tee: an interactive `bash ...` still prints live, while batch (qsub/sbatch) both
+# captures stdout to the job file and leaves run.log in the canonical spot.
+# rm -f first so a stale symlink can't redirect the write to an old file.
+# Set RUN_LOG= (empty) to disable the file entirely (terminal only).
+mkdir -p "$RUN_DIR"
+RUN_LOG="${RUN_LOG-${RUN_DIR}/run.log}"
+if [ -n "$RUN_LOG" ]; then
+    rm -f "$RUN_LOG"
+    exec > >(tee "$RUN_LOG") 2>&1
+fi
+
 NUM_GPUS="${NUM_GPUS:-8}"          # total GPUs visible on the node
 NUM_NODES="${NUM_NODES:-1}"
 
@@ -64,7 +100,7 @@ COLOCATE_ALL="${COLOCATE_ALL:-false}"
 POLICY_NUM_GPUS="${POLICY_NUM_GPUS:-4}"
 
 GPU_LIST="${GPU_LIST:-$(seq -s, 0 $((NUM_GPUS - 1)))}"
-MEGATRON_TP="${MEGATRON_TP:-4}"    # policy on POLICY_NUM_GPUS (=4): one replica, TP=4 PP=1
+MEGATRON_TP="${MEGATRON_TP:-1}"    # policy on POLICY_NUM_GPUS (=4): one replica, TP=4 PP=1
 MEGATRON_PP="${MEGATRON_PP:-1}"
 MEGATRON_CP="${MEGATRON_CP:-1}"
 MEGATRON_EP="${MEGATRON_EP:-1}"
@@ -75,13 +111,13 @@ INFERENCE_ENGINE_TP="${INFERENCE_ENGINE_TP:-1}"
 
 # Fully-async (off-policy) training: sampler runs ahead of the trainer by up to
 # max_staleness_steps. num_parallel_generation_workers caps concurrent trajectories
-# -- each is a harbor sandbox (nested apptainer), so keep it modest, not the 768 default.
+# -- each worker is a harbor sandbox (local docker or modal), so keep it modest,
+# not the 768 default.
 FULLY_ASYNC="${FULLY_ASYNC:-true}"
 MAX_STALENESS_STEPS="${MAX_STALENESS_STEPS:-2}"
-# Each parallel worker = one nested apptainer sandbox with a RAM-backed --writable-tmpfs
-# overlay. Too many at once (16) drove tmpfs/memory pressure -> SIGBUS on the fuse/sandbox
-# processes and an unreachable engine mid-eval. Start conservative; raise once stable.
-NUM_PARALLEL_GEN_WORKERS="${NUM_PARALLEL_GEN_WORKERS:-8}"
+# Each parallel worker = one harbor sandbox (local docker or modal). Too many at
+# once drove tmpfs/memory pressure -> SIGBUS. Start conservative; raise once stable.
+NUM_PARALLEL_GEN_WORKERS="${NUM_PARALLEL_GEN_WORKERS:-32}"
 # Non-colocated: GPUs 0-3 are DEDICATED to inference (policy is on 4-7), so the
 # engines can use most of the GPU for KV cache. 0.4 was a colocated-mode leftover
 # that starved the KV cache (~6 GiB) and choked under concurrent long generations.
@@ -121,11 +157,13 @@ USE_KL_LOSS="${USE_KL_LOSS:-false}"
 LR="${LR:-1e-6}"
 
 # Trainer
-EPOCHS="${EPOCHS:-20}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
-POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-16}"
+# 20-step run: train_batch_size=25 over 500 tasks x epochs=1 = ceil(500/25)=20 steps
+# (the RL trainer has no max_steps knob; total steps = ceil(N_train/batch) x epochs).
+EPOCHS="${EPOCHS:-1}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-25}"
+POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-25}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
-EVAL_INTERVAL="${EVAL_INTERVAL:-5}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
 MAX_GENERATE_LENGTH="${MAX_GENERATE_LENGTH:-4096}"
 
@@ -140,100 +178,68 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-4B}"
 # `CUDA Error: invalid argument at cumem_allocator.cpp:258`. Off for colocation.
 USE_EXPANDABLE_SEGMENTS="${USE_EXPANDABLE_SEGMENTS:-false}"
 
-# --- Nested-apptainer support for harbor's `singularity` trial environment ------
-# Each rollout trial runs the agent in an apptainer sandbox NESTED inside this
-# training container. The SIF has no apptainer binary/libs, so we bind the host's
-# apptainer in (below) and stage here the shared libs the image lacks. Proven
-# minimal set (see _container_run.sh for why ldconfig, not LD_LIBRARY_PATH).
-# Under /scratch (like HF_DIR/TMP_DIR) -- storage outside /scratch is limited, and
-# these (host-specific libs + a re-pullable sif) are cheap to regenerate if purged.
-NESTED_DIR="${NESTED_DIR:-${BASE_DIR%/}/lsutawik/nested_apptainer}"
-HOSTLIBS_DIR_HOST="${NESTED_DIR}/hostlibs"
-SIF_CACHE_HOST="${NESTED_DIR}/sif_cache"
-mkdir -p "$HOSTLIBS_DIR_HOST" "$SIF_CACHE_HOST"
-_stage_lib() {  # <soname>: copy newest matching host lib -> hostlibs/<soname>
-  local soname="$1" src
-  [ -e "$HOSTLIBS_DIR_HOST/$soname" ] && return 0
-  src=$(find /usr/lib64 /lib64 -maxdepth 1 -name "${soname}*" 2>/dev/null | sort | tail -1)
-  [ -n "$src" ] && cp -f "$src" "$HOSTLIBS_DIR_HOST/$soname"
-}
-for _lib in libsubid.so.3 libseccomp.so.2 libcrypt.so.2 libfuse3.so.3 \
-            liblz4.so.1 liblzo2.so.2 libzstd.so.1 liblzma.so.5; do
-  _stage_lib "$_lib"
-done
-# Pre-seed the agent sandbox image so harbor skips a per-image docker pull inside
-# the container. harbor caches as <docker_image, / and : -> _>.sif, i.e. the
-# python:3.11-slim in each task.toml maps to python_3.11-slim.sif. We BUILD (not
-# pull) so we can bake in /app -- harbor launches the sandbox with `--pwd /app`
-# (its default workdir when the task has no Dockerfile), and stock python:3.11-slim
-# has no /app, so a plain pull dies with "chdir /app: no such file or directory".
-AGENT_SIF="${SIF_CACHE_HOST}/python_3.11-slim.sif"
-if [ ! -f "$AGENT_SIF" ]; then
-  echo "Pre-building agent sandbox image -> $AGENT_SIF"
-  APPTAINER_DOCKER_USERNAME="${SINGULARITY_DOCKER_USERNAME:-}" \
-  APPTAINER_DOCKER_PASSWORD="${SINGULARITY_DOCKER_PASSWORD:-}" \
-    apptainer build --fakeroot --force "$AGENT_SIF" "${REPO_DIR}/scripts/train/agent_sandbox.def"
-fi
-# Prebuild harbor's server venv (uvicorn+fastapi) at /opt/harbor-server, bind-mounted
-# into each trial sandbox (see harbor_trial_config/default.yaml environment.mounts).
-# /opt is a read-only volume in the sandbox, so bootstrap.sh can't create it there;
-# a prebuilt bind lets it skip venv creation + the per-trial pip install. Built via
-# the sandbox's own python so shebangs resolve to /opt/harbor-server/bin/python3.
-HARBOR_OPT_HOST="${NESTED_DIR}/harbor_server_opt"
-# Guard on a real host-side file: harbor-server/bin/python3 is a symlink to the
-# sandbox's /usr/local/bin/python3, which doesn't exist on the host, so `-x` on it
-# is always false and would rebuild every launch. pyvenv.cfg is a plain file that
-# only exists once the venv (and its pip installs) completed.
-if [ ! -f "${HARBOR_OPT_HOST}/harbor-server/pyvenv.cfg" ]; then
-  echo "Pre-building harbor server venv -> ${HARBOR_OPT_HOST}/harbor-server"
-  mkdir -p "$HARBOR_OPT_HOST"
-  apptainer exec --writable-tmpfs --fakeroot -B "${HARBOR_OPT_HOST}:/opt" "$AGENT_SIF" \
-    bash -c 'python3 -m venv /opt/harbor-server && /opt/harbor-server/bin/pip install --no-cache-dir uvicorn fastapi'
+# Harbor sandbox backend. "remote" model: the harbor SDK runs in this training
+# container but dispatches each trial sandbox to an external executor. modal =
+# Modal cloud (default). Other remote clouds (e2b, daytona, ...) also selectable;
+# a same-host docker/singularity backend would need that runtime reachable from
+# inside this frozen SIF, so prefer a network-remote one here.
+HARBOR_ENV_TYPE="${HARBOR_ENV_TYPE:-singularity}"
+# Local external sandbox executor (Modal-like, but local): when EXECUTOR_URL is
+# set, harbor trials are POSTed to a separate executor process on the node (see
+# scripts/executor/executor_service.py) instead of running in-process. Leave
+# unset to run trials in-process (original behavior).
+EXECUTOR_URL="${EXECUTOR_URL:-}"
+
+# How the trainer runs INSIDE the SIF -- auto-selected from the image itself, so
+# BASE_SIF is the only knob you need to switch paths:
+#   * fat SIF  (built by scripts/build/build_train.sh; baked env at /opt/SkyRL/.venv):
+#     run that interpreter directly -- no uv, no --extra, no runtime resolve.
+#   * base SIF (system-only): build the env at runtime from pyproject.toml via uv.
+# Export TRAIN_LAUNCHER yourself to override the auto-detection.
+BAKED_PY=/opt/SkyRL/.venv/bin/python
+if [ -z "${TRAIN_LAUNCHER:-}" ]; then
+  if singularity exec "${BASE_SIF}" test -x "${BAKED_PY}" 2>/dev/null; then
+    TRAIN_LAUNCHER="${BAKED_PY} -m src.train_entrypoint"
+    echo "[launcher] fat SIF detected -> ${BAKED_PY} (env baked, no runtime resolve)"
+  else
+    TRAIN_LAUNCHER="uv run --isolated --python 3.12 --extra megatron -m src.train_entrypoint"
+    echo "[launcher] base SIF -> uv run --isolated (runtime env build from pyproject.toml)"
+  fi
 fi
 
 echo ${BASE_SIF}
 
 singularity exec --nv --writable-tmpfs \
     --workdir "${TMP_DIR}" \
+    --bind "${BASE_DIR}:${BASE_DIR}" \
+    --bind "${USER_DATA}:${USER_DATA}" \
+    --env SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
     --bind "${HF_DIR}:/root/.cache/huggingface" \
     --bind "${TMP_DIR}:/tmp_work" \
     --env TMPDIR=/tmp_work \
     --env HF_HOME=/root/.cache/huggingface \
     --env CPATH= \
-    --env PYTHONPATH="${REPO_DIR}/src" \
+    --env PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}/scripts/executor" \
     --env MICRO_SCAFFOLD_DIR="${MINI_FORK_LOCAL}" \
     --env MSWEA_API_KEY="${MSWEA_API_KEY:-dummy}" \
-    --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-32768}" \
+    --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-16384}" \
+    --env AGENT_EXEC_TIMEOUT_SEC="${AGENT_EXEC_TIMEOUT_SEC:-1800}" \
     --env RAY_worker_register_timeout_seconds=600 \
-    --env NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}" \
-    --env NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" \
-    --env NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
-    --env NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET,GRAPH,ENV}" \
-    --env TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}" \
-    --env SKYRL_WORKER_NCCL_TIMEOUT_IN_S="${SKYRL_WORKER_NCCL_TIMEOUT_IN_S:-600}" \
     --env CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     --bind "${UV_CACHE_PERSIST}:/root/.cache/uv" \
     --env UV_CACHE_DIR=/root/.cache/uv \
-    --bind /usr/bin/apptainer:/usr/bin/apptainer \
-    --bind /usr/bin/apptainer:/usr/bin/singularity \
-    --bind /usr/libexec/apptainer:/usr/libexec/apptainer \
-    --bind /etc/apptainer:/etc/apptainer \
-    --bind /var/lib/apptainer:/var/lib/apptainer \
-    --bind "${NESTED_DIR}:/mnt" \
-    --env HOSTLIBS_DIR=/mnt/hostlibs \
     --env TRITON_CACHE_DIR=/tmp_work/triton_cache \
     --env TORCHINDUCTOR_CACHE_DIR=/tmp_work/torchinductor_cache \
     --env VLLM_CACHE_ROOT=/tmp_work/vllm_cache \
     --env XDG_CACHE_HOME=/tmp_work/xdg_cache \
-    --env APPTAINER_CACHEDIR=/tmp_work/nested_apptainer_cache \
-    --env APPTAINER_TMPDIR=/tmp_work \
-    --env APPTAINER_DOCKER_USERNAME="${SINGULARITY_DOCKER_USERNAME:-}" \
-    --env APPTAINER_DOCKER_PASSWORD="${SINGULARITY_DOCKER_PASSWORD:-}" \
+    --env SINGULARITY_CACHEDIR=/tmp_work/singularity_cache \
+    --env HARBOR_ENV_TYPE="${HARBOR_ENV_TYPE}" \
+    --env EXECUTOR_URL="${EXECUTOR_URL}" \
+    --env SINGULARITY_TMPDIR=/tmp_work \
+    --env SINGULARITY_DOCKER_USERNAME="${SINGULARITY_DOCKER_USERNAME:-}" \
+    --env SINGULARITY_DOCKER_PASSWORD="${SINGULARITY_DOCKER_PASSWORD:-}" \
     "${BASE_SIF}" \
-        bash "${REPO_DIR}/scripts/train/_container_run.sh" \
-        uv run \
-        --isolated --python 3.12 --extra megatron \
-            -m src.train_entrypoint \
+        ${TRAIN_LAUNCHER} \
                 data.train_data="['${MATH_TRAIN_DIR}']" \
                 data.val_data="['${MATH_VAL_DIR}']" \
                 data.dataloader.num_workers=0 \
@@ -292,3 +298,10 @@ singularity exec --nv --writable-tmpfs \
                 trainer.max_ckpts_to_keep=${MAX_CKPTS_TO_KEEP} \
                 trainer.hf_save_interval=${HF_SAVE_INTERVAL} \
                 $@
+
+    # --env NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}" \
+    # --env NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" \
+    # --env NCCL_DEBUG="${NCCL_DEBUG:-WARN}" \
+    # --env NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,NET,GRAPH,ENV}" \
+    # --env TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}" \
+    # --env SKYRL_WORKER_NCCL_TIMEOUT_IN_S="${SKYRL_WORKER_NCCL_TIMEOUT_IN_S:-600}" \
