@@ -18,39 +18,12 @@ from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.utils.rate_limiter import RateLimiterConfig
 
 
-def _load_module(name: str, path):
-    """Import a local .py by absolute path under a non-colliding module name.
-
-    The mho generator/dataset live in src/harbor/, which cannot be imported as
-    ``harbor.*`` -- that name is taken by the installed Harbor package, and these
-    modules themselves import the installed ``harbor`` absolutely. Load them under
-    distinct names instead, so their internal ``import harbor.models...`` still
-    resolves to the installed package.
-    """
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-_src = Path(__file__).parent
-_harbor_gen = _load_module("_mho_harbor_generator", _src / "harbor" / "generator.py")
-HarborGenerator = _harbor_gen.HarborGenerator
-_dataset = _load_module("_mho_harbor_dataset", _src / "harbor" / "dataset.py")
-HarborTaskDataset = _dataset.HarborTaskDataset
-
-# Ray ships `skyrl_entrypoint` and everything it closes over (HarborExp ->
-# HarborGenerator / HarborTaskDataset) to workers via cloudpickle. Those classes
-# live in the synthetic `_mho_harbor_*` modules loaded above, which exist only in
-# THIS (driver) process's sys.modules -- a Ray worker never runs `_load_module`,
-# so the default pickle-by-reference raises `ModuleNotFoundError: No module named
-# '_mho_harbor_dataset'` on the worker. Register the modules for pickle-by-value
-# so their class definitions travel inside the payload and need no worker import.
-import ray.cloudpickle as _ray_cloudpickle
-
-_ray_cloudpickle.register_pickle_by_value(_harbor_gen)
-_ray_cloudpickle.register_pickle_by_value(_dataset)
+# mho lives under src/ (on PYTHONPATH), so import directly -- the old `_load_module`
+# path-loading hack is gone now that these modules are `mho.*` (not the colliding
+# `harbor.*`). HarborGenerator/HarborTaskDataset pickle by reference to Ray workers,
+# which import `mho.*` the same way (src on PYTHONPATH), so no register_pickle_by_value.
+from mho.generator import HarborGenerator
+from mho.dataset import HarborTaskDataset
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
