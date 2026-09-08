@@ -1,0 +1,33 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+# Sandbox image for harbor's `singularity` trial environment. Adjustments the
+# official python:3.11-slim image needs for harbor's bootstrap.sh + agent install:
+#   1. WORKDIR /app -- harbor launches the sandbox with `--pwd /app`.
+#   2. /usr/bin/python3 -- bootstrap.sh hardcodes it; the python image ships python
+#      only at /usr/local/bin/python3 (FATAL "cannot install /usr/bin/python3").
+#   3. tmux -- harbor execs agent commands through tmux.
+#   4. APT::Sandbox::User "root" -- the trial sandbox runs in a root-mapped fakeroot
+#      namespace where only uid 0 is mapped, so apt's default drop to the unmapped
+#      `_apt` user fails with "Permission denied" on /var/cache/apt/.../partial. Keep
+#      apt running as root instead.
+#   5. Pre-bake harbor's ensure_system_dependencies targets (curl bash build-essential
+#      git python3-pip) + uv, so per-trial agent setup is fast and needs no apt network.
+# NOTE: harbor's server venv lives at /opt/harbor-server, but /opt is a READ-ONLY
+# volume here (%post writes under /opt don't persist and it's not writable at run
+# time). A prebuilt venv is bind-mounted onto /opt/harbor-server via
+# harbor_trial_config/default.yaml (environment.mounts) instead of baked here.
+%post
+    set -eux
+    printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99-disable-sandbox
+    apt-get update -qq
+    apt-get install -y -qq --no-install-recommends \
+        tmux curl ca-certificates bash build-essential git python3-pip
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+    ln -sf /usr/local/bin/python3 /usr/bin/python3
+    ln -sf /usr/local/bin/python3 /usr/bin/python
+    mkdir -p /app
+    # Pre-install uv so the agent's `curl | sh` bootstrap is skipped (it's on PATH),
+    # plus the math stack so the agent can compute in-sandbox (`python3 -c "import sympy..."`)
+    # for the DAPO-Math tasks. Installed into the system python (/usr/local, which persists).
+    pip install --no-cache-dir uv sympy numpy scipy mpmath

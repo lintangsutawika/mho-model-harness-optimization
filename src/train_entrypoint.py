@@ -2,6 +2,7 @@
 Main entrypoint for training on Harbor tasks.
 """
 
+import os
 import sys
 
 import ray
@@ -136,6 +137,43 @@ def main() -> None:
     with open(HARBOR_DEFAULT_CONFIG) as f:
         defaults = yaml.safe_load(f)
     cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
+
+    # Sandbox backend selection. HARBOR_ENV_TYPE (from .env) chooses where harbor
+    # runs each trial sandbox: "modal" (Modal cloud) or "docker"/"local" (a Docker
+    # daemon reachable from this process). The default.yaml pins `singularity` for
+    # the nested-sandbox path, which is no longer used. Modal needs no image cache
+    # dir or the /mnt bind (which the stripped nested path mounted).
+    harbor_env_type = os.environ.get("HARBOR_ENV_TYPE", "modal")
+    env_cfg = cfg.harbor_trial_config.setdefault("environment", {})
+    if harbor_env_type == "modal":
+        env_cfg["type"] = "modal"
+        env_cfg.pop("mounts", None)
+        env_cfg.setdefault("kwargs", {}).pop("singularity_image_cache_dir", None)
+    else:
+        env_cfg["type"] = harbor_env_type
+        if harbor_env_type == "singularity":
+            # External-executor (host) path: default.yaml's /mnt/* values were for the old
+            # NESTED-singularity design and don't exist/writable on the host. Point the SIF
+            # cache at a host-writable dir (SIF_IMAGE_CACHE_DIR from train_math_dapo.sh), and
+            # drop the /opt bind -- the executor runs writable sandbox dirs, so /opt is
+            # writable in-sandbox and bootstrap builds its server venv there.
+            kw = env_cfg.setdefault("kwargs", {})
+            _cache = os.environ.get("SIF_IMAGE_CACHE_DIR")
+            if _cache:
+                kw["singularity_image_cache_dir"] = _cache
+            else:
+                kw.pop("singularity_image_cache_dir", None)
+            env_cfg.pop("mounts", None)
+
+    # The agent (AgentHarness) runs in the EXTERNAL executor, which does not inherit this
+    # training process's env, so MICRO_SCAFFOLD_DIR won't reach it. Carry the scaffold
+    # snapshot into the trial config (agent.kwargs.mini_fork_local) so it travels over HTTP
+    # to the executor. default.yaml leaves it null; the agent reads mini_fork_local or env.
+    _scaffold = os.environ.get("MICRO_SCAFFOLD_DIR")
+    if _scaffold:
+        _agent_kwargs = cfg.harbor_trial_config.setdefault("agent", {}).setdefault("kwargs", {})
+        if not _agent_kwargs.get("mini_fork_local"):
+            _agent_kwargs["mini_fork_local"] = _scaffold
 
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:
