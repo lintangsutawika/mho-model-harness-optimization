@@ -18,7 +18,7 @@ mkdir -p "$UV_CACHE_PERSIST"
 
 # Host-writable SIF image cache for the external executor's docker->sif sandbox conversion.
 # PERSISTENT (next to BASE_SIF, not node-local) so a pre-seeded python_3.11-slim.sif -- built
-# from scripts/train/agent_sandbox.def (adds /usr/bin/python3 + tools harbor's bootstrap
+# from tasks/dapo_math_17k/agent_sandbox.def (adds /usr/bin/python3 + tools harbor's bootstrap
 # needs) -- survives across jobs and is reused instead of re-pulling vanilla python:3.11-slim.
 # Passed into the SIF so train_entrypoint writes it into each trial's environment config.
 SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
@@ -36,7 +36,7 @@ if [ ! -d "$MATH_TRAIN_DIR" ]; then
   # Host-side data prep only needs `datasets`. Use --no-project so uv does NOT resolve
   # this repo's pyproject (its megatron/vllm-router pins are for the SIF and fail to
   # install on a host with a different glibc); --with datasets supplies the one real dep.
-  uv run --no-project --with datasets src/mho/prepare_math_tasks.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
+  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
 fi
 
 # Held-out eval set = EVAL_BATCH_SIZE instances disjoint from train. The dir is keyed by the
@@ -44,7 +44,7 @@ fi
 MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test_${EVAL_BATCH_SIZE}}"
 if [ ! -d "$MATH_VAL_DIR" ]; then
   # Rows [MAX_TRAIN, MAX_TRAIN+EVAL_BATCH_SIZE) of the seed-0 shuffle (disjoint from train).
-  uv run --no-project --with datasets src/mho/prepare_math_tasks.py --out "$MATH_VAL_DIR" --split train --max-tasks "$EVAL_BATCH_SIZE" --start "$MAX_TRAIN"
+  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_VAL_DIR" --split train --max-tasks "$EVAL_BATCH_SIZE" --start "$MAX_TRAIN"
 fi
 
 RUN_ID="${RUN_ID:-math}"

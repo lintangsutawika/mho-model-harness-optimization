@@ -27,7 +27,7 @@ from mho.dataset import HarborTaskDataset
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
-HARBOR_DEFAULT_CONFIG = Path(__file__).parent.parent / "harbor_trial_config" / "default.yaml"
+HARBOR_DEFAULT_CONFIG = Path(__file__).parent.parent / "tasks" / "dapo_math_17k" / "trial_config.yaml"
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
