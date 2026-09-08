@@ -240,3 +240,5 @@ scripts/build/train-megatron.def
 # meta-harness: unplanned; keep local, do not track
 meta-harness/
 src/meta-harness/
+
+src/.claude/skills/meta-harness-terminal-bench-2/
