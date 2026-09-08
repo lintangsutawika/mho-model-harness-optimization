@@ -161,11 +161,11 @@ USE_KL_LOSS="${USE_KL_LOSS:-false}"
 LR="${LR:-1e-6}"
 
 # Trainer
-# 20-step run: train_batch_size=25 over 500 tasks x epochs=1 = ceil(500/25)=20 steps
+# ~32-step run: train_batch_size=16 over 500 tasks x epochs=1 = ceil(500/16)=32 steps
 # (the RL trainer has no max_steps knob; total steps = ceil(N_train/batch) x epochs).
 EPOCHS="${EPOCHS:-1}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-25}"
-POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-25}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-16}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
 # Pre-train eval gate. Set EVAL_BEFORE_TRAIN=false to skip the (slow) eval-before-train and
 # go straight to the first training step. Shrink the eval instead with EVAL_BATCH_SIZE (the
@@ -258,7 +258,7 @@ singularity exec --nv --writable-tmpfs \
     --env MICRO_SCAFFOLD_DIR="${MINI_FORK_LOCAL}" \
     --env MSWEA_API_KEY="${MSWEA_API_KEY:-dummy}" \
     --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-16384}" \
-    --env AGENT_EXEC_TIMEOUT_SEC="${AGENT_EXEC_TIMEOUT_SEC:-1800}" \
+    --env AGENT_EXEC_TIMEOUT_SEC="${AGENT_EXEC_TIMEOUT_SEC:-600}" \
     --env RAY_worker_register_timeout_seconds=600 \
     --env CUDA_VISIBLE_DEVICES="${GPU_LIST}" \
     --bind "${UV_CACHE_PERSIST}:/root/.cache/uv" \
