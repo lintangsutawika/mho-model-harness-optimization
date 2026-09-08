@@ -21,7 +21,7 @@ from harbor.trial.trial import Trial
 # running in-process. Keeping this import lazy/optional keeps the in-process
 # path unchanged when the executor is absent.
 try:
-    import executor_client
+    from mho.backends.local_singularity import client as executor_client
 except Exception:  # pragma: no cover - executor_client optional
     executor_client = None
 from skyrl.backends.skyrl_train.inference_servers.base import ConversationType, InferenceEngineInterface
