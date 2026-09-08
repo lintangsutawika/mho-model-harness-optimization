@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a FAT SkyRL[megatron] training image (Apptainer/Singularity .sif).
+# Build a SkyRL[megatron] training image (Apptainer/Singularity .sif).
 #
 # WHY: the base SIF (skyrl-train-ray-...-cu13.0-megatron.sif) is system-only -- CUDA 13
 # + uv, but NO Python ML packages (verified: no torch/skyrl/megatron baked). So the
@@ -24,7 +24,7 @@
 #
 # Env:
 #   BASE_SIF       base image to build FROM (default: repo's ...-megatron.sif)
-#   OUT_SIF        output fat image           (default: repo/skyrl-train-megatron-fat.sif)
+#   OUT_SIF        output skyrl-megatron image           (default: <BASE_SIF dir>/skyrl-megatron.sif)
 #   SKYRL_REV      SkyRL git rev to bake -- MUST match the base SIF's stack
 #                  (default: c516f3a5..., the rev the base SIF was built from)
 #   HARBOR_REV     harbor git rev (default: c178c20..., matches pyproject.toml)
@@ -41,7 +41,7 @@ OUT_SIF="${OUT_SIF:-$(dirname "${BASE_SIF}")/skyrl-megatron.sif}"
 SKYRL_REV="${SKYRL_REV:-c516f3a5634701f2d157753cb47bc3f8271b0f11}"
 HARBOR_REV="${HARBOR_REV:-c178c20710c362ef806c5d5d18852f95b21ca34b}"
 APPTAINER_BIN="${APPTAINER_BIN:-$(command -v apptainer || command -v singularity || echo apptainer)}"
-DEF_FILE="${SELF_DIR}/train-megatron-fat.def"
+DEF_FILE="${SELF_DIR}/train-megatron.def"
 
 [ -f "${BASE_SIF}" ] || { echo "base SIF not found: ${BASE_SIF}" >&2; exit 1; }
 
@@ -54,7 +54,7 @@ cat > "${DEF_FILE}" <<EOF
 Bootstrap: localimage
 From: ${BASE_SIF}
 
-# Fat SkyRL[megatron] training image. The megatron env is resolved & built at BUILD time
+# SkyRL[megatron] training image. The megatron env is resolved & built at BUILD time
 # from SkyRL@${SKYRL_REV} (SkyRL's own [tool.uv] does the work -- no fork of SkyRL). Our
 # own src/ is bind-mounted at run time, not baked, so code edits don't need a rebuild.
 %post
@@ -119,7 +119,7 @@ echo "==> Building ${OUT_SIF} ..."
 cat <<MSG
 ==> Done: ${OUT_SIF}
 
-Run training against the fat image (train script auto-detects the baked env):
+Run training against the skyrl-megatron image (train script auto-detects the baked env):
 
   export BASE_SIF="${OUT_SIF}"
   bash scripts/train/train_math_dapo.sh
