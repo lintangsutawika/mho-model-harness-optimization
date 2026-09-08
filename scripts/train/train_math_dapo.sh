@@ -196,7 +196,7 @@ EXECUTOR_URL="${EXECUTOR_URL:-}"
 
 # How the trainer runs INSIDE the SIF -- auto-selected from the image itself, so
 # BASE_SIF is the only knob you need to switch paths:
-#   * fat SIF  (built by scripts/build/build_train.sh; baked env at /opt/SkyRL/.venv):
+#   * skyrl-megatron SIF  (built by scripts/build/build_train.sh; baked env at /opt/SkyRL/.venv):
 #     run that interpreter directly -- no uv, no --extra, no runtime resolve.
 #   * base SIF (system-only): build the env at runtime from pyproject.toml via uv.
 # Export TRAIN_LAUNCHER yourself to override the auto-detection.
@@ -204,7 +204,7 @@ BAKED_PY=/opt/SkyRL/.venv/bin/python
 if [ -z "${TRAIN_LAUNCHER:-}" ]; then
   if singularity exec "${BASE_SIF}" test -x "${BAKED_PY}" 2>/dev/null; then
     TRAIN_LAUNCHER="${BAKED_PY} -m src.train_entrypoint"
-    echo "[launcher] fat SIF detected -> ${BAKED_PY} (env baked, no runtime resolve)"
+    echo "[launcher] skyrl-megatron SIF detected -> ${BAKED_PY} (env baked, no runtime resolve)"
   else
     TRAIN_LAUNCHER="uv run --isolated --python 3.12 --extra megatron -m src.train_entrypoint"
     echo "[launcher] base SIF -> uv run --isolated (runtime env build from pyproject.toml)"
