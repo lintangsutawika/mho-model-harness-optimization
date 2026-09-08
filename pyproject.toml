@@ -1,11 +1,3 @@
-# Thin project manifest. The heavy training env (skyrl + megatron/torch cu130 + vLLM +
-# transformer-engine + flashinfer, etc.) is NOT resolved here anymore -- it is baked into
-# the fat SIF (scripts/build/build_train.sh, from SkyRL's own [tool.uv]) and consumed via
-# the baked venv. So this file no longer mirrors SkyRL's megatron resolution config:
-#   * training runs the baked interpreter (no `uv run`, no resolve)
-#   * data prep uses `uv run --no-project --with datasets`
-#   * the image build uses SkyRL's pyproject, then `uv pip install`s these deps by name
-# What remains here are mho's own top-level deps, for reference / local (non-GPU) dev.
 [project]
 name = "mho-model-harness-optimization"
 version = "0.1.0"
