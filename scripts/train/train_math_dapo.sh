@@ -164,6 +164,10 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-25}"
 POLICY_MINI_BATCH_SIZE="${POLICY_MINI_BATCH_SIZE:-25}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-10}"
+# Pre-train eval gate. Set EVAL_BEFORE_TRAIN=false to skip the (slow) eval-before-train
+# and go straight to the first training step. Shrink it instead with MAX_VAL + EVAL_BATCH_SIZE
+# (e.g. MAX_VAL=10 EVAL_BATCH_SIZE=10). EVAL_INTERVAL controls periodic eval during training.
+EVAL_BEFORE_TRAIN="${EVAL_BEFORE_TRAIN:-true}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"
 MAX_GENERATE_LENGTH="${MAX_GENERATE_LENGTH:-4096}"
 
@@ -282,7 +286,7 @@ singularity exec --nv --writable-tmpfs \
                 generator.sampling_params.temperature=${TEMPERATURE} \
                 trainer.epochs=${EPOCHS} \
                 trainer.eval_batch_size=${EVAL_BATCH_SIZE} \
-                trainer.eval_before_train=true \
+                trainer.eval_before_train=${EVAL_BEFORE_TRAIN} \
                 trainer.eval_interval=${EVAL_INTERVAL} \
                 trainer.train_batch_size=${TRAIN_BATCH_SIZE} \
                 trainer.policy_mini_batch_size=${POLICY_MINI_BATCH_SIZE} \
