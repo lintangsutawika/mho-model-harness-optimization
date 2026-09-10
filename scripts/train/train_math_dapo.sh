@@ -80,6 +80,9 @@ MAX_CKPTS_TO_KEEP="${MAX_CKPTS_TO_KEEP:-2}"
 # These are for eval/deployment/sharing; the .distcp checkpoints above are for RESUME
 # (they carry optimizer state). -1 disables. 10 matches the distcp ckpt_interval.
 HF_SAVE_INTERVAL="${HF_SAVE_INTERVAL:-10}"
+# Dump each training batch (the assembled rollout trajectories used for the GRPO update:
+# token ids, advantages, masks) to ${EXPORT_PATH}/dumped_data/global_step_N_training_input.pkl.
+DUMP_DATA_BATCH="${DUMP_DATA_BATCH:-true}"
 mkdir -p "$EXPORT_PATH"
 
 # Mirror all output to the terminal AND a canonical log at ${RUN_DIR}/run.log (fresh each
@@ -104,7 +107,9 @@ COLOCATE_ALL="${COLOCATE_ALL:-false}"
 POLICY_NUM_GPUS="${POLICY_NUM_GPUS:-4}"
 
 GPU_LIST="${GPU_LIST:-$(seq -s, 0 $((NUM_GPUS - 1)))}"
-MEGATRON_TP="${MEGATRON_TP:-1}"    # policy on POLICY_NUM_GPUS (=4): one replica, TP=4 PP=1
+MEGATRON_TP="${MEGATRON_TP:-1}"    # 4 data-parallel replicas across POLICY_NUM_GPUS (TP=1 PP=1); each GPU holds the full 4B
+    # model. Fits on 140GB when trajectories are bounded (MAX_MODEL_LEN<=32k). If the policy
+    # backward OOMs, raise TP (2/4) -> Megatron sequence-parallel shards long-seq activations.
 MEGATRON_PP="${MEGATRON_PP:-1}"
 MEGATRON_CP="${MEGATRON_CP:-1}"
 MEGATRON_EP="${MEGATRON_EP:-1}"
@@ -145,7 +150,7 @@ LANGUAGE_MODEL_ONLY="${LANGUAGE_MODEL_ONLY:-true}"
 # engine core raise ValueError at startup ("larger than available KV cache memory").
 # 64K is ample for prompt(4096)+generate(4096) plus long agent rollouts, and its KV
 # (~2 GiB) fits easily. Passed via engine_init_kwargs (overrides config-derived args).
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 # The micro-swe-agent scaffold drives the model via OpenAI tool/function calling
 # (tools=[BASH_TOOL], tool_choice=auto). vLLM rejects that unless the OpenAI server
 # is started with tool-call support, so enable it on the engines. Parser must match
@@ -332,6 +337,7 @@ singularity exec --nv --writable-tmpfs \
                 trainer.export_path="$EXPORT_PATH" \
                 trainer.max_ckpts_to_keep=${MAX_CKPTS_TO_KEEP} \
                 trainer.hf_save_interval=${HF_SAVE_INTERVAL} \
+                trainer.dump_data_batch=${DUMP_DATA_BATCH} \
                 $@
 
     # --env NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}" \
