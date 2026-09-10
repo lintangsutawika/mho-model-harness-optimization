@@ -1,0 +1,67 @@
+# Harbor Trial configuration template used by HarborGenerator during GRPO
+# training (src/train_entrypoint.py -> src/harbor/harbor_generator.py).
+#
+# HarborGenerator deep-copies this dict for every trial and injects the
+# run-specific bits itself:
+#   * agent.model_name  = "hosted_vllm/<served_model_name>"   (the served Qwen)
+#   * agent.kwargs.api_base                                 (the vLLM endpoint)
+#   * agent.kwargs.session_id                                (per-trial router)
+#   * task.path = <task dir>                                 (this DAPO problem)
+#   * agent.kwargs.collect_rollout_details = true             (forced on)
+#
+# So this file only pins the parts that are constant across a training run:
+# which harness (micro-swe-agent snapshot) runs, how MATH trials are graded,
+# and the sandbox environment.
+#
+# Harness swapping: point agent.kwargs.mini_fork_local (or MICRO_SCAFFOLD_DIR
+# env) at a candidate snapshot from harness.scaffold.materialize(...). sevex
+# candidates by re-running training with a different snapshot path -- no other
+# changes needed (this is exactly the "change the harness, keep the pipeline"
+# property the mho project wants).
+
+# Harbor agent that installs the micro-swe-agent snapshot into the sandbox and
+# runs it. Import path is `harness.agent_harness:AgentHarness` with `src/` on
+# PYTHONPATH (mirrors scripts/eval/eval_terminal_bench_2.sh).
+agent:
+  import_path: harness.agent_harness:AgentHarness
+  # gennforced: collect_rollout_details=true, enable_summarize=false,
+  #             model_name/api_base/session_id injected by HarborGenerator.
+  n_concurrent: 16
+  kwargs:
+    mini_fork_local: null          # set to runs/run_<id>/candidate_<id>/micro-swe-agent/
+                                   # or export MICRO_SCAFFOLD_DIR
+    collect_rollout_details: true
+    enable_summarize: false
+
+# MATH grading: parse the agent's final "Answer: $Answer" line, sympy-normalize,
+# exact-match against task [metadata].answer. Runs in the harbor process.
+verifier:
+  import_path: harness.math_verifier:MathVerifier
+  override_timeout_sec: 120
+
+# Sandbox the agent works in. On this HPC there is no Docker daemon, so we use
+# harbor's `singularity` environment: it runs the agent in an apptainer sandbox
+# NESTED inside the training container (scripts/train/train_math_dapo.sh binds the
+# host apptainer + support libs in and pre-seeds the image cache). Each task's
+# task.toml [environment].docker_image (python:3.11-slim) is pulled/converted to
+# .sif once and cached at singularity_image_cache_dir (pre-seeded as
+# python_3.11-slim.sif, so no pull happens at run time). No GPU needed.
+environment:
+  type: singularity
+  # Bind a prebuilt venv onto /opt/harbor-server. bootstrap.sh hardcodes its server
+  # venv there and pip-installs uvicorn/fastapi per trial, but (a) /opt is a
+  # read-only volume in the python:3.11-slim sandbox (can't create the venv) and
+  # (b) per-trial network installs risk harbor's 60s health-check timeout. The bind
+  # (source = train_math_dapo.sh's /mnt = ${NESTED_DIR}) is writable and already
+  # holds uvicorn+fastapi, so bootstrap skips both venv creation and pip install.
+  mounts:
+    - type: bind
+      source: /mnt/harbor_server_opt
+      target: /opt
+  kwargs:
+    # Matches the in-container bind target in train_math_dapo.sh; pre-seeded with
+    # python_3.11-slim.sif so harbor's converter finds it and skips the docker pull.
+    singularity_image_cache_dir: /mnt/sif_cache
+
+# Trials root (relative to the training job cwd).
+trials_dir: trials

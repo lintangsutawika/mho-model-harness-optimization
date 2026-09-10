@@ -16,6 +16,14 @@ from tqdm import tqdm
 from harbor.models.agent.rollout_detail import RolloutDetail
 from harbor.models.trial.config import TrialConfig
 from harbor.trial.trial import Trial
+# Local external sandbox executor: when EXECUTOR_URL is set, trials are POSTed
+# to a separate executor process on the node (Modal-like, but local) instead of
+# running in-process. Keeping this import lazy/optional keeps the in-process
+# path unchanged when the executor is absent.
+try:
+    from mho.backends.local_singularity import client as executor_client
+except Exception:  # pragma: no cover - executor_client optional
+    executor_client = None
 from skyrl.backends.skyrl_train.inference_servers.base import ConversationType, InferenceEngineInterface
 from skyrl.train.generators.base import (
     GeneratorInput,
@@ -285,7 +293,7 @@ class HarborGenerator(GeneratorInterface):
         # the agent sets no max_tokens, so a single completion can run toward max_model_len
         # (65k) and never finish inside harbor's fixed 600s per-exec HTTP timeout -> the
         # agent phase times out with an empty transcript. Bound it (override via env).
-        _agent_max_tokens = int(os.environ.get("AGENT_MAX_TOKENS", "32768"))
+        _agent_max_tokens = int(os.environ.get("AGENT_MAX_TOKENS", "16384"))
         if _agent_max_tokens > 0:
             _model_kwargs.setdefault("max_tokens", _agent_max_tokens)
         # Belt-and-suspenders: harbor writes the model_kwargs config into the sandbox
@@ -299,6 +307,16 @@ class HarborGenerator(GeneratorInterface):
         _env = self._harbor_trial_config_template.setdefault("environment", {}).setdefault("env", {})
         _env.setdefault("HOSTED_VLLM_API_BASE", _api_base)
         _env.setdefault("HOSTED_VLLM_API_KEY", os.environ.get("MSWEA_API_KEY", "dummy"))
+        # mini-swe-agent checks MSWEA_API_KEY (its own var) before the provider key and
+        # errors without it ("No API key found for model ..."). The agent runs in the
+        # sandbox, not this training process, so deliver it via environment.env too.
+        _env.setdefault("MSWEA_API_KEY", os.environ.get("MSWEA_API_KEY", "dummy"))
+        # Tell the micro-swe-agent fork to request per-turn token IDs + logprobs from vLLM
+        # (return_token_ids/logprobs) so AgentHarness.populate_context_post_run can build the
+        # rollout_details this generator trains on. Harbor merges environment.env into every
+        # sandbox exec, so the fork subprocess inherits it. Kept in lockstep with
+        # collect_rollout_details below.
+        _env.setdefault("MICRO_RETURN_TOKEN_IDS", "1")
 
         # Step-wise needs per-turn token IDs and logprobs from vLLM via Harbor.
         agent_kwargs = self._harbor_trial_config_template["agent"]["kwargs"]
@@ -413,11 +431,17 @@ class HarborGenerator(GeneratorInterface):
                     if not isinstance(extra_body, dict):
                         raise TypeError("harbor_trial_config.agent.kwargs.llm_kwargs.extra_body must be a mapping")
                     extra_body["cache_salt"] = cache_salt
-                trial_config = TrialConfig.model_validate(config)
-                trial = await Trial.create(trial_config)
+                if executor_client is not None and executor_client.executor_enabled():
+                    # External executor: run the trial on the node in a separate
+                    # process (the sandbox is external to this container).
+                    results = await executor_client.run_trial_async(config)
+                else:
+                    # In-process harbor (original behaviour).
+                    trial_config = TrialConfig.model_validate(config)
+                    trial = await Trial.create(trial_config)
+                    async with self._rate_limiter:
+                        results = await trial.run()
 
-                async with self._rate_limiter:
-                    results = await trial.run()
 
                 # Parse exception type
                 exc_type = results.exception_info.exception_type if results.exception_info else None
@@ -442,7 +466,13 @@ class HarborGenerator(GeneratorInterface):
 
                 # Extract rollout details and check for success
                 rollout_details = results.agent_result.rollout_details
-                num_turns = results.agent_result.metadata["n_episodes"]
+                # metadata may be absent on a trajectory that produced no token-id-bearing
+                # turns; fall back to the rollout segment length rather than crashing on None.
+                _metadata = results.agent_result.metadata or {}
+                num_turns = _metadata.get(
+                    "n_episodes",
+                    len(rollout_details[0].get("completion_token_ids", [])) if rollout_details else 0,
+                )
 
                 if (
                     rollout_details

@@ -8,6 +8,8 @@ dependencies = [
   "litellm",
   "python-dotenv",
   "pyyaml",
+  "sympy",
+  "loguru",
 ]
 
 [tool.uv]

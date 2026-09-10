@@ -2,6 +2,7 @@
 Main entrypoint for training on Harbor tasks.
 """
 
+import os
 import sys
 
 import ray
@@ -17,43 +18,16 @@ from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.utils.rate_limiter import RateLimiterConfig
 
 
-def _load_module(name: str, path):
-    """Import a local .py by absolute path under a non-colliding module name.
-
-    The mho generator/dataset live in src/harbor/, which cannot be imported as
-    ``harbor.*`` -- that name is taken by the installed Harbor package, and these
-    modules themselves import the installed ``harbor`` absolutely. Load them under
-    distinct names instead, so their internal ``import harbor.models...`` still
-    resolves to the installed package.
-    """
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-_src = Path(__file__).parent
-_harbor_gen = _load_module("_mho_harbor_generator", _src / "harbor" / "generator.py")
-HarborGenerator = _harbor_gen.HarborGenerator
-_dataset = _load_module("_mho_harbor_dataset", _src / "harbor" / "dataset.py")
-HarborTaskDataset = _dataset.HarborTaskDataset
-
-# Ray ships `skyrl_entrypoint` and everything it closes over (HarborExp ->
-# HarborGenerator / HarborTaskDataset) to workers via cloudpickle. Those classes
-# live in the synthetic `_mho_harbor_*` modules loaded above, which exist only in
-# THIS (driver) process's sys.modules -- a Ray worker never runs `_load_module`,
-# so the default pickle-by-reference raises `ModuleNotFoundError: No module named
-# '_mho_harbor_dataset'` on the worker. Register the modules for pickle-by-value
-# so their class definitions travel inside the payload and need no worker import.
-import ray.cloudpickle as _ray_cloudpickle
-
-_ray_cloudpickle.register_pickle_by_value(_harbor_gen)
-_ray_cloudpickle.register_pickle_by_value(_dataset)
+# mho lives under src/ (on PYTHONPATH), so import directly -- the old `_load_module`
+# path-loading hack is gone now that these modules are `mho.*` (not the colliding
+# `harbor.*`). HarborGenerator/HarborTaskDataset pickle by reference to Ray workers,
+# which import `mho.*` the same way (src on PYTHONPATH), so no register_pickle_by_value.
+from mho.generator import HarborGenerator
+from mho.dataset import HarborTaskDataset
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
-HARBOR_DEFAULT_CONFIG = Path(__file__).parent.parent / "harbor_trial_config" / "default.yaml"
+HARBOR_DEFAULT_CONFIG = Path(__file__).parent.parent / "tasks" / "dapo_math_17k" / "trial_config.yaml"
 
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
@@ -136,6 +110,43 @@ def main() -> None:
     with open(HARBOR_DEFAULT_CONFIG) as f:
         defaults = yaml.safe_load(f)
     cfg.harbor_trial_config = _deep_merge(defaults, cfg.harbor_trial_config)
+
+    # Sandbox backend selection. HARBOR_ENV_TYPE (from .env) chooses where harbor
+    # runs each trial sandbox: "modal" (Modal cloud) or "docker"/"local" (a Docker
+    # daemon reachable from this process). The default.yaml pins `singularity` for
+    # the nested-sandbox path, which is no longer used. Modal needs no image cache
+    # dir or the /mnt bind (which the stripped nested path mounted).
+    harbor_env_type = os.environ.get("HARBOR_ENV_TYPE", "modal")
+    env_cfg = cfg.harbor_trial_config.setdefault("environment", {})
+    if harbor_env_type == "modal":
+        env_cfg["type"] = "modal"
+        env_cfg.pop("mounts", None)
+        env_cfg.setdefault("kwargs", {}).pop("singularity_image_cache_dir", None)
+    else:
+        env_cfg["type"] = harbor_env_type
+        if harbor_env_type == "singularity":
+            # External-executor (host) path: default.yaml's /mnt/* values were for the old
+            # NESTED-singularity design and don't exist/writable on the host. Point the SIF
+            # cache at a host-writable dir (SIF_IMAGE_CACHE_DIR from train_math_dapo.sh), and
+            # drop the /opt bind -- the executor runs writable sandbox dirs, so /opt is
+            # writable in-sandbox and bootstrap builds its server venv there.
+            kw = env_cfg.setdefault("kwargs", {})
+            _cache = os.environ.get("SIF_IMAGE_CACHE_DIR")
+            if _cache:
+                kw["singularity_image_cache_dir"] = _cache
+            else:
+                kw.pop("singularity_image_cache_dir", None)
+            env_cfg.pop("mounts", None)
+
+    # The agent (AgentHarness) runs in the EXTERNAL executor, which does not inherit this
+    # training process's env, so MICRO_SCAFFOLD_DIR won't reach it. Carry the scaffold
+    # snapshot into the trial config (agent.kwargs.mini_fork_local) so it travels over HTTP
+    # to the executor. default.yaml leaves it null; the agent reads mini_fork_local or env.
+    _scaffold = os.environ.get("MICRO_SCAFFOLD_DIR")
+    if _scaffold:
+        _agent_kwargs = cfg.harbor_trial_config.setdefault("agent", {}).setdefault("kwargs", {})
+        if not _agent_kwargs.get("mini_fork_local"):
+            _agent_kwargs["mini_fork_local"] = _scaffold
 
     validate_cfg(cfg)
     if cfg.trainer.algorithm.max_seq_len is None:
