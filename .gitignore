@@ -219,3 +219,26 @@ __marimo__/
 
 # meta-harness candidate snapshots
 runs/
+
+# --- mho: session artifacts / backups / envs (not source) ---
+*.bak
+uv.lock
+trials/
+wandb/
+.venv/
+*.sif
+!scripts/build/
+!scripts/build/**
+
+# session notes (keep local, do not track)
+mho.txt
+notes.md
+
+# build_train.sh-generated def (artifact)
+scripts/build/train-megatron.def
+
+# meta-harness: unplanned; keep local, do not track
+meta-harness/
+src/meta-harness/
+
+src/.claude/skills/meta-harness-terminal-bench-2/
