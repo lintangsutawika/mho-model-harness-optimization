@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#PBS -N miles-build
+#PBS -l select=1:ncpus=8:mem=128gb
+#PBS -l walltime=02:00:00
+#PBS -j oe
+#PBS -o /home/aci18914wh/miles_build_qsub.log
+#PBS -v RTYPE=rt_HF
+# Submit the miles.sif build on a CPU compute node so it runs to completion
+# (long singularity builds don't survive an ssh session on the login node).
+set -euo pipefail
+cd /home/aci18914wh/mho-model-harness-optimization/mho-model-harness-optimization
+export SINGULARITY_DOCKER_USERNAME="lintangsutawika"
+echo "=== host: $(hostname) ==="
+bash scripts/build/build-miles.sh
+echo "=== miles build job finished rc=$? ==="
+ls -la /home/aci18914wh/mho-model-harness-optimization/miles.sif
