@@ -1,0 +1,11 @@
+Bootstrap: localimage
+From: /home/aci18914wh/mho-model-harness-optimization/mho-model-harness-optimization/vllm-openai-cuda-0.28.0.sif
+
+%post
+    set -e
+    PY=$(command -v python3)
+    $PY -m pip install -q 'prometheus-fastapi-instrumentator==8.0.2'
+    $PY -c "import torch, vllm; print('torch', torch.__version__, '| vllm', vllm.__version__)"
+
+%environment
+    :
