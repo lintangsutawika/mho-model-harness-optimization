@@ -134,6 +134,19 @@ class WritableSingularityEnvironment(SingularityEnvironment):
         super().__init__(*args, **kwargs)
         _install_writable_argv_rewrite()
 
+    @property
+    def _docker_image(self) -> str | None:
+        """Fall back to a default image when a task omits [environment].docker_image.
+
+        Pure-reasoning registry tasks (e.g. AIME math) don't declare an environment, but harbor's
+        singularity backend requires one. Default to python:3.11-slim -- whose safe_name resolves
+        to the pre-built sif_cache/python_3.11-slim.sif (the fat sandbox from agent_sandbox.def:
+        tmux + uv + /usr/bin/python3 + the harbor-server venv), so the agent's bootstrap works the
+        same as on the training path. Override with MHO_DEFAULT_DOCKER_IMAGE."""
+        return self.task_env_config.docker_image or os.environ.get(
+            "MHO_DEFAULT_DOCKER_IMAGE", "python:3.11-slim"
+        )
+
     async def _convert_docker_to_sif(self, docker_image: str, *, force_pull: bool = False) -> Path:
         sif = await super()._convert_docker_to_sif(docker_image, force_pull=force_pull)
         if self._writable_sandbox:
