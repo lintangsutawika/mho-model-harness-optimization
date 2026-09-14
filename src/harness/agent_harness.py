@@ -38,7 +38,9 @@ from harbor.models.agent.context import AgentContext
 # Where the snapshot is uploaded inside the sandbox.
 _SCAFFOLD_SANDBOX_DIR = "/tmp/micro-scaffold"
 # Repo root, used to resolve a relative snapshot path (e.g. "runs/run_x/candidate_y/...").
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+# agent_harness.py is at <repo>/src/harness/ (3 levels); parents[2] = repo root, so a
+# relative mini_fork_local resolves against the repo, not <repo>/src.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class AgentHarness(MiniSweAgent):

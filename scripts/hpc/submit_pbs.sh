@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
-#PBS -N mho-tb2
-#PBS -l select=1
-#PBS -l walltime=08:00:00
-#PBS -j oe
-# PBS/Torque wrapper (ABCI / qsub) around scripts/eval/eval_terminal_bench_2.sh.
+# Submit a repo script as a PBS batch job.
 #
-# qsub takes NO positional script args and does not export your shell env by default, so
-# pass config via `-v` and request env export with `-V`:
+#   bash scripts/hpc/submit_pbs.sh <target-script> [args...]
+#   e.g.  MHO_TRAINER=miles bash scripts/hpc/submit_pbs.sh scripts/optimize/train.sh
 #
-#   qsub -V -P <group> -q <queue> -l select=1 \
-#     -v AGENT_IMPORT=harness.harbor_run:AgentHarness,TASK_SET=full,N_ATTEMPTS=1,N_CONCURRENT=16,MODEL=openai/gpt-5 \
-#     scripts/hpc/submit_pbs.sh
-
+# The submitted job cd's to the repo (PBS_O_WORKDIR) and runs <target> by RELATIVE path, so the
+# target's own BASH_SOURCE-based repo-dir resolution stays correct despite PBS spooling. The
+# current env is exported to the job (-V), so set MHO_*/config vars before calling this.
+#
+# Resources (env, overridable): PBS_SELECT (default select=1:ngpus=8 -- set to select=1 for a
+#   CPU-only eval), PBS_WALLTIME (24:00:00), PBS_QUEUE, PBS_GROUP, JOB_NAME, PBS_OUT.
 set -euo pipefail
-cd "${PBS_O_WORKDIR:-$(pwd)}"
-mkdir -p logs
-if [ -n "${PBS_JOBID:-}" ]; then
-    exec > >(tee -a "logs/${PBS_JOBID}.out") 2>&1
-fi
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+[ "$#" -ge 1 ] || { echo "usage: bash $0 <target-script relative to repo> [args...]" >&2; exit 2; }
+TARGET="$1"; shift
+[ -f "$REPO_DIR/$TARGET" ] || echo "[submit_pbs] warning: $TARGET not found under repo" >&2
 
-echo "[pbs] job=${PBS_JOBID:-?} node=$(hostname) workdir=${PBS_O_WORKDIR:-$(pwd)}"
+QSUB=(qsub -V -j oe -N "${JOB_NAME:-mho-$(basename "$TARGET" .sh)}")
+[ -n "${PBS_QUEUE:-}" ] && QSUB+=(-q "$PBS_QUEUE")
+[ -n "${PBS_GROUP:-}" ] && QSUB+=(-P "$PBS_GROUP")
+SEL="${PBS_SELECT-select=1:ngpus=8}"; [ -n "$SEL" ] && QSUB+=(-l "$SEL")
+QSUB+=(-l "walltime=${PBS_WALLTIME:-24:00:00}")
+[ -n "${PBS_OUT:-}" ] && QSUB+=(-o "$PBS_OUT")
 
-# qsub can't forward positional args, so the eval script is driven purely by env vars
-# (AGENT_IMPORT / TASK_SET / N_ATTEMPTS / N_CONCURRENT / MODEL / ...), passed via `-v`.
-exec bash scripts/eval/eval_terminal_bench_2.sh
+echo "[submit_pbs] ${QSUB[*]}  <job: cd repo && bash $TARGET $*>"
+"${QSUB[@]}" <<PBSJOB
+cd "\${PBS_O_WORKDIR:-$REPO_DIR}"
+exec bash $TARGET $*
+PBSJOB
