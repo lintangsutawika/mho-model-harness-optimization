@@ -32,7 +32,10 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# scaffold.py lives at <repo>/src/harness/ (3 levels deep). parents[2] = the repo root, so
+# DEFAULT_BASE resolves to the sibling micro-swe-agent checkout. (Was parent.parent, correct
+# only at the pre-refactor <repo>/harness/ location.)
+REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNS_DIR = REPO_ROOT / "runs"
 #: The base scaffold's directory name, preserved inside each candidate dir.
 SCAFFOLD_NAME = "micro-swe-agent"

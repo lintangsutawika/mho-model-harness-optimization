@@ -23,6 +23,7 @@ Which 16 rows are picked is deterministic via --seed for reproducible subsets.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import shutil
 from pathlib import Path
@@ -94,12 +95,45 @@ def prepare(
         task_dir = out / f"{i:010d}"
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "instruction.md").write_text(prompt_text + "\n")
-        (task_dir / "task.toml").write_text(_task_toml(answer))
+        (task_dir / "task.toml").write_text(_task_toml(answer, f"mho/dapo-math-17k-{i:010d}"))
         _write_stub_tests(task_dir)
         n += 1
         if max_tasks is not None and n >= max_tasks:
             break
     print(f"Wrote {n} DAPO task dirs to {out}")
+
+    # Emit the Miles prompt jsonl from the task dirs we just wrote. Single source of
+    # truth: the SAME function backfills pre-existing preps (--emit-rollout-only), so
+    # fresh and backfilled jsonl are byte-identical and can never drift.
+    emit_rollout_from_dirs(out)
+    return out
+
+
+def emit_rollout_from_dirs(out_dir: str | Path) -> Path:
+    """(Re)write ``<out>/rollout.jsonl`` from EXISTING harbor task dirs.
+
+    Miles' rollout loop reads a flat prompt jsonl (``--prompt-data``), not the harbor
+    task-dir tree that SkyRL consumes directly. This derives that jsonl from the dirs:
+    one row per ``<out>/<instance_id>/instruction.md``, with ``metadata.instance_id``
+    == the task-dir name (the Harbor connector looks up ``tasks_dir/<instance_id>``).
+
+    No dataset download -- safe to call idempotently, including as a backfill for task
+    dirs prepared before rollout.jsonl was emitted. Returns the out dir.
+    """
+    out = Path(out_dir).expanduser()
+    if not out.is_dir():
+        raise SystemExit(f"{out} is not a task-dir root; run prepare (without --emit-rollout-only) first.")
+    rollout_path = out / "rollout.jsonl"
+    n = 0
+    with rollout_path.open("w") as fout:
+        for d in sorted(p for p in out.iterdir() if p.is_dir()):
+            inst = d / "instruction.md"
+            if not inst.exists():
+                continue
+            row = {"prompt": inst.read_text().strip(), "metadata": {"instance_id": d.name}}
+            fout.write(json.dumps(row) + "\n")
+            n += 1
+    print(f"Wrote {n} Miles rollout rows to {rollout_path}")
     return out
 
 
@@ -118,9 +152,12 @@ def _write_stub_tests(task_dir) -> None:
     )
 
 
-def _task_toml(answer: str | None) -> str:
+def _task_toml(answer: str | None, name: str) -> str:
     """Harbor TaskConfig TOML for a DAPO math task.
 
+    - [task]         org/name identity. Required for harbor to package these dirs into a
+                     local dataset (harbor run -p / dataset.toml scan reads task.name); the
+                     per-trial path (task.path) works without it, but dataset resolution needs it.
     - [environment]  plain python image (agent computes with python).
     - [agent]        override timeout for a short single-turn math problem.
     - [metadata]     ground-truth answer for the verifier.
@@ -131,6 +168,9 @@ def _task_toml(answer: str | None) -> str:
     answer_toml = f'answer = "{answer}"' if answer is not None else "# no answer"
     return f"""\
 schema_version = "1.4"
+
+[task]
+name = "{name}"
 
 [environment]
 docker_image = "python:3.11-slim"
@@ -162,13 +202,22 @@ if __name__ == "__main__":
     p.add_argument("--dataset", default="BytedTsinghua-SIA/DAPO-Math-17k")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--start", type=int, default=0, help="row offset into the seed-shuffled split (for disjoint val)")
-    args = p.parse_args()
-    prepare(
-        out_dir=args.out,
-        max_tasks=args.max_tasks,
-        split=args.split,
-        seed=args.seed,
-        dataset_name=args.dataset,
-        overwrite=args.overwrite,
-        start=args.start,
+    p.add_argument(
+        "--emit-rollout-only",
+        action="store_true",
+        help="skip the dataset download; only (re)write rollout.jsonl from existing "
+        "task dirs under --out (idempotent backfill for pre-jsonl preps).",
     )
+    args = p.parse_args()
+    if args.emit_rollout_only:
+        emit_rollout_from_dirs(args.out)
+    else:
+        prepare(
+            out_dir=args.out,
+            max_tasks=args.max_tasks,
+            split=args.split,
+            seed=args.seed,
+            dataset_name=args.dataset,
+            overwrite=args.overwrite,
+            start=args.start,
+        )

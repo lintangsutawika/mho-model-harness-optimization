@@ -1,0 +1,32 @@
+Bootstrap: localimage
+From: /home/aci18914wh/mho-model-harness-optimization/miles_latest.sif
+# Miles training image: perms fix + miles refresh + harbor/thin-deps layered on
+# radixark/miles:latest. src/ is bind-mounted at run time, not baked.
+%post
+    set -eux
+    export PATH="/usr/local/bin:/usr/bin:$PATH"
+    # 1) Perms: /root is 0700 root -> non-root cluster uid can't see miles/Megatron-LM.
+    chmod a+rx /root
+    chmod -R a+rX /root/miles /root/Megatron-LM
+    # 2) Miles' working interpreter: /opt/sglang/bin/python (has pip; /usr/bin/python3
+    #    does not). Refresh miles to latest + editable (no deps).
+    PY=/opt/sglang/bin/python
+    if [ -d /root/miles/.git ]; then
+        git -C /root/miles pull --ff-only || echo "WARN: miles git pull failed (network?)"
+    fi
+    $PY -m pip install -e /root/miles --no-deps
+    # 3) Layer harbor + thin deps into the SAME interpreter (in-process Harbor rollout).
+    $PY -m pip install \
+        "harbor[modal] @ git+https://github.com/harbor-framework/harbor.git@c178c20710c362ef806c5d5d18852f95b21ca34b" \
+        "terminal-bench==0.2.18" litellm python-dotenv pyyaml sympy loguru
+    # 4) Smoke-test the layered stack -- any failure here MUST abort the build.
+    $PY - <<'PY'
+import sys
+import harbor, litellm, loguru, yaml, sympy   # noqa: F401
+import pathlib
+assert pathlib.Path("/root/miles").is_dir(), "/root/miles missing"
+assert pathlib.Path("/root/Megatron-LM").is_dir(), "/root/Megatron-LM missing"
+print("OK harbor + thin deps import; miles+Megatron-LM present; python", sys.version)
+PY
+%environment
+    export PYTHONPATH="/root/miles:/root/Megatron-LM:${PYTHONPATH:-}"
