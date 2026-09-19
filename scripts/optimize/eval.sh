@@ -163,6 +163,7 @@ CMD=(
   "${VENV_BIN}/harbor" run --agent "${AGENT_IMPORT}" "${DATA_FLAG[@]}" -m "${MODEL}" "${ENV_FLAGS[@]}"
   --jobs-dir "${EVAL_JOBS_DIR}" --job-name "${EVAL_JOB_NAME}"
   -n "${N_CONCURRENT}" --n-attempts "${RUNS}" --ak "temperature=${AGENT_TEMPERATURE}"
+  ${MHO_VERIFIER:+--verifier "${MHO_VERIFIER}"}
 )
 [ -n "${MINI_FORK_LOCAL:-}" ] && CMD+=( --ak "mini_fork_local=${MINI_FORK_LOCAL}" )
 
