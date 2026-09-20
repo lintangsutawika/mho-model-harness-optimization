@@ -19,6 +19,7 @@
 #   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_TEMPERATURE,
 #   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, SIF_IMAGE_CACHE_DIR, SINGULARITY_NO_MOUNT,
 #   MODAL_*, VLLM_SIF/VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
+#   VLLM_PORT is auto-picked from 8000-8099 when unset (compute nodes are shared).
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # MHO_REPO_DIR (set by the loop) / PBS_O_WORKDIR / SLURM_SUBMIT_DIR win over BASH_SOURCE,
@@ -73,7 +74,20 @@ trap cleanup EXIT
 # --- self-serve the model with vLLM (if MHO_MODEL set) -----------------------
 if [ -n "${MHO_MODEL:-}" ]; then
   VLLM_SIF="${VLLM_SIF:-$(dirname "${BASE_SIF}")/vllm-cuda.sif}"
-  VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
+  SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
+  # Compute nodes are shared, so a fixed port is a coin flip -- and losing it is silent:
+  # vLLM dies with "Address already in use" while the health check below happily succeeds
+  # against the stranger's server, and every trial then fails with "model does not exist".
+  # Take the first free port instead. VLLM_PORT still pins one if you need it pinned.
+  if [ -z "${VLLM_PORT:-}" ]; then
+    for _p in $(seq 8000 8099); do
+      "${VENV_BIN}/python" -c "import socket,sys; s=socket.socket()
+try: s.bind((\"127.0.0.1\", int(sys.argv[1]))); sys.exit(0)
+except OSError: sys.exit(1)
+finally: s.close()" "${_p}" 2>/dev/null && { VLLM_PORT="${_p}"; break; }
+    done
+    [ -n "${VLLM_PORT:-}" ] || { echo "ERROR: no free port in 8000-8099 on $(hostname)" >&2; exit 1; }
+  fi
   [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but no vLLM sif at ${VLLM_SIF}" >&2; exit 1; }
   MODEL_BIND=(); [ -d "${MHO_MODEL}" ] && MODEL_BIND=(--bind "${MHO_MODEL}:${MHO_MODEL}")
   mkdir -p "${MHO_OUT:-/tmp}"
@@ -99,9 +113,21 @@ if [ -n "${MHO_MODEL:-}" ]; then
     "$VLLM_SIF" vllm serve "${MHO_MODEL}" --port "${VLLM_PORT}" --served-model-name "${SERVED_NAME}" \
       "${VLLM_TOOL_ARGS[@]}" ${VLLM_EXTRA_ARGS:-} >"${MHO_OUT:-/tmp}/vllm_serve.log" 2>&1 &
   VLLM_PID=$!
-  for _ in $(seq 1 120); do curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 && break; sleep 5; done
-  curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
-    || { echo "[eval] vLLM not healthy; see ${MHO_OUT:-/tmp}/vllm_serve.log" >&2; exit 1; }
+  # Wait on OUR process, not on the port: if vLLM died, stop instead of talking to whatever
+  # else is listening. Then require the served name to actually be there -- /health alone is
+  # answered by any vLLM, including someone else's serving a different model.
+  _READY=0
+  for _ in $(seq 1 120); do
+    kill -0 "${VLLM_PID}" 2>/dev/null \
+      || { echo "[eval] vLLM exited during startup; see ${MHO_OUT:-/tmp}/vllm_serve.log" >&2
+           tail -5 "${MHO_OUT:-/tmp}/vllm_serve.log" >&2; exit 1; }
+    curl -sf "http://localhost:${VLLM_PORT}/v1/models" 2>/dev/null | grep -q "\"${SERVED_NAME}\"" \
+      && { _READY=1; break; }
+    sleep 5
+  done
+  [ "${_READY}" = "1" ] \
+    || { echo "[eval] vLLM never served '${SERVED_NAME}' on :${VLLM_PORT}; see ${MHO_OUT:-/tmp}/vllm_serve.log" >&2; exit 1; }
+  echo "[eval] vLLM ready: '${SERVED_NAME}' on :${VLLM_PORT} (pid=${VLLM_PID})"
   MODEL="litellm_proxy/${SERVED_NAME}"; VLLM_LOCAL_URL="http://localhost:${VLLM_PORT}"
   if [ "${HARBOR_ENV}" = "modal" ]; then
     RELAY=1                                   # cloud sandboxes reach the vLLM via the relay
