@@ -96,6 +96,10 @@ def prepare(
         task_dir.mkdir(parents=True, exist_ok=True)
         (task_dir / "instruction.md").write_text(prompt_text + "\n")
         (task_dir / "task.toml").write_text(_task_toml(answer, f"mho/dapo-math-17k-{i:010d}"))
+        # harbor's Task.is_valid_dir requires BOTH task.toml and an environment/ dir; without
+        # it every task here is silently skipped ("Either datasets or tasks must be provided").
+        # Empty is correct: [environment].docker_image below names a stock image, so there is
+        # no Dockerfile to build and nothing to stage into the sandbox.
         (task_dir / "environment").mkdir(parents=True, exist_ok=True)
         _write_stub_tests(task_dir)
         n += 1

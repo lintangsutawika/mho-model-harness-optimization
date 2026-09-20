@@ -17,14 +17,21 @@
 #
 # Env: HARBOR_ENV, MHO_MODEL, MHO_HARNESS (->MINI_FORK_LOCAL), MHO_DATA / MHO_DATA_PATH, MHO_OUT,
 #   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_TEMPERATURE,
-#   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, SIF_IMAGE_CACHE_DIR, SINGULARITY_NO_MOUNT,
-#   MODAL_*, VLLM_SIF/VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
+#   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, BASE_SIF, SINGULARITY_NO_MOUNT,
+#   MODAL_*, VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
+#
+# Images: BASE_SIF is the only sif knob. The vLLM image (vllm-cuda.sif) and the docker->sif
+# cache (sif_cache/) are its siblings, so one path picks the whole set.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# MHO_REPO_DIR (set by the loop) / PBS_O_WORKDIR / SLURM_SUBMIT_DIR win over BASH_SOURCE,
-# which points at the PBS-spooled copy (/var/spool/pbs/...) in a batch job.
-REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}}}"
+# MHO_REPO_DIR (set by the loop) selects WHICH checkout is evaluated. That is the point of the
+# eval -- the harness edits live in that checkout -- so it is set explicitly or not at all; the
+# only fallback is this script's own repo. PBS_O_WORKDIR / SLURM_SUBMIT_DIR are deliberately NOT
+# consulted: under srun/sbatch they point at the submit dir, which silently evaluates a
+# different checkout and never reads this one's .env.
+REPO_DIR="${MHO_REPO_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 cd "$REPO_DIR"
+echo "[eval] repo: ${REPO_DIR}${MHO_REPO_DIR:+ (MHO_REPO_DIR)}"
 export PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
 # would shadow src/harness/ (agent_harness/math_verifier live only in src). src stays on
@@ -35,6 +42,15 @@ export PYTHONSAFEPATH=1
 # left harbor missing in the batch eval. Override with MHO_VENV_BIN.
 VENV_BIN="${MHO_VENV_BIN:-${REPO_DIR}/.venv/bin}"
 if [ -f "${REPO_DIR}/.env" ]; then set -a; . "${REPO_DIR}/.env"; set +a; fi
+# Every sif this script needs sits next to BASE_SIF. Resolve the dir now (empty if BASE_SIF is
+# unset) and demand it only on the paths that use one -- a modal run needs no image at all.
+SIF_DIR="${BASE_SIF:+$(dirname "${BASE_SIF}")}"
+require_sif_dir() {
+  [ -n "${SIF_DIR}" ] && return 0
+  echo "ERROR: BASE_SIF is not set; it resolves the vLLM image and the sif cache." >&2
+  echo "       Put it in ${REPO_DIR}/.env or export BASE_SIF=/path/to/<train>.sif" >&2
+  exit 2
+}
 
 HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' for cloud
 AGENT_IMPORT="${AGENT_IMPORT:-harness.agent_harness:AgentHarness}"
@@ -72,9 +88,10 @@ trap cleanup EXIT
 
 # --- self-serve the model with vLLM (if MHO_MODEL set) -----------------------
 if [ -n "${MHO_MODEL:-}" ]; then
-  VLLM_SIF="${VLLM_SIF:-$(dirname "${BASE_SIF}")/vllm-cuda.sif}"
+  require_sif_dir
+  VLLM_SIF="${SIF_DIR}/vllm-cuda.sif"
   VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
-  [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but no vLLM sif at ${VLLM_SIF}" >&2; exit 1; }
+  [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but no vLLM sif at ${VLLM_SIF} (sibling of BASE_SIF)" >&2; exit 1; }
   MODEL_BIND=(); [ -d "${MHO_MODEL}" ] && MODEL_BIND=(--bind "${MHO_MODEL}:${MHO_MODEL}")
   mkdir -p "${MHO_OUT:-/tmp}"
   # mini-swe-agent sends tool_choice=auto; vLLM needs --enable-auto-tool-choice +
@@ -142,9 +159,10 @@ else echo "ERROR: set MHO_DATA_PATH/HARBOR_PATH (-p) or MHO_DATA/HARBOR_DATASET 
 # -- no nesting, no external executor) or modal (cloud).
 ENV_FLAGS=()
 if [ "${HARBOR_ENV}" = "singularity" ]; then
+  require_sif_dir
   ENV_FLAGS=(
     -e "${HARBOR_SING_IMPORT:-mho.backends.local_singularity.environment:WritableSingularityEnvironment}"
-    --ek "singularity_image_cache_dir=${SIF_IMAGE_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
+    --ek "singularity_image_cache_dir=${SIF_DIR}/sif_cache"
   )
   [ -n "${SINGULARITY_NO_MOUNT:-}" ] && ENV_FLAGS+=( --ek "singularity_no_mount=${SINGULARITY_NO_MOUNT}" )
 else

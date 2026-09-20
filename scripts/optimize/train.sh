@@ -27,7 +27,9 @@ source .env
 
 # --- storage / data (mirror train_math_dapo.sh) ---------------------------------
 USER_DATA="${USER_DATA:-/data/user_data/lsutawik}"
-SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
+# BASE_SIF (from .env) is the only sif knob: the docker->sif cache is its sibling.
+[ -n "${BASE_SIF:-}" ] || { echo "ERROR: BASE_SIF is not set (put it in ${REPO_DIR}/.env)" >&2; exit 2; }
+SIF_IMAGE_CACHE_DIR="$(dirname "${BASE_SIF}")/sif_cache"
 mkdir -p "$SIF_IMAGE_CACHE_DIR"
 MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data-harbor/DAPO-Math-17k}"
 MATH_TRAIN_DIR="${MATH_TRAIN_DIR:-${MATH_DATA_DIR}/train}"
