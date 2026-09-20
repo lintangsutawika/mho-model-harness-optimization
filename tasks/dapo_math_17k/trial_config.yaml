@@ -42,10 +42,11 @@ verifier:
 # Sandbox the agent works in. On this HPC there is no Docker daemon, so we use
 # harbor's `singularity` environment: it runs the agent in an apptainer sandbox
 # NESTED inside the training container (scripts/train/train_math_dapo.sh binds the
-# host apptainer + support libs in and pre-seeds the image cache). Each task's
-# task.toml [environment].docker_image (python:3.11-slim) is pulled/converted to
-# .sif once and cached at singularity_image_cache_dir (pre-seeded as
-# python_3.11-slim.sif, so no pull happens at run time). No GPU needed.
+# host apptainer + support libs in). Each task's task.toml [environment].docker_image
+# (the stock python:3.11-slim) is pulled/converted to .sif once and cached at
+# singularity_image_cache_dir, then extracted to a writable sandbox that the
+# local_singularity backend prepares for harbor's bootstrap (tmux, /usr/bin/python3,
+# uv + the math stack) once, before any trial runs. No GPU needed.
 environment:
   type: singularity
   # Bind a prebuilt venv onto /opt/harbor-server. bootstrap.sh hardcodes its server
@@ -59,8 +60,8 @@ environment:
       source: /mnt/harbor_server_opt
       target: /opt
   kwargs:
-    # Matches the in-container bind target in train_math_dapo.sh; pre-seeded with
-    # python_3.11-slim.sif so harbor's converter finds it and skips the docker pull.
+    # Matches the in-container bind target in train_math_dapo.sh; persistent, so the
+    # converted python_3.11-slim.sif is reused instead of re-pulled every job.
     singularity_image_cache_dir: /mnt/sif_cache
 
 # Trials root (relative to the training job cwd).

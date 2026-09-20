@@ -17,11 +17,13 @@ UV_CACHE_PERSIST="${UV_CACHE_PERSIST:-${USER_DATA}/uv_cache}"
 mkdir -p "$UV_CACHE_PERSIST"
 
 # Host-writable SIF image cache for the external executor's docker->sif sandbox conversion.
-# PERSISTENT (next to BASE_SIF, not node-local) so a pre-seeded python_3.11-slim.sif -- built
-# from tasks/dapo_math_17k/agent_sandbox.def (adds /usr/bin/python3 + tools harbor's bootstrap
-# needs) -- survives across jobs and is reused instead of re-pulling vanilla python:3.11-slim.
+# BASE_SIF is the only sif knob: the cache is its sibling, and PERSISTENT (not node-local) so
+# the pulled python:3.11-slim survives across jobs instead of being re-pulled. What that stock
+# image is missing for harbor's bootstrap is added once per sandbox by the local_singularity
+# backend, so nothing here has to be built by hand.
 # Passed into the SIF so train_entrypoint writes it into each trial's environment config.
-SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
+[ -n "${BASE_SIF:-}" ] || { echo "ERROR: BASE_SIF is not set (put it in ${REPO_DIR}/.env)" >&2; exit 2; }
+SIF_IMAGE_CACHE_DIR="$(dirname "${BASE_SIF}")/sif_cache"
 mkdir -p "$SIF_IMAGE_CACHE_DIR"
 
 MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data-harbor/DAPO-Math-17k}"
