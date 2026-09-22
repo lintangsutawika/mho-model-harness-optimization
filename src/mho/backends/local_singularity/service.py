@@ -60,9 +60,12 @@ from harbor.models.trial.paths import TrialPaths  # noqa: E402
 from harbor.models.trial.result import TrialResult  # noqa: E402
 from harbor.trial.trial import Trial  # noqa: E402
 
-# Import the backend so it loads in-process (fail fast) and captures the ORIGINAL
-# asyncio.create_subprocess_exec before any wrapping.
-from . import environment as _env  # noqa: E402
+# Host-side sandbox engine: harbor-singularity-hpc's writable-rootfs Singularity
+# environment (drift-guarded against harbor c178c20, proven on this cluster by the
+# tts-tokens-that-suffice project). Replaces the hand-rolled WritableSingularityEnvironment
+# that lived in ./environment.py. The in-SIF RemoteSingularityEnvironment still forwards
+# /sandbox provisioning here; sandboxes run on THIS host, not nested in the training SIF.
+from harbor_singularity_hpc.environment import SingularityWritableEnvironment as _WritableEnv  # noqa: E402
 
 log = logging.getLogger("mho.backends.local_singularity.service")
 logging.basicConfig(level=logging.INFO)
@@ -82,10 +85,10 @@ if _STAGING_ROOT:
 
 app = FastAPI(title="mho-local-singularity-service")
 
-_BACKEND_IMPORT_PATH = "mho.backends.local_singularity.environment:WritableSingularityEnvironment"
+_BACKEND_IMPORT_PATH = "harbor_singularity_hpc.environment:SingularityWritableEnvironment"
 
 # Live sandboxes provisioned via /sandbox, keyed by sandbox_id.
-_SANDBOXES: dict[str, _env.WritableSingularityEnvironment] = {}
+_SANDBOXES: dict[str, _WritableEnv] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -122,7 +125,7 @@ async def post_trial(request: Request) -> JSONResponse:
 # --------------------------------------------------------------------------- #
 # Sandbox-lifecycle path (Miles / lossless)
 # --------------------------------------------------------------------------- #
-def _build_env(payload: dict) -> _env.WritableSingularityEnvironment:
+def _build_env(payload: dict) -> _WritableEnv:
     """Reconstruct the host-side writable singularity environment from a /sandbox payload.
 
     The manager only ever calls start()/stop() on this env (launch + tear down the
@@ -137,7 +140,7 @@ def _build_env(payload: dict) -> _env.WritableSingularityEnvironment:
     _host_cache = os.environ.get("SIF_IMAGE_CACHE_DIR")
     if _host_cache:
         env_kwargs["singularity_image_cache_dir"] = _host_cache
-    return _env.WritableSingularityEnvironment(
+    return _WritableEnv(
         environment_dir=Path(payload["environment_dir"]),
         environment_name=payload["environment_name"],
         session_id=payload["session_id"],
