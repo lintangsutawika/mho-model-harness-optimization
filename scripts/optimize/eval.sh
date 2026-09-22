@@ -5,7 +5,7 @@
 #
 # Sandbox environment (HARBOR_ENV, default 'singularity'):
 #   singularity -> run trials in LOCAL apptainer sandboxes on THIS node via our
-#                  WritableSingularityEnvironment. harbor run executes on the host (not nested),
+#                  SingularityWritableEnvironment. harbor run executes on the host (not nested),
 #                  and the sandbox shares the host net namespace, so the agent reaches the local
 #                  vLLM at localhost directly -- NO Modal, NO relay.
 #   modal       -> cloud sandboxes; the local vLLM is exposed to them via the Modal reverse relay.
@@ -20,8 +20,9 @@
 #   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, BASE_SIF, SINGULARITY_NO_MOUNT,
 #   MODAL_*, VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
 #
-# Images: BASE_SIF is the only sif knob. The vLLM image (vllm-cuda.sif) and the docker->sif
-# cache (sif_cache/) are its siblings, so one path picks the whole set.
+# Images: BASE_SIF is the ONLY sif knob -- it serves training AND vLLM serving (the train
+# image ships vLLM). The docker->sif cache (sif_cache/) is its sibling, so one path picks
+# the whole set; no separate vllm-cuda.sif image.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # MHO_REPO_DIR (set by the loop) selects WHICH checkout is evaluated. That is the point of the
@@ -47,13 +48,28 @@ if [ -f "${REPO_DIR}/.env" ]; then set -a; . "${REPO_DIR}/.env"; set +a; fi
 SIF_DIR="${BASE_SIF:+$(dirname "${BASE_SIF}")}"
 require_sif_dir() {
   [ -n "${SIF_DIR}" ] && return 0
-  echo "ERROR: BASE_SIF is not set; it resolves the vLLM image and the sif cache." >&2
+  echo "ERROR: BASE_SIF is not set; it resolves training, vLLM serving, and the sif cache." >&2
   echo "       Put it in ${REPO_DIR}/.env or export BASE_SIF=/path/to/<train>.sif" >&2
   exit 2
 }
 
 HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' for cloud
 AGENT_IMPORT="${AGENT_IMPORT:-harness.agent_harness:AgentHarness}"
+# Custom harbor-singularity-hpc env class, selected by --environment-import-path (harbor's
+# -e is a fixed enum and cannot name a custom class). Override to test a fork.
+HARBOR_SING_IMPORT="${HARBOR_SING_IMPORT:-harbor_singularity_hpc.environment:SingularityWritableEnvironment}"
+# Singularity (on-node) knobs. The .sif cache is a PERSISTENT SHARED dir for converted task
+# images, decoupled from the sif-in-use (BASE_SIF); node-local dirs are wiped per job, causing
+# re-pulls. Sandbox dir defaults to live $PBS_LOCALDIR.
+SINGULARITY_CACHE_DIR="${SINGULARITY_CACHE_DIR:-$(dirname "${BASE_SIF}")/sif_cache}"
+SINGULARITY_FORCE_PULL="${SINGULARITY_FORCE_PULL:-}"
+SINGULARITY_NO_MOUNT="${SINGULARITY_NO_MOUNT:-home,tmp}"
+SINGULARITY_WRITABLE_SANDBOX="${SINGULARITY_WRITABLE_SANDBOX:-}"     # empty=on (adapter default)
+SINGULARITY_SANDBOX_DIR="${SINGULARITY_SANDBOX_DIR:-}"               # empty=node-local scratch
+SINGULARITY_MEMORY_MB="${SINGULARITY_MEMORY_MB:-}"
+SINGULARITY_MEMORY_ENFORCEMENT="${SINGULARITY_MEMORY_ENFORCEMENT:-}"
+# Modal sandbox knobs.
+ALLOW_HOST="${ALLOW_HOST:-}"
 TASK_SET="${TASK_SET:-full}"
 RUNS="${N_ATTEMPTS:-1}"
 N_CONCURRENT="${N_CONCURRENT:-16}"
@@ -89,9 +105,10 @@ trap cleanup EXIT
 # --- self-serve the model with vLLM (if MHO_MODEL set) -----------------------
 if [ -n "${MHO_MODEL:-}" ]; then
   require_sif_dir
-  VLLM_SIF="${SIF_DIR}/vllm-cuda.sif"
+  # vLLM serving runs from BASE_SIF itself (it ships vllm serve); no separate vllm-cuda.sif.
+  VLLM_SIF="${BASE_SIF}"
   VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
-  [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but no vLLM sif at ${VLLM_SIF} (sibling of BASE_SIF)" >&2; exit 1; }
+  [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but BASE_SIF missing: ${BASE_SIF}" >&2; exit 1; }
   MODEL_BIND=(); [ -d "${MHO_MODEL}" ] && MODEL_BIND=(--bind "${MHO_MODEL}:${MHO_MODEL}")
   mkdir -p "${MHO_OUT:-/tmp}"
   # mini-swe-agent sends tool_choice=auto; vLLM needs --enable-auto-tool-choice +
@@ -155,22 +172,29 @@ DATA_FLAG=()
 if [ -n "${HARBOR_PATH}" ]; then DATA_FLAG=(-p "${HARBOR_PATH}")
 elif [ -n "${HARBOR_DATASET}" ]; then DATA_FLAG=(-d "${HARBOR_DATASET}")
 else echo "ERROR: set MHO_DATA_PATH/HARBOR_PATH (-p) or MHO_DATA/HARBOR_DATASET (-d)" >&2; exit 2; fi
-# Environment selection: local singularity (our WritableSingularityEnvironment, run on the host
+# Environment selection: local singularity (our harbor-singularity-hpc SingularityWritableEnvironment, run on the host
 # -- no nesting, no external executor) or modal (cloud).
+# Environment selection. `singularity` is a custom class from harbor-singularity-hpc, so it is
+# picked by --environment-import-path (harbor's -e is a fixed enum). modal uses the built-in -e.
 ENV_FLAGS=()
 if [ "${HARBOR_ENV}" = "singularity" ]; then
   require_sif_dir
-  ENV_FLAGS=(
-    -e "${HARBOR_SING_IMPORT:-mho.backends.local_singularity.environment:WritableSingularityEnvironment}"
-    --ek "singularity_image_cache_dir=${SIF_DIR}/sif_cache"
-  )
-  [ -n "${SINGULARITY_NO_MOUNT:-}" ] && ENV_FLAGS+=( --ek "singularity_no_mount=${SINGULARITY_NO_MOUNT}" )
+  [ -n "${SINGULARITY_CACHE_DIR}" ] && mkdir -p "${SINGULARITY_CACHE_DIR}" 2>/dev/null || true
+  ENV_FLAGS=( --environment-import-path "${HARBOR_SING_IMPORT}" )
+  # The .sif cache: a PERSISTENT dir for converted task images -- NOT the sif-in-use dir.
+  [ -n "${SINGULARITY_CACHE_DIR}" ] && ENV_FLAGS+=( --ek "singularity_image_cache_dir=${SINGULARITY_CACHE_DIR}" )
+  [ -n "${SINGULARITY_FORCE_PULL}" ] && ENV_FLAGS+=( --ek "singularity_force_pull=${SINGULARITY_FORCE_PULL}" )
+  [ -n "${SINGULARITY_NO_MOUNT}" ] && ENV_FLAGS+=( --ek "singularity_no_mount=${SINGULARITY_NO_MOUNT}" )
+  [ -n "${SINGULARITY_WRITABLE_SANDBOX}" ] && ENV_FLAGS+=( --ek "singularity_writable_sandbox=${SINGULARITY_WRITABLE_SANDBOX}" )
+  [ -n "${SINGULARITY_SANDBOX_DIR}" ] && ENV_FLAGS+=( --ek "singularity_sandbox_dir=${SINGULARITY_SANDBOX_DIR}" )
+  [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
+  [ -n "${SINGULARITY_MEMORY_ENFORCEMENT}" ] && ENV_FLAGS+=( --ek "memory_enforcement_policy=${SINGULARITY_MEMORY_ENFORCEMENT}" )
 else
-  ENV_FLAGS=(
-    -e modal --ek "app_name=${MODAL_APP_NAME}"
-    --ek "sandbox_timeout_secs=${MODAL_SANDBOX_TIMEOUT_SEC}"
-    --ek "sandbox_idle_timeout_secs=${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}"
-  )
+  ENV_FLAGS=( -e modal )
+  [ -n "${MODAL_APP_NAME}" ] && ENV_FLAGS+=( --ek "app_name=${MODAL_APP_NAME}" )
+  [ -n "${MODAL_SANDBOX_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_timeout_secs=${MODAL_SANDBOX_TIMEOUT_SEC}" )
+  [ -n "${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_idle_timeout_secs=${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" )
+  [ -n "${ALLOW_HOST}" ] && ENV_FLAGS+=( --allow-agent-host "${ALLOW_HOST}" )
 fi
 # Output location: write to a deterministic dir (MHO_OUT, else runs_output/eval) with a stable
 # job name, so results are findable (harbor's default is a timestamped dir under ./jobs).
