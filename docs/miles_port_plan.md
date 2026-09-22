@@ -41,7 +41,6 @@ rewards, a full training step).
 | `src/mho/dataset.py` | `HarborTaskDataset`. |
 | `tasks/dapo_math_17k/prepare.py` | Data prep → harbor task dirs. **Reuse as-is.** |
 | `tasks/dapo_math_17k/trial_config.yaml` | Harbor trial config (agent/verifier/env). **Reuse.** |
-| `tasks/dapo_math_17k/agent_sandbox.def` | Sandbox image recipe (python3.11 + harbor server venv + math tools). **Reuse.** |
 | `src/harness/agent_harness.py` | `AgentHarness(MiniSweAgent)` — the harbor agent. **Reuse** (import path `harness.agent_harness:AgentHarness`). |
 | `src/harness/math_verifier.py` | `MathVerifier` — grades answers. **Reuse** (`harness.math_verifier:MathVerifier`). |
 | `src/mho/backends/local_singularity/environment.py` | `WritableSingularityEnvironment` — the harbor singularity backend (extract-to-writable-dir + argv rewrite + /dev,resolv.conf binds + per-image extraction lock). **Reuse.** |
@@ -59,8 +58,9 @@ same on Miles — **only the trainer-side caller changes** (SkyRL generator → 
 function).
 
 Runtime pieces that already exist and are reused verbatim:
-- Fat sandbox image `python_3.11-slim.sif` in `sif_cache` (built from `agent_sandbox.def`;
-  has `/usr/bin/python3`, `/opt/harbor-server` venv w/ uvicorn+fastapi, math tools).
+- `sif_cache` next to `BASE_SIF`, holding the converted stock `python:3.11-slim.sif`. What
+  that image lacks for harbor's bootstrap (`/usr/bin/python3`, tmux, uv, math tools) is
+  installed once per extracted sandbox by `WritableSingularityEnvironment`, not baked by hand.
 - Host executor venv `/home/aci18914wh/executor_env/.venv` (harbor + fastapi + uvicorn +
   httpx + **loguru + sympy** — the last two needed by the verifier).
 - `.env`: `EXECUTOR_URL=http://127.0.0.1:8900`, `HARBOR_ENV_TYPE=singularity`, `BASE_SIF`,
@@ -166,7 +166,7 @@ DEF (localimage From base):  %post →
    # layer harbor + our thin deps so the Harbor rollout + tasks import in-process:
    uv pip install (or pip) "harbor[modal] @ git+…@<HARBOR_REV>" terminal-bench==0.2.18 \
        litellm python-dotenv pyyaml sympy loguru
-   # perms fix if the base hides its python under a non-world-readable home (see agent_sandbox/
+   # perms fix if the base hides its python under a non-world-readable home (see the
    #   build_train.sh chmod trick) — verify with a non-root `singularity exec` import test.
 OUT:   $(dirname BASE_SIF)/miles.sif
 ```
@@ -193,8 +193,8 @@ Miles Harbor loader tolerates that (SkyRL's harbor did).
 > the container side is proven. **Key correctness finding:** the writable-sandbox
 > extraction only fires when `docker_image` is a **docker ref** (e.g. `python:3.11-slim`),
 > because harbor's `start()` skips `_convert_docker_to_sif` for a prebuilt `.sif` path
-> (`_is_sif_image`). The task config already uses the docker ref (converter finds the
-> pre-seeded `python_3.11-slim.sif` in the cache dir) — keep it that way. **Cross-boundary
+> (`_is_sif_image`). The task config already uses the docker ref (the converter caches the
+> pulled image as `python_3.11-slim.sif`) — keep it that way. **Cross-boundary
 > gotcha for Step 4:** bind-mount `source` paths + `singularity_image_cache_dir` in the
 > config are resolved by the *host manager*, so they must be host-valid paths (the manager
 > already overrides the cache dir from its own `SIF_IMAGE_CACHE_DIR`; the launch script

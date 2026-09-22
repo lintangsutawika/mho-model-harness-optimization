@@ -89,6 +89,62 @@ def _install_writable_argv_rewrite() -> None:
     asyncio.create_subprocess_exec = _wrapped_create_subprocess_exec  # type: ignore[assignment]
 
 
+# Stock images do not satisfy harbor's bootstrap.sh. For the default python sandbox
+# (python:3.11-slim, the image the math tasks declare) it exits with
+# "FATAL: cannot install /usr/bin/python3" -- the python image ships its interpreter only at
+# /usr/local/bin/python3 -- and it lacks the tmux harbor execs agent commands through. apt
+# cannot supply either inside the fakeroot namespace harbor runs trials in: only uid 0 is
+# mapped, so apt's drop to the unmapped `_apt` user dies on /var/cache/apt/.../partial.
+#
+# bootstrap.sh retries this per trial, but the writable sandbox is shared by every trial in
+# this process (one dir per sif, below), so concurrent trials pile onto one dpkg lock and
+# hang. Doing it ONCE here, under the same lock that guards the extraction and before any
+# trial starts, lets the tasks keep declaring the stock image and leaves the per-trial
+# bootstrap with nothing to install.
+_DEFAULT_SANDBOX_IMAGE = "python:3.11-slim"
+
+_SANDBOX_PREP = r"""
+set -eu
+printf 'APT::Sandbox::User "root";\n' > /etc/apt/apt.conf.d/99-disable-sandbox
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq --no-install-recommends \
+    tmux curl ca-certificates bash build-essential git python3-pip
+apt-get clean && rm -rf /var/lib/apt/lists/*
+# AFTER apt: python3-pip pulls in Debian's python3, which has no ensurepip, so bootstrap.sh
+# could not create its server venv. Point /usr/bin/python3 at the image's own interpreter.
+ln -sf /usr/local/bin/python3 /usr/bin/python3
+ln -sf /usr/local/bin/python3 /usr/bin/python
+mkdir -p /app                       # harbor launches the sandbox with --pwd /app
+# uv so the agent's `curl | sh` bootstrap is a no-op, plus the math stack so the agent can
+# compute in-sandbox (python3 -c "import sympy ...") on the DAPO-Math tasks.
+pip install --no-cache-dir uv sympy numpy scipy mpmath
+"""
+
+
+async def _prepare_sandbox(sandbox: Path) -> None:
+    """Make an extracted python sandbox ready for harbor's bootstrap. Runs once per sif."""
+    binds = [
+        arg
+        for host in ("/dev", "/etc/resolv.conf", "/etc/hosts")
+        if os.path.exists(host)
+        for arg in ("--bind", host)
+    ]
+    # Same flags harbor execs trials with (fakeroot for apt, containall for isolation), minus
+    # --writable-tmpfs: writes must land in the sandbox dir to outlive this exec.
+    cmd = ["singularity", "exec", "--writable", "--fakeroot", "--containall", *binds,
+           str(sandbox), "bash", "-c", _SANDBOX_PREP]
+    log.info("Preparing sandbox for harbor bootstrap: %s", sandbox)
+    proc = await _ORIG_CREATE_SUBPROCESS(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    out, _ = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Failed to prepare sandbox {sandbox}: {out.decode(errors='replace')}"
+        )
+
+
 # One extraction per sif, guarded by a per-sif lock: with many concurrent trials, every
 # trial's WritableSingularityEnvironment calls this for the SAME sif, and racing
 # `rm -rf`+`singularity build --sandbox` on one path fails ("sandbox assemble failed: ...
@@ -96,7 +152,7 @@ def _install_writable_argv_rewrite() -> None:
 _EXTRACT_LOCKS: dict[str, "asyncio.Lock"] = {}
 
 
-async def _extract_writable_sandbox(sif_path: Path) -> Path:
+async def _extract_writable_sandbox(sif_path: Path, *, prepare: bool = False) -> Path:
     key = str(sif_path)
     lock = _EXTRACT_LOCKS.setdefault(key, asyncio.Lock())
     async with lock:
@@ -122,6 +178,8 @@ async def _extract_writable_sandbox(sif_path: Path) -> Path:
                 f"Failed to build writable sandbox from {sif_path}: "
                 f"{stderr.decode(errors='replace')}"
             )
+        if prepare:
+            await _prepare_sandbox(sandbox)
         _WRITABLE_REGISTRY[key] = sandbox
         return sandbox
 
@@ -139,17 +197,21 @@ class WritableSingularityEnvironment(SingularityEnvironment):
         """Fall back to a default image when a task omits [environment].docker_image.
 
         Pure-reasoning registry tasks (e.g. AIME math) don't declare an environment, but harbor's
-        singularity backend requires one. Default to python:3.11-slim -- whose safe_name resolves
-        to the pre-built sif_cache/python_3.11-slim.sif (the fat sandbox from agent_sandbox.def:
-        tmux + uv + /usr/bin/python3 + the harbor-server venv), so the agent's bootstrap works the
-        same as on the training path. Override with MHO_DEFAULT_DOCKER_IMAGE."""
+        singularity backend requires one. Default to the same stock python:3.11-slim the math
+        tasks declare, so the agent's bootstrap works the same as on the training path.
+        Override with MHO_DEFAULT_DOCKER_IMAGE."""
         return self.task_env_config.docker_image or os.environ.get(
-            "MHO_DEFAULT_DOCKER_IMAGE", "python:3.11-slim"
+            "MHO_DEFAULT_DOCKER_IMAGE", _DEFAULT_SANDBOX_IMAGE
         )
 
     async def _convert_docker_to_sif(self, docker_image: str, *, force_pull: bool = False) -> Path:
         sif = await super()._convert_docker_to_sif(docker_image, force_pull=force_pull)
         if self._writable_sandbox:
-            sbx = await _extract_writable_sandbox(sif)
+            # Prep only the default python sandbox. A task that ships its own image already
+            # provides its environment; installing into it would change what it tests.
+            prepare = docker_image == os.environ.get(
+                "MHO_DEFAULT_DOCKER_IMAGE", _DEFAULT_SANDBOX_IMAGE
+            )
+            sbx = await _extract_writable_sandbox(sif, prepare=prepare)
             _WRITABLE_REGISTRY[str(sif)] = sbx
         return sif

@@ -1,0 +1,14 @@
+schema_version = "1.4"
+[task]
+name = "{name}"
+[environment]
+docker_image = "python:3.11-slim"
+network_mode = "public"
+[agent]
+override_timeout_sec = 1800.0
+[verifier]
+environment_mode = "shared"
+[metadata]
+task_family = "HMMT-Feb-2025"
+ability = "MATH"
+answer = {answer}
