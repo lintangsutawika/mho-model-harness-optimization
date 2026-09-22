@@ -195,6 +195,9 @@ else
   [ -n "${MODAL_SANDBOX_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_timeout_secs=${MODAL_SANDBOX_TIMEOUT_SEC}" )
   [ -n "${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_idle_timeout_secs=${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" )
   [ -n "${ALLOW_HOST}" ] && ENV_FLAGS+=( --allow-agent-host "${ALLOW_HOST}" )
+# Math verifier for standalone harbor evals (defaults to the repo custom grader,
+# mirroring miles_agent_fn.py). Passed to `harbor run --verifier`.
+MHO_VERIFIER="${MHO_VERIFIER:-harness.math_verifier:MathVerifier}"
 fi
 # Output location: write to a deterministic dir (MHO_OUT, else runs_output/eval) with a stable
 # job name, so results are findable (harbor's default is a timestamped dir under ./jobs).
