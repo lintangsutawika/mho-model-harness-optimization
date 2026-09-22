@@ -51,7 +51,6 @@ from harbor.models.trial.config import VerifierConfig as _VerifierConfig  # noqa
 # trial_config.yaml), so without this every trial hits RewardFileNotFoundError -> reward 0.
 # We wrap build_trial_config to set verifier.import_path (preserving any timeout override).
 # --------------------------------------------------------------------------- #
-_MHO_VERIFIER = os.environ.get("MHO_VERIFIER_IMPORT_PATH", "harness.math_verifier:MathVerifier")
 _orig_build_trial_config = _haf.build_trial_config
 
 
@@ -60,7 +59,7 @@ def _build_trial_config_with_verifier(*args, **kwargs):
     existing = getattr(tc, "verifier", None)
     if existing is None or getattr(existing, "import_path", None) is None:
         tc = tc.model_copy(update={"verifier": _VerifierConfig(
-            import_path=_MHO_VERIFIER,
+            import_path=os.environ.get("MHO_VERIFIER", "harness.math_verifier:MathVerifier"),
             override_timeout_sec=getattr(existing, "override_timeout_sec", None),
         )})
     return tc
