@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "harbor[modal]",
+  "harbor-singularity-hpc; python_version >= '3.12'",
   "terminal-bench==0.2.18",
   "litellm",
   "python-dotenv",
@@ -17,3 +18,4 @@ package = false
 
 [tool.uv.sources]
 harbor = { git = "https://github.com/harbor-framework/harbor.git", rev = "c178c20710c362ef806c5d5d18852f95b21ca34b" }
+harbor-singularity-hpc = { git = "https://github.com/lintangsutawika/harbor-singularity-hpc.git", rev = "91d6a3315770c51b846c782ef88488203bb27854" }
