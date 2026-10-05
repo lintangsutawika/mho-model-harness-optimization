@@ -245,3 +245,6 @@ src/.claude/skills/meta-harness-terminal-bench-2/
 
 # generated dataset artifacts (never commit)
 tasks/*/data/
+
+# Problem JSONL is rebuilt from HuggingFace by each task package on first use.
+tasks/*/data/
