@@ -1,14 +1,13 @@
-"""Harbor verifier for DAPO-Math math tasks: sympy-normalized exact-answer match.
+"""Harbor verifier for short-answer math tasks.
 
 Grades a trial by extracting the agent's final ``Answer: <answer>`` line (the
 DAPO instruction mandates that format) from the agent's trajectory, then
 normalizing both the candidate and the task's ground truth with sympy and
 returning reward 1.0 iff they are mathematically equal, else 0.0.
 
-Because every DAPO-Math-17k ground truth is a signed integer regex ``-?\d+``,
-in practice this is integer equality after normalizing lexical variants
-(``+5``, ``5.0``, `` 5 `` -> 5). Sympy parsing also tolerates fractions and
-radical forms if a future dataset uses them.
+MathArena answers can contain LaTeX fractions, radicals, or other equivalent
+expressions.  Grade those with ``math_verify`` first (the same library used by
+MathArena), then fall back to the older sympy/string comparison used for DAPO.
 
 Attached to a trial via ``verifier.import_path`` in the harbor trial config
 (see harbor_trial_config/default.yaml). Subclasses harbor's
@@ -20,8 +19,6 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, override
-
-from loguru import logger
 
 from harbor.models.verifier.result import VerifierResult
 from harbor.verifier.base import BaseVerifier
@@ -105,7 +102,23 @@ def _parse_number(text: str) -> Any | None:
 
 
 def _answers_equal(candidate: str, ground_truth: str) -> bool:
-    """Sympy-normalized exact match between two answer strings."""
+    """MathArena-compatible equivalence with conservative fallbacks."""
+    try:
+        from math_verify import parse, verify
+
+        gold = parse(
+            ground_truth
+            if ground_truth.strip().startswith("$")
+            else f"${ground_truth}$"
+        )
+        pred = parse(
+            candidate if candidate.strip().startswith("$") else f"${candidate}$"
+        )
+        if verify(gold, pred):
+            return True
+    except Exception:
+        pass
+
     cand = _parse_number(candidate)
     truth = _parse_number(ground_truth)
     if cand is None or truth is None:
