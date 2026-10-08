@@ -13,7 +13,7 @@ which phases run is set by --mode:
     model-harness : propose -> train -> eval
 
 Only the *fitting* bits are borrowed from stanford-iris-lab/meta-harness: scoring a
-harbor trials dir (via scripts/eval/aggregate_results.py), a JSONL frontier + evolution
+harbor trials dir (via scripts/optimize/aggregate_results.py), a JSONL frontier + evolution
 summary, and the propose->eval sequencing. Everything else here is PBS orchestration.
 
 The phase jobs are the existing scripts, submitted directly (`qsub -V <script>` with
@@ -36,7 +36,7 @@ from typing import Any
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = Path(os.environ.get("MHO_RUNS_DIR", REPO_DIR / "runs_output" / "optimize"))
-AGGREGATE_PY = REPO_DIR / "scripts" / "eval" / "aggregate_results.py"
+AGGREGATE_PY = REPO_DIR / "scripts" / "optimize" / "aggregate_results.py"
 
 # Phase job scripts submitted by the loop (one per phase). Each dispatches to the concrete
 # entrypoint from env (eval.sh on MHO_TASK; train.sh on MHO_TRAINER). Overridable via env.
@@ -51,7 +51,7 @@ POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
 
 
 # --------------------------------------------------------------------------- #
-# Scoring -- reuse scripts/eval/aggregate_results.py (no duplication).
+# Scoring -- reuse scripts/optimize/aggregate_results.py (no duplication).
 # --------------------------------------------------------------------------- #
 _AGG = None
 
