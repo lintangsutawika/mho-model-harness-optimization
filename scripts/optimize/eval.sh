@@ -16,7 +16,7 @@
 #   MHO_MODEL unset-> use MODEL (a litellm id) directly (API model; no self-serve).
 #
 # Env: HARBOR_ENV, MHO_MODEL, MHO_HARNESS (->MINI_FORK_LOCAL), MHO_DATA / MHO_DATA_PATH, MHO_OUT,
-#   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_TEMPERATURE,
+#   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_CONFIG,
 #   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, BASE_SIF, SINGULARITY_NO_MOUNT,
 #   MODAL_*, VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
 #
@@ -86,7 +86,30 @@ if [ -z "${MINI_FORK_LOCAL:-}" ]; then
     || { echo "ERROR: no harness set and base scaffold not found (set MHO_HARNESS or MICRO_SCAFFOLD_BASE)" >&2; exit 2; }
   echo "[eval] no harness passed -> using base scaffold: ${MINI_FORK_LOCAL}"
 fi
-AGENT_TEMPERATURE="${AGENT_TEMPERATURE:-0.7}"
+# Sampling knobs come from configs/sampling/<hf-repo>.yaml, chosen by the model under test:
+# MHO_MODEL when self-hosting, else MODEL with its litellm provider prefix stripped (the
+# serving block below rewrites MODEL to litellm_proxy/<served-name>, so it cannot be used for
+# the self-hosted path). harbor's installed MiniSweAgent reads `config_file` and hands it to
+# the mini-swe-agent CLI as `-c <file>` on top of `-c mini`; it has no `temperature`
+# parameter, so the `--ak temperature=` this script used to pass landed in **kwargs unread
+# and every trial ran at mini.yaml's defaults. Resolved and checked here, before a server or
+# a sandbox is paid for, and fatal when absent for the same reason the old path was a bug:
+# silently sampling at the wrong settings is worse than not starting. AGENT_CONFIG=<file>
+# overrides the path, AGENT_CONFIG=none runs mini.yaml as-is.
+if [ -n "${MHO_MODEL:-}" ]; then
+  _AGENT_CONFIG_MODEL="${MHO_MODEL}"
+else
+  _AGENT_CONFIG_MODEL="${MODEL:-}"; _AGENT_CONFIG_MODEL="${_AGENT_CONFIG_MODEL#*/}"
+fi
+AGENT_CONFIG="${AGENT_CONFIG:-${REPO_DIR}/configs/sampling/${_AGENT_CONFIG_MODEL}.yaml}"
+if [ "${AGENT_CONFIG}" = "none" ]; then
+  AGENT_CONFIG=""
+elif [ ! -f "${AGENT_CONFIG}" ]; then
+  echo "ERROR: no sampling config at ${AGENT_CONFIG}" >&2
+  echo "       add it, or pass AGENT_CONFIG=<file>, or AGENT_CONFIG=none to use mini.yaml as-is" >&2
+  exit 2
+fi
+echo "[eval] sampling config: ${AGENT_CONFIG:-<none, mini.yaml defaults>}"
 AGENT_TIMEOUT_MULTIPLIER="${AGENT_TIMEOUT_MULTIPLIER:-}"
 HARBOR_TIMEOUT_SECONDS="${HARBOR_TIMEOUT_SECONDS:-28800}"
 MODAL_APP_NAME="${MODAL_APP_NAME:-mho_opt_eval}"
@@ -207,9 +230,10 @@ mkdir -p "${EVAL_JOBS_DIR}"
 CMD=(
   "${VENV_BIN}/harbor" run --agent "${AGENT_IMPORT}" "${DATA_FLAG[@]}" -m "${MODEL}" "${ENV_FLAGS[@]}"
   --jobs-dir "${EVAL_JOBS_DIR}" --job-name "${EVAL_JOB_NAME}"
-  -n "${N_CONCURRENT}" --n-attempts "${RUNS}" --ak "temperature=${AGENT_TEMPERATURE}"
+  -n "${N_CONCURRENT}" --n-attempts "${RUNS}"
   ${MHO_VERIFIER:+--verifier "${MHO_VERIFIER}"}
 )
+[ -n "${AGENT_CONFIG}" ] && CMD+=( --ak "config_file=${AGENT_CONFIG}" )
 [ -n "${MINI_FORK_LOCAL:-}" ] && CMD+=( --ak "mini_fork_local=${MINI_FORK_LOCAL}" )
 
 # --- Modal reverse relay (only for HARBOR_ENV=modal: expose local vLLM to cloud sandboxes) --
