@@ -16,7 +16,7 @@
 #   MHO_MODEL unset-> use MODEL (a litellm id) directly (API model; no self-serve).
 #
 # Env: HARBOR_ENV, MHO_MODEL, MHO_HARNESS (->MINI_FORK_LOCAL), MHO_DATA / MHO_DATA_PATH, MHO_OUT,
-#   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_TEMPERATURE,
+#   AGENT_IMPORT, MODEL, N_ATTEMPTS, N_CONCURRENT, TASK_SET, AGENT_CONFIG, AGENT_TASK_CONFIG,
 #   AGENT_TIMEOUT_MULTIPLIER, HARBOR_TIMEOUT_SECONDS, BASE_SIF, SINGULARITY_NO_MOUNT,
 #   MODAL_*, VLLM_PORT/SERVED_NAME/VLLM_EXTRA_ARGS, RELAY/VLLM_LOCAL_URL/RELAY_APP_NAME.
 #
@@ -86,7 +86,31 @@ if [ -z "${MINI_FORK_LOCAL:-}" ]; then
     || { echo "ERROR: no harness set and base scaffold not found (set MHO_HARNESS or MICRO_SCAFFOLD_BASE)" >&2; exit 2; }
   echo "[eval] no harness passed -> using base scaffold: ${MINI_FORK_LOCAL}"
 fi
-AGENT_TEMPERATURE="${AGENT_TEMPERATURE:-0.7}"
+# Agent config: configs/task/<task>.yaml then configs/sampling/<model>.yaml, layered over
+# the scaffold's mini.yaml that harbor loads as `-c mini`. Override with AGENT_TASK_CONFIG /
+# AGENT_CONFIG, or pass "none" to drop a layer. The model id is MHO_MODEL because the
+# serving block below overwrites MODEL with litellm_proxy/<served-name>. A missing sampling
+# config exits here, before vLLM starts: the `--ak temperature=` this replaces was ignored
+# by harbor's MiniSweAgent, and every trial ran at mini.yaml's defaults without saying so.
+if [ -n "${MHO_MODEL:-}" ]; then
+  _AGENT_CONFIG_MODEL="${MHO_MODEL}"
+else
+  _AGENT_CONFIG_MODEL="${MODEL:-}"; _AGENT_CONFIG_MODEL="${_AGENT_CONFIG_MODEL#*/}"
+fi
+AGENT_CONFIG="${AGENT_CONFIG:-${REPO_DIR}/configs/sampling/${_AGENT_CONFIG_MODEL}.yaml}"
+if [ "${AGENT_CONFIG}" = "none" ]; then
+  AGENT_CONFIG=""
+elif [ ! -f "${AGENT_CONFIG}" ]; then
+  echo "ERROR: no sampling config at ${AGENT_CONFIG}" >&2
+  echo "       add it, or pass AGENT_CONFIG=<file>, or AGENT_CONFIG=none to use mini.yaml as-is" >&2
+  exit 2
+fi
+AGENT_TASK_CONFIG="${AGENT_TASK_CONFIG:-${REPO_DIR}/configs/task/${MHO_TASK:-}.yaml}"
+if [ "${AGENT_TASK_CONFIG}" = "none" ] || [ ! -f "${AGENT_TASK_CONFIG}" ]; then
+  AGENT_TASK_CONFIG=""
+fi
+echo "[eval] task config:     ${AGENT_TASK_CONFIG:-<none, scaffold mini.yaml only>}"
+echo "[eval] sampling config: ${AGENT_CONFIG:-<none, mini.yaml defaults>}"
 AGENT_TIMEOUT_MULTIPLIER="${AGENT_TIMEOUT_MULTIPLIER:-}"
 HARBOR_TIMEOUT_SECONDS="${HARBOR_TIMEOUT_SECONDS:-28800}"
 MODAL_APP_NAME="${MODAL_APP_NAME:-mho_opt_eval}"
@@ -207,9 +231,39 @@ mkdir -p "${EVAL_JOBS_DIR}"
 CMD=(
   "${VENV_BIN}/harbor" run --agent "${AGENT_IMPORT}" "${DATA_FLAG[@]}" -m "${MODEL}" "${ENV_FLAGS[@]}"
   --jobs-dir "${EVAL_JOBS_DIR}" --job-name "${EVAL_JOB_NAME}"
-  -n "${N_CONCURRENT}" --n-attempts "${RUNS}" --ak "temperature=${AGENT_TEMPERATURE}"
+  -n "${N_CONCURRENT}" --n-attempts "${RUNS}"
   ${MHO_VERIFIER:+--verifier "${MHO_VERIFIER}"}
 )
+# harbor raises "'config' and 'config_file' are mutually exclusive", so the two layers are
+# merged into one file, written beside the run so the exact config it used is recoverable.
+# Mappings merge key by key and sampling wins, matching how mini-swe-agent layers `-c` specs.
+if [ -n "${AGENT_TASK_CONFIG}" ] && [ -n "${AGENT_CONFIG}" ]; then
+  _MERGED_CONFIG="${EVAL_JOBS_DIR}/${EVAL_JOB_NAME}.agent-config.yaml"
+  "${VENV_BIN}/python" - "${AGENT_TASK_CONFIG}" "${AGENT_CONFIG}" "${_MERGED_CONFIG}" <<'PYMERGE'
+import sys, yaml
+
+def merge(base, over):
+    if isinstance(base, dict) and isinstance(over, dict):
+        out = dict(base)
+        for k, v in over.items():
+            out[k] = merge(base[k], v) if k in base else v
+        return out
+    return over
+
+task, sampling, out = sys.argv[1:4]
+merged = {}
+for path in (task, sampling):
+    with open(path) as fh:
+        merged = merge(merged, yaml.safe_load(fh) or {})
+with open(out, "w") as fh:
+    yaml.safe_dump(merged, fh, sort_keys=False)
+print(f"[eval] merged agent config -> {out}")
+PYMERGE
+  AGENT_CONFIG="${_MERGED_CONFIG}"
+elif [ -n "${AGENT_TASK_CONFIG}" ]; then
+  AGENT_CONFIG="${AGENT_TASK_CONFIG}"
+fi
+[ -n "${AGENT_CONFIG}" ] && CMD+=( --ak "config_file=${AGENT_CONFIG}" )
 [ -n "${MINI_FORK_LOCAL:-}" ] && CMD+=( --ak "mini_fork_local=${MINI_FORK_LOCAL}" )
 
 # --- Modal reverse relay (only for HARBOR_ENV=modal: expose local vLLM to cloud sandboxes) --
