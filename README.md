@@ -11,8 +11,8 @@ running each train/eval phase as a harbor job on the cluster.
 
 ## Setup
 
-Create `.env` in the repo root (gitignored; it holds storage roots, docker creds, WANDB key,
-model/serving config)
+Copy `.env.example` to `.env` in the repo root (gitignored; it holds storage roots, docker
+creds, WANDB key, model/serving config)
 
 Required `.env`/env keys:
 - `BASE_DIR` — node-local tmp/cache (`$PBS_LOCALDIR`); `HF_DIR`/`TMP_DIR`/`SINGULARITY_*` derive from it.
@@ -81,3 +81,31 @@ bash scripts/build/build-miles.sh      # miles.sif (from radixark/miles:latest)
 ## Scheduler
 
 Auto-detected PBS/SLURM (`MHO_SCHEDULER=pbs|slurm`); per-scheduler wrappers in `scripts/hpc/`.
+Resources are per phase: `MHO_{EVAL,TRAIN,PROPOSE}_{QUEUE,NGPUS,WALLTIME}`, plus
+`MHO_EVAL_CPUS` and `MHO_ACCOUNT`. `MHO_*_SELECT` and `MHO_*_RTYPE` are PBS-only. See
+`.env.example`.
+
+### SLURM
+
+`QUEUE` is the partition (`-p`), `MHO_ACCOUNT` is `-A`. `SBATCH_QOS` and
+`SBATCH_MEM_PER_NODE` are read by `sbatch` itself rather than by the loop, so they belong
+in `.env` as well.
+
+```bash
+tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B --task math \
+  --data data-harbor/<task> --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
+  2>&1 | tee -a ~/logs/r1.log"
+```
+
+The driver only submits and polls, so a login node is fine; tmux keeps it alive across the
+SSH session. Progress is the number of finished trials, not the driver log, which stays
+silent for the hours a phase runs:
+
+```bash
+find runs_output/optimize/<run-name>/eval -name result.json | wc -l
+```
+
+A phase whose QOS forbids its resource request waits in the queue rather than failing. On a
+partition whose QOS sets `MinTRES gres/gpu=1`, `MHO_PROPOSE_NGPUS=0` leaves the propose job
+pending with reason `QOSMinGRES`; give it a GPU it will not use, or move the phase to a QOS
+that allows none.
