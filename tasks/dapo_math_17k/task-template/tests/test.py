@@ -1,10 +1,7 @@
-"""DAPO math verifier (standalone tests/ form).
-
-Mirrors the grading harness.math_verifier applies in-process: read the agent's
-final "Answer: $A" line from the task output and compare it (normalized) to the
-expected ground-truth answer. In the real pipeline this verifier is run by
-harness.math_verifier directly from the trajectory; this file / test.sh supply
-a self-contained answer-string check wherever the tasks/ are executed.
+"""DAPO math verifier (self-contained tests/ form).
+Read the agent's final "Answer: $A" line from the task output and compare it
+(normalized) to the expected ground-truth answer. Self-graded via test.sh ->
+verifier/reward.txt; no external src/ dependency.
 """
 
 import re
