@@ -17,7 +17,6 @@ process before any trial builds its environment, then (b) re-exports miles' real
 ``harbor_agent_function.run`` unchanged, so the connector's agent<->generate wiring and
 native token recording are untouched.
 """
-import os
 import sys as _sys
 from pathlib import Path as _Path
 
@@ -35,8 +34,6 @@ for _m in [m for m in list(_sys.modules) if m == "harness" or m.startswith("harn
 
 from mho.backends.local_singularity import remote_env as _remote_env  # noqa: E402,F401  (arms the registry swap on import)
 
-# Tasks grade themselves via tests/test.sh -> verifier/reward.txt (harbor's built-in file
-# verifier); no in-process verifier import_path is forced, so tasks stay isolated (no src/ dep).
 # Imported AFTER _remote_env so the EnvironmentType.SINGULARITY registry swap is armed before
 # any trial builds its environment; re-export miles' real agent function unchanged.
 import harbor_agent_function as _haf  # noqa: E402
