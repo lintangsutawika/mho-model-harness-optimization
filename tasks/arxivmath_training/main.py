@@ -111,7 +111,7 @@ def generate(
         "language": language,
         "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
-        "name": f"mho/arxivmath-0826-{problem['problem_id']}",
+        "name": f"mho/arxivmath-training-{problem['problem_id']}",
     }
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
@@ -164,6 +164,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for --sample. Two subsets drawn with different seeds are "
                              "independent; --limit would return the same leading rows.")
+    parser.add_argument("--val-size", type=int, default=None,
+                        help="Split the selected problems into a held-out val of this many "
+                             "(last N by problem_id, disjoint from train) and generate "
+                             "<out>-train-split + <out>-val-split. 0 disables (generate one dir).")
     parser.add_argument("--skip-unsupported", action="store_true",
                         help="Record unsupported problems in exclusions.json instead of aborting.")
     args = parser.parse_args()
@@ -194,6 +198,42 @@ def main() -> None:
     elif args.limit is not None and args.limit >= 0:
         problems = problems[: args.limit]
 
+    # Held-out val split: val = last args.val_size (deterministic by problem_id order,
+    # disjoint from train), train = the rest. Generates <out>-train-split + <out>-val-split.
+    if args.val_size:
+        if args.val_size < 0 or args.val_size > len(problems):
+            raise SystemExit(
+                f"--val-size {args.val_size} must be in [0, {len(problems)}] "
+                f"(got {len(problems)} selected problems)."
+            )
+        val = problems[-args.val_size:] if args.val_size else []
+        train = problems[:-args.val_size] if args.val_size else problems
+        train_out = output_dir.with_name(output_dir.name + "-train-split")
+        val_out = output_dir.with_name(output_dir.name + "-val-split")
+        for out_, subset, label in ((train_out, train, "train"), (val_out, val, "val")):
+            if out_.exists():
+                raise SystemExit(f"Output directory already exists: {out_}. Use a fresh --output-dir.")
+            _ex, _count = generate_all(subset, output=out_)
+            print(f"[split] generated {_count} {label} tasks in {out_}; excluded {len(_ex)}")
+        (output_dir.parent / f"{output_dir.name}_split_manifest.json").write_text(
+            json.dumps(
+                {
+                    "dataset": DATASET_NAME,
+                    "split": SPLIT,
+                    "val_size": args.val_size,
+                    "train_count": len(train),
+                    "val_count": len(val),
+                    "train_out": str(train_out),
+                    "val_out": str(val_out),
+                    "problem_ids": [int(p["problem_id"]) for p in problems],
+                    "val_problem_ids": [int(p["problem_id"]) for p in val],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return
     if output_dir.exists():
         raise SystemExit(f"Output directory already exists: {output_dir}. Use a fresh --output-dir.")
     exclusions, count = generate_all(problems, output=output_dir)
