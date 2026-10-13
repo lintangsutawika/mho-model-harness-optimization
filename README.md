@@ -69,6 +69,24 @@ bash scripts/build/build_train.sh      # skyrl-megatron.sif
 bash scripts/build/build-miles.sh      # miles.sif (from radixark/miles:latest)
 ```
 
+### Serve a model (vLLM Gateway)
+
+```bash
+# local only (on a compute node):
+MODEL=Qwen/Qwen3.5-4B PORT=8000 bash scripts/utils/serve.sh
+
+# + Modal gateway: expose the node vLLM at a public https://<app>.modal.run/v1 endpoint
+# reachable from anywhere (node dials OUT; no inbound/tunnel):
+MODEL=Qwen/Qwen3.5-4B USE_RELAY=1 bash scripts/utils/serve.sh
+
+# curl the relay endpoint from anywhere:
+#   curl -s <RELAY_URL>/v1/models
+```
+
+`scripts/utils/serve.sh` serves vLLM from `BASE_SIF`, loads the per-model flags from
+`configs/serve/<model>.json`, and (with `USE_RELAY=1`) exposes it via the Modal reverse
+relay (`src/harness/relay/`). `eval.sh` delegates its serving to it.
+
 ## Notes / constraints (ABCI)
 
 - Singularity-only: no Docker. Sandboxes run on the node writable-rootfs via
