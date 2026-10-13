@@ -37,36 +37,9 @@ for _m in [m for m in list(_sys.modules) if m == "harness" or m.startswith("harn
 
 from mho.backends.local_singularity import remote_env as _remote_env  # noqa: E402,F401  (arms the registry swap on import)
 
-# Miles' harbor connector module. We patch its trial-config builder below, then re-export
-# its `run` (which calls the patched builder). Imported AFTER _remote_env so the env
-# registry swap is armed before any trial is built.
+# Tasks grade themselves via tests/test.sh -> verifier/reward.txt (harbor's built-in file
+# verifier); no in-process verifier import_path is forced, so tasks stay isolated (no src/ dep).
+# Imported AFTER _remote_env so the EnvironmentType.SINGULARITY registry swap is armed before
+# any trial builds its environment; re-export miles' real agent function unchanged.
 import harbor_agent_function as _haf  # noqa: E402
-from harbor.models.trial.config import VerifierConfig as _VerifierConfig  # noqa: E402
-
-# --------------------------------------------------------------------------- #
-# Inject our custom verifier. The connector's build_trial_config() sets the trial-level
-# VerifierConfig only for a timeout override, never import_path -- so harbor falls back to
-# its shared file verifier (runs tests/test.sh, reads verifier/reward.txt). Our tasks use a
-# stub test.sh and grade via harness.math_verifier:MathVerifier instead (as SkyRL did via
-# trial_config.yaml), so without this every trial hits RewardFileNotFoundError -> reward 0.
-# We wrap build_trial_config to set verifier.import_path (preserving any timeout override).
-# --------------------------------------------------------------------------- #
-_orig_build_trial_config = _haf.build_trial_config
-
-
-def _build_trial_config_with_verifier(*args, **kwargs):
-    tc = _orig_build_trial_config(*args, **kwargs)
-    existing = getattr(tc, "verifier", None)
-    if existing is None or getattr(existing, "import_path", None) is None:
-        tc = tc.model_copy(update={"verifier": _VerifierConfig(
-            import_path=os.environ.get("MHO_VERIFIER", "harness.math_verifier:MathVerifier"),
-            override_timeout_sec=getattr(existing, "override_timeout_sec", None),
-        )})
-    return tc
-
-
-_haf.build_trial_config = _build_trial_config_with_verifier
-
-run = _haf.run  # re-export miles' agent function (now uses the patched build_trial_config)
-
-__all__ = ["run"]
+run = _haf.run  # re-export miles' agent function (registry swap armed on import)

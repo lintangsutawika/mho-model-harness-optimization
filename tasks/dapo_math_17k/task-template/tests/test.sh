@@ -1,7 +1,19 @@
-#!/bin/sh
-# DAPO math grading is done by harness.math_verifier:MathVerifier (in-process,
-# read from the agent trajectory); this stub only satisfies harbor's task
-# test-file requirement, mirroring dapo_math_17k/prepare.py.
-# The standalone tests/test.py below is a faithful local re-implementation of
-# that "Answer: $A" parse + normalized compare, for environments that run it.
-exit 0
+#!/bin/bash
+set -Eeuo pipefail
+echo "=== STARTING DAPO MATH TEST EXECUTION ==="
+mkdir -p /logs/verifier
+# Self-contained answer-string grading (mirrors harness.math_verifier semantics):
+# read the agent's "Answer: $A" line and compare (normalized) to the expected truth.
+# test.py exits 0 on correct, non-zero on incorrect; we gate reward.txt on it so
+# harbor's built-in file verifier can grade WITHOUT any src/ import.
+set +e
+python3 /tests/test.py
+exit_code=$?
+set -e
+echo "=== TEST EXECUTION COMPLETED (exit ${exit_code}) ==="
+if [ $exit_code -eq 0 ]; then
+    echo "OK - answer correct"; echo 1 > /logs/verifier/reward.txt
+else
+    echo "X - answer incorrect"; echo 0 > /logs/verifier/reward.txt
+fi
+exit $exit_code
