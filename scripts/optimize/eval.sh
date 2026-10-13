@@ -130,50 +130,22 @@ trap cleanup EXIT
 if [ -n "${MHO_MODEL:-}" ]; then
   require_sif_dir
   # vLLM serving runs from BASE_SIF itself (it ships vllm serve); no separate vllm-cuda.sif.
-  VLLM_SIF="${BASE_SIF}"
-  VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
-  [ -f "$VLLM_SIF" ] || { echo "ERROR: MHO_MODEL set but BASE_SIF missing: ${BASE_SIF}" >&2; exit 1; }
-  MODEL_BIND=(); [ -d "${MHO_MODEL}" ] && MODEL_BIND=(--bind "${MHO_MODEL}:${MHO_MODEL}")
+  [ -f "${BASE_SIF}" ] || { echo "ERROR: MHO_MODEL set but BASE_SIF missing: ${BASE_SIF}" >&2; exit 1; }
   mkdir -p "${MHO_OUT:-/tmp}"
-  # mini-swe-agent sends tool_choice=auto; vLLM needs --enable-auto-tool-choice +
-  # --tool-call-parser. Qwen3.5 uses the 'qwen3_coder' parser (same name in this vLLM as on the
-  # sglang training path). Override via VLLM_TOOL_PARSER; set VLLM_REASONING_PARSER
-  # (e.g. deepseek_r1 / qwen3) to strip <think>.
-  # Serve config (configs/serve/<model>.json): if present, use its extra_args as the vLLM
-  # flags (chunked-prefill, prefix-caching, language-model-only, qwen3_coder parser, ...);
-  # else fall back to the hardcoded defaults. The ctx cap (VLLM_MAX_MODEL_LEN) is always
-  # appended so the OOM guard holds regardless of config.
-  _SERVE_CONF="${REPO_DIR}/configs/serve/${MHO_MODEL}.json"
-  if [ -f "$_SERVE_CONF" ]; then
-    VLLM_TOOL_ARGS=()
-    while IFS= read -r _f; do VLLM_TOOL_ARGS+=( "$_f" ); done < <(
-      python3 -c "import json,sys; print('\n'.join(json.load(open(sys.argv[1]))['extra_args']))" "$_SERVE_CONF"
-    )
-    echo "[eval] serve config: $_SERVE_CONF (${#VLLM_TOOL_ARGS[@]} flags)"
-  else
-    # Hard fail: no serve config means we'd silently serve with the wrong per-model flags
-    # (tool parser, language-model-only, chunked prefill, ...) for whichever model is set.
-    # Require a config at configs/serve/<model>.json; add one per model.
-    echo "ERROR: no serve config at $_SERVE_CONF (create configs/serve/<model>.json for ${MHO_MODEL})" >&2
-    exit 2
-  fi
-  VLLM_TOOL_ARGS+=(--max-model-len "${VLLM_MAX_MODEL_LEN:-32768}")
-  [ -n "${VLLM_REASONING_PARSER:-}" ] && VLLM_TOOL_ARGS+=(--reasoning-parser "${VLLM_REASONING_PARSER}")
-  # Small model (fits on 1 GPU) + many concurrent agents -> DATA-parallel (N replicas, load
-  # balanced) maximizes throughput; tensor-parallel would only add comm overhead. Default DP to
-  # the number of visible GPUs so it uses the whole allocation; override with VLLM_DATA_PARALLEL
-  # (=1 to disable) and VLLM_TENSOR_PARALLEL (for models too big for one GPU).
-  _NGPU="$(echo "${CUDA_VISIBLE_DEVICES:-}" | tr "," "\n" | grep -c . || true)"
-  [ "${_NGPU:-0}" -ge 1 ] 2>/dev/null || _NGPU="$(nvidia-smi -L 2>/dev/null | grep -c . || echo 1)"
-  VLLM_DATA_PARALLEL="${VLLM_DATA_PARALLEL:-${_NGPU:-1}}"
-  VLLM_TENSOR_PARALLEL="${VLLM_TENSOR_PARALLEL:-1}"
-  [ "${VLLM_DATA_PARALLEL}" -gt 1 ] 2>/dev/null && VLLM_TOOL_ARGS+=(--data-parallel-size "${VLLM_DATA_PARALLEL}")
-  [ "${VLLM_TENSOR_PARALLEL}" -gt 1 ] 2>/dev/null && VLLM_TOOL_ARGS+=(--tensor-parallel-size "${VLLM_TENSOR_PARALLEL}")
-  echo "[eval] serving ${MHO_MODEL} as '${SERVED_NAME}' on :${VLLM_PORT} (sif=${VLLM_SIF}) tool-parser=${VLLM_TOOL_PARSER:-qwen3_coder} dp=${VLLM_DATA_PARALLEL} tp=${VLLM_TENSOR_PARALLEL}"
-  singularity exec --nv \
-    --bind "${HF_DIR:-$HOME/.cache/huggingface}:/root/.cache/huggingface" "${MODEL_BIND[@]}" \
-    "$VLLM_SIF" vllm serve "${MHO_MODEL}" --port "${VLLM_PORT}" --served-model-name "${SERVED_NAME}" \
-      "${VLLM_TOOL_ARGS[@]}" ${VLLM_EXTRA_ARGS:-} >"${MHO_OUT:-/tmp}/vllm_serve.log" 2>&1 &
+  # Delegate serving to the reusable scripts/utils/serve.sh (loads the per-model serve
+  # config, sets DP/TP/MAX_MODEL_LEN, and starts vLLM from BASE_SIF). Use_RELAY=1 exposes it
+  # via the Modal gateway. serve.sh runs vLLM in the foreground; we background it and poll.
+  VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
+  echo "[eval] serving via scripts/utils/serve.sh: ${MHO_MODEL} -> :${VLLM_PORT}"
+  if [ "${HARBOR_ENV}" = "modal" ]; then USE_RELAY=1; fi
+
+  MODEL="${MHO_MODEL}" \
+  VLLM_PORT="${VLLM_PORT}" \
+  SERVED_NAME="${SERVED_NAME}" \
+  BASE_SIF="${BASE_SIF}" \
+  USE_RELAY="${USE_RELAY:-0}" \
+  bash "${REPO_DIR}/scripts/utils/serve.sh" > "${MHO_OUT:-/tmp}/vllm_serve.log" 2>&1 &
+
   VLLM_PID=$!
   for _ in $(seq 1 120); do curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 && break; sleep 5; done
   curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
@@ -187,7 +159,9 @@ if [ -n "${MHO_MODEL:-}" ]; then
     export LITELLM_PROXY_API_KEY="${LITELLM_PROXY_API_KEY:-EMPTY}"
   fi
 fi
-MODEL="${MODEL:-litellm_proxy/Qwen/Qwen3.8-27B}"
+# MODEL must be set: either the self-serve block set it (litellm_proxy/<served>) or the
+# caller passed an API-model litellm id. No silent hardcoded fallback.
+[ -n "${MODEL:-}" ] || { echo "ERROR: MODEL is empty. Set MHO_MODEL (self-serve) or MODEL=<litellm id> (API model)." >&2; exit 2; }
 
 # --- validate agent import (before paying for any sandbox) -------------------
 "${VENV_BIN}/python" - "${AGENT_IMPORT}" <<'PYV'
