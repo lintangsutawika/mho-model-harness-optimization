@@ -21,11 +21,9 @@ import os
 import sys as _sys
 from pathlib import Path as _Path
 
-# The repo ROOT has its own `harness/` package (harbor_run/scaffold/relay, NO math_verifier)
-# that shadows src/harness/ whenever the repo root lands on the worker's sys.path (cwd, etc.).
-# harbor imports the verifier by module path (`harness.math_verifier`) IN THIS worker process,
-# so force src/ to the FRONT and drop any already-imported `harness` that resolved outside src,
-# else the verifier import hits the shadow -> "No module named 'harness.math_verifier'".
+# The repo ROOT has its own `harness/` package that can shadow src/harness/ whenever the repo
+# root lands on the worker's sys.path (cwd, etc.). Force src/ to the FRONT and drop any
+# already-imported `harness` that resolved outside src, so src/harness (agent harness) wins.
 _SRC = str(_Path(__file__).resolve().parents[3])  # .../src
 while _SRC in _sys.path:
     _sys.path.remove(_SRC)

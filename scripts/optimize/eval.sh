@@ -35,7 +35,7 @@ cd "$REPO_DIR"
 echo "[eval] repo: ${REPO_DIR}${MHO_REPO_DIR:+ (MHO_REPO_DIR)}"
 export PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
-# would shadow src/harness/ (agent_harness/math_verifier live only in src). src stays on
+# would shadow src/harness/ (agent_harness lives only in src). src stays on
 # PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/miles_agent_fn.
 export PYTHONSAFEPATH=1
 # Use the prebuilt project .venv directly (harbor + deps already installed, shared home) rather

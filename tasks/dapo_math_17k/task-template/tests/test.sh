@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 echo "=== STARTING DAPO MATH TEST EXECUTION ==="
 mkdir -p /logs/verifier
-# Self-contained answer-string grading (mirrors harness.math_verifier semantics):
+# Self-contained answer-string grading (final Answer: $A, normalized compare):
 # read the agent's "Answer: $A" line and compare (normalized) to the expected truth.
 # test.py exits 0 on correct, non-zero on incorrect; we gate reward.txt on it so
 # harbor's built-in file verifier can grade WITHOUT any src/ import.
