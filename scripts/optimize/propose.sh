@@ -17,7 +17,7 @@ REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
 # would shadow src/harness/ (agent_harness lives only in src). src stays on
-# PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/miles_agent_fn.
+# PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/backend.
 export PYTHONSAFEPATH=1
 [ -n "${MHO_CANDIDATE_DIR:-}" ] || { echo "MHO_CANDIDATE_DIR required" >&2; exit 2; }
 OPENHANDS_PKGS="${OPENHANDS_PKGS:-openhands-sdk openhands-tools litellm}"

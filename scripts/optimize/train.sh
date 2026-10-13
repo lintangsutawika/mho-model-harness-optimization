@@ -5,7 +5,7 @@
 #
 # Miles runs Harbor trials IN-PROCESS in the rollout worker; the sandbox container is
 # provisioned on the host via the local_singularity backend (HARBOR_ENV_TYPE=singularity +
-# the remote_env registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
+# the backend registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
 # is recorded natively (--tito-model). HF->Megatron conversion is done by run.py prepare().
 # The Miles launcher is src/run_training.py, bind-mounted over the example run.py.
 #
@@ -88,7 +88,7 @@ LOGGER="${LOGGER:-wandb}"
 
 # --- local_singularity executor auto-start (same pattern as SkyRL) ---------------
 # HARBOR_ENV_TYPE=singularity -> the connector builds EnvironmentType.SINGULARITY,
-# which (via the registry swap in remote_env.py) resolves to RemoteSingularityEnvironment,
+# which (via the registry swap in backend.py) resolves to RemoteSingularityEnvironment,
 # which POSTs /sandbox to this host service. It must be running before training.
 if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL:-}" ]; then
   EXECUTOR_PYTHON="${EXECUTOR_PYTHON:-/home/aci18914wh/executor_env/.venv/bin/python}"
