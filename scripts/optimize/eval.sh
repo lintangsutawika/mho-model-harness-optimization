@@ -139,7 +139,25 @@ if [ -n "${MHO_MODEL:-}" ]; then
   # --tool-call-parser. Qwen3.5 uses the 'qwen3_coder' parser (same name in this vLLM as on the
   # sglang training path). Override via VLLM_TOOL_PARSER; set VLLM_REASONING_PARSER
   # (e.g. deepseek_r1 / qwen3) to strip <think>.
-  VLLM_TOOL_ARGS=(--enable-auto-tool-choice --tool-call-parser "${VLLM_TOOL_PARSER:-qwen3_coder}" --max-model-len "${VLLM_MAX_MODEL_LEN:-32768}")
+  # Serve config (configs/serve/<model>.json): if present, use its extra_args as the vLLM
+  # flags (chunked-prefill, prefix-caching, language-model-only, qwen3_coder parser, ...);
+  # else fall back to the hardcoded defaults. The ctx cap (VLLM_MAX_MODEL_LEN) is always
+  # appended so the OOM guard holds regardless of config.
+  _SERVE_CONF="${REPO_DIR}/configs/serve/${MHO_MODEL}.json"
+  if [ -f "$_SERVE_CONF" ]; then
+    VLLM_TOOL_ARGS=()
+    while IFS= read -r _f; do VLLM_TOOL_ARGS+=( "$_f" ); done < <(
+      python3 -c "import json,sys; print('\n'.join(json.load(open(sys.argv[1]))['extra_args']))" "$_SERVE_CONF"
+    )
+    echo "[eval] serve config: $_SERVE_CONF (${#VLLM_TOOL_ARGS[@]} flags)"
+  else
+    # Hard fail: no serve config means we'd silently serve with the wrong per-model flags
+    # (tool parser, language-model-only, chunked prefill, ...) for whichever model is set.
+    # Require a config at configs/serve/<model>.json; add one per model.
+    echo "ERROR: no serve config at $_SERVE_CONF (create configs/serve/<model>.json for ${MHO_MODEL})" >&2
+    exit 2
+  fi
+  VLLM_TOOL_ARGS+=(--max-model-len "${VLLM_MAX_MODEL_LEN:-32768}")
   [ -n "${VLLM_REASONING_PARSER:-}" ] && VLLM_TOOL_ARGS+=(--reasoning-parser "${VLLM_REASONING_PARSER}")
   # Small model (fits on 1 GPU) + many concurrent agents -> DATA-parallel (N replicas, load
   # balanced) maximizes throughput; tensor-parallel would only add comm overhead. Default DP to
