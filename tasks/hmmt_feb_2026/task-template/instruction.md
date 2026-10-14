@@ -1,5 +1,3 @@
-Language: {language}
-
 Problem:
 {problem}
 
