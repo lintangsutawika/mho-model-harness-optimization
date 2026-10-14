@@ -139,7 +139,27 @@ def generate_all(
         if exclusions:
             (staged / "exclusions.json").write_text(json.dumps(exclusions, indent=2) + "\n")
         staged.rename(output)
+    _emit_seed(output)
     return exclusions, sum(1 for p in output.iterdir() if p.is_dir())
+
+def _emit_seed(output: Path) -> Path:
+    """Write ``<output>/seed.jsonl``: one row per generated task dir with
+    ``{prompt, metadata.instance_id}``. `instance_id` == the task-dir name, so Miles'
+    harbor connector can resolve each prompt to its task dir via
+    HARBOR_TASKS_DIR/<instance_id>. This SEEDS the rollout dataset (RL produces the
+    rollouts); it is not the rollouts themselves."""
+    seed_path = output / "seed.jsonl"
+    n = 0
+    with seed_path.open("w", encoding="utf-8") as f:
+        for d in sorted(p for p in output.iterdir() if p.is_dir()):
+            inst = d / "instruction.md"
+            if not inst.exists():
+                continue
+            f.write(json.dumps({"prompt": inst.read_text().strip(),
+                                "metadata": {"instance_id": d.name}}) + "\n")
+            n += 1
+    print(f"[seed] wrote {n} seed rows to {seed_path}")
+    return seed_path
 
 
 # ------------------------------------------------------------------------- CLI

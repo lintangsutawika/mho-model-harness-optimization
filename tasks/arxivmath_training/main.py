@@ -22,9 +22,10 @@ def row_to_problem(index: int, row: dict[str, Any]) -> dict[str, Any]:
     training: {paper_id, question, answer, title, authors, license, categories}
     0826:     {problem_idx, problem, answer, source, title, authors}
 
-    There is no problem_idx here, so the row position is the id -- which is why a subset is
-    only reproducible through --seed plus the manifest, not through the ids alone. paper_id
-    carries the arXiv identifier into `source` for provenance, matching the 0826 package.
+    This dataset has no problem_idx. `problem_id` is therefore a synthetic row index
+    (index + 1), used only for --val-size/--sample subsetting and ordering (stable given a
+    fixed dataset). The REAL dataset key is `paper_id`, kept in `source` -- it is what names
+    each task dir / instance_id (see generate()), matching the 0826 package's use of source.
     """
     return {
         "problem_id": index + 1,
@@ -92,26 +93,45 @@ def _fill(path: Path, **kw: str) -> None:
     path.write_text(text)
 
 
+_PAPER_COUNTER: dict[str, int] = {}
+
+
+def _sanitize(paper_id: str) -> str:
+    """Turn a paper_id (e.g. arXiv id / URN) into a safe, readable dir component."""
+    s = str(paper_id).strip().split("/")[-1]      # last path segment (arXiv id)
+    s = "".join(c for c in s if c.isalnum() or c in "._-")
+    return s or "paper"
+
+
 def generate(
     problem: dict[str, Any],
     language: str = "python",
     output: Path | str = "tasks",
 ) -> Path:
-    """Render one HMMT math task into a fresh subdir of ``output``."""
+    """Render one arxivmath-training task into a fresh subdir of ``output``.
+
+    The task-dir name (== Miles' ``instance_id``) is the dataset's real key,
+    ``paper_id`` (sanitized), NOT a fabricated row index -- this dataset has no
+    problem_idx and one row maps to one paper. If a paper_id repeats (dataset
+    changes / multiple questions from one paper), a ``-qN`` suffix keeps each
+    dir unique."""
     if language != "python":
         raise ValueError(f"HMMT math only supports 'python', got {language!r}")
     output = Path(output)
-    task = output / f"{problem['problem_id']}-{language}"
+    base = _sanitize(problem.get("source") or "")
+    n = _PAPER_COUNTER.get(base, 0)
+    _PAPER_COUNTER[base] = n + 1
+    task = output / (f"{base}-q{n}-{language}" if n else f"{base}-{language}")
     if task.exists():
         raise FileExistsError(f"Use a fresh output directory: {task}")
     tpl = PKG / "task-template"
     shutil.copytree(tpl, task, dirs_exist_ok=False)
     fills = {
-        "question_id": problem["problem_id"],
+        "question_id": problem.get("source") or problem["problem_id"],
         "language": language,
         "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
-        "name": f"mho/arxivmath-training-{problem['problem_id']}",
+        "name": f"mho/arxivmath-training-{_sanitize(problem.get('source') or '')}",
     }
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
@@ -127,6 +147,7 @@ def generate_all(
 ) -> tuple[list[dict[str, Any]], int]:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    _PAPER_COUNTER.clear()
     exclusions: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(dir=output.parent) as directory:
         staged = Path(directory) / "tasks"
@@ -144,7 +165,27 @@ def generate_all(
         if exclusions:
             (staged / "exclusions.json").write_text(json.dumps(exclusions, indent=2) + "\n")
         staged.rename(output)
+    _emit_seed(output)
     return exclusions, sum(1 for p in output.iterdir() if p.is_dir())
+
+def _emit_seed(output: Path) -> Path:
+    """Write ``<output>/seed.jsonl``: one row per generated task dir with
+    ``{prompt, metadata.instance_id}``. `instance_id` == the task-dir name, so Miles'
+    harbor connector can resolve each prompt to its task dir via
+    HARBOR_TASKS_DIR/<instance_id>. This SEEDS the rollout dataset (RL produces the
+    rollouts); it is not the rollouts themselves."""
+    seed_path = output / "seed.jsonl"
+    n = 0
+    with seed_path.open("w", encoding="utf-8") as f:
+        for d in sorted(p for p in output.iterdir() if p.is_dir()):
+            inst = d / "instruction.md"
+            if not inst.exists():
+                continue
+            f.write(json.dumps({"prompt": inst.read_text().strip(),
+                                "metadata": {"instance_id": d.name}}) + "\n")
+            n += 1
+    print(f"[seed] wrote {n} seed rows to {seed_path}")
+    return seed_path
 
 
 # ------------------------------------------------------------------------- CLI

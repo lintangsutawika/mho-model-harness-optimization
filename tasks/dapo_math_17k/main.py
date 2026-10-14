@@ -10,27 +10,24 @@ from typing import Any
 LANGUAGES = ("python",)
 PKG = Path(__file__).parent
 
-DATASET_NAME = "BytedTsinghua-SIA/DAPO-Math-17k"
+DATASET_NAME = "MathArena/arxivmath-0826"
 SPLIT = "train"
-DEFAULT_DATASET = PKG / "data" / "dapo_math_17k.jsonl"
+DEFAULT_DATASET = PKG / "data" / "arxivmath_0826.jsonl"
 
 # ---------------------------------------------------------------- data loading
-def _prompt_text(messages: list) -> str:
-    """Flatten a DAPO ``prompt`` (list of {content, role}) to plain text."""
-    parts = []
-    for m in messages:
-        c = m.get("content", "")
-        if isinstance(c, list):
-            c = " ".join(str(x.get("text", "")) for x in c if isinstance(x, dict))
-        parts.append(str(c))
-    return "\n\n".join(p for p in parts if p.strip())
-
-
 def row_to_problem(index: int, row: dict[str, Any]) -> dict[str, Any]:
+    """MathArena columns: problem_idx (int), problem (text), answer (exact
+    arxivmath-0826 is an arXiv-math slice: columns {problem_idx, problem, answer,
+    source, title, authors} -- no problem_type. source/title are carried through for
+    provenance (unused by the verifier, which grades answer-string match like HMMT)."""
+    idx = row.get("problem_idx", index + 1)
     return {
-        "problem_id": int(index),
-        "prompt": _prompt_text(row.get("prompt") or []),
-        "answer": (row.get("reward_model") or {}).get("ground_truth"),
+        "problem_id": int(idx),
+        "problem": str(row["problem"]).strip(),
+        "answer": str(row["answer"]).strip(),
+        "problem_type": [t for t in (row.get("problem_type") or ()) if t],
+        "source": str(row.get("source") or "").strip() or None,
+        "title": str(row.get("title") or "").strip() or None,
     }
 
 
@@ -38,25 +35,19 @@ def build_dataset(
     dataset_path: Path | str | None = None,
     max_tasks: int = 0,
     split: str = SPLIT,
-    seed: int = 0,
 ) -> list[dict[str, Any]]:
-    """Assemble ``data/<task>.jsonl`` from HF (DAPO-Math-17k)."""
+    """Assemble ``data/<task>.jsonl`` from HF (MathArena/arxivmath-0826)."""
     from datasets import load_dataset
 
     out = Path(dataset_path or DEFAULT_DATASET)
     out.parent.mkdir(parents=True, exist_ok=True)
     ds = load_dataset(DATASET_NAME, split=split)
-    if max_tasks and max_tasks > 0:
-        ds = ds.shuffle(seed=seed).select(range(min(max_tasks, len(ds))))
-    records = []
-    for i, row in enumerate(ds):
-        record = row_to_problem(i, row)
-        if record["prompt"].strip():
-            records.append(record)
+    n = len(ds) if not max_tasks else min(max_tasks, len(ds))
+    records = [row_to_problem(i, ds[i]) for i in range(n)]
     with out.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record) + "\n")
-    print(f"Wrote {len(records)} DAPO problem records to {out}")
+    print(f"Wrote {len(records)} HMMT problem records to {out}")
     return records
 
 
@@ -101,9 +92,9 @@ def generate(
     language: str = "python",
     output: Path | str = "tasks",
 ) -> Path:
-    """Render one DAPO math task into a fresh subdir of ``output``."""
+    """Render one HMMT math task into a fresh subdir of ``output``."""
     if language != "python":
-        raise ValueError(f"DAPO math only supports 'python', got {language!r}")
+        raise ValueError(f"HMMT math only supports 'python', got {language!r}")
     output = Path(output)
     task = output / f"{problem['problem_id']}-{language}"
     if task.exists():
@@ -113,9 +104,9 @@ def generate(
     fills = {
         "question_id": problem["problem_id"],
         "language": language,
-        "problem": problem["prompt"].strip(),
+        "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
-        "name": f"mho/dapo-math-17k-{problem['problem_id']}",
+        "name": f"mho/arxivmath-0826-{problem['problem_id']}",
     }
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
@@ -148,12 +139,32 @@ def generate_all(
         if exclusions:
             (staged / "exclusions.json").write_text(json.dumps(exclusions, indent=2) + "\n")
         staged.rename(output)
+    _emit_seed(output)
     return exclusions, sum(1 for p in output.iterdir() if p.is_dir())
+
+def _emit_seed(output: Path) -> Path:
+    """Write ``<output>/seed.jsonl``: one row per generated task dir with
+    ``{prompt, metadata.instance_id}``. `instance_id` == the task-dir name, so Miles'
+    harbor connector can resolve each prompt to its task dir via
+    HARBOR_TASKS_DIR/<instance_id>. This SEEDS the rollout dataset (RL produces the
+    rollouts); it is not the rollouts themselves."""
+    seed_path = output / "seed.jsonl"
+    n = 0
+    with seed_path.open("w", encoding="utf-8") as f:
+        for d in sorted(p for p in output.iterdir() if p.is_dir()):
+            inst = d / "instruction.md"
+            if not inst.exists():
+                continue
+            f.write(json.dumps({"prompt": inst.read_text().strip(),
+                                "metadata": {"instance_id": d.name}}) + "\n")
+            n += 1
+    print(f"[seed] wrote {n} seed rows to {seed_path}")
+    return seed_path
 
 
 # ------------------------------------------------------------------------- CLI
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate Harbor DAPO math tasks.")
+    parser = argparse.ArgumentParser(description="Generate Harbor HMMT math tasks.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET,
                         help=f"Problems JSONL (default: {DEFAULT_DATASET}); built on first use.")
     parser.add_argument("--output-dir", type=Path, default=None,

@@ -10,20 +10,24 @@ from typing import Any
 LANGUAGES = ("python",)
 PKG = Path(__file__).parent
 
-DATASET_NAME = "MathArena/hmmt_feb_2026"
+DATASET_NAME = "MathArena/arxivmath-0826"
 SPLIT = "train"
-DEFAULT_DATASET = PKG / "data" / "hmmt_feb_2026.jsonl"
+DEFAULT_DATASET = PKG / "data" / "arxivmath_0826.jsonl"
 
 # ---------------------------------------------------------------- data loading
 def row_to_problem(index: int, row: dict[str, Any]) -> dict[str, Any]:
     """MathArena columns: problem_idx (int), problem (text), answer (exact
-    expression, often LaTeX), problem_type (list of str)."""
+    arxivmath-0826 is an arXiv-math slice: columns {problem_idx, problem, answer,
+    source, title, authors} -- no problem_type. source/title are carried through for
+    provenance (unused by the verifier, which grades answer-string match like HMMT)."""
     idx = row.get("problem_idx", index + 1)
     return {
         "problem_id": int(idx),
         "problem": str(row["problem"]).strip(),
         "answer": str(row["answer"]).strip(),
         "problem_type": [t for t in (row.get("problem_type") or ()) if t],
+        "source": str(row.get("source") or "").strip() or None,
+        "title": str(row.get("title") or "").strip() or None,
     }
 
 
@@ -32,7 +36,7 @@ def build_dataset(
     max_tasks: int = 0,
     split: str = SPLIT,
 ) -> list[dict[str, Any]]:
-    """Assemble ``data/<task>.jsonl`` from HF (MathArena/hmmt_feb_2026)."""
+    """Assemble ``data/<task>.jsonl`` from HF (MathArena/arxivmath-0826)."""
     from datasets import load_dataset
 
     out = Path(dataset_path or DEFAULT_DATASET)
@@ -102,7 +106,7 @@ def generate(
         "language": language,
         "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
-        "name": f"mho/hmmt-feb-2026-{problem['problem_id']}",
+        "name": f"mho/arxivmath-0826-{problem['problem_id']}",
     }
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
@@ -135,7 +139,27 @@ def generate_all(
         if exclusions:
             (staged / "exclusions.json").write_text(json.dumps(exclusions, indent=2) + "\n")
         staged.rename(output)
+    _emit_seed(output)
     return exclusions, sum(1 for p in output.iterdir() if p.is_dir())
+
+def _emit_seed(output: Path) -> Path:
+    """Write ``<output>/seed.jsonl``: one row per generated task dir with
+    ``{prompt, metadata.instance_id}``. `instance_id` == the task-dir name, so Miles'
+    harbor connector can resolve each prompt to its task dir via
+    HARBOR_TASKS_DIR/<instance_id>. This SEEDS the rollout dataset (RL produces the
+    rollouts); it is not the rollouts themselves."""
+    seed_path = output / "seed.jsonl"
+    n = 0
+    with seed_path.open("w", encoding="utf-8") as f:
+        for d in sorted(p for p in output.iterdir() if p.is_dir()):
+            inst = d / "instruction.md"
+            if not inst.exists():
+                continue
+            f.write(json.dumps({"prompt": inst.read_text().strip(),
+                                "metadata": {"instance_id": d.name}}) + "\n")
+            n += 1
+    print(f"[seed] wrote {n} seed rows to {seed_path}")
+    return seed_path
 
 
 # ------------------------------------------------------------------------- CLI
