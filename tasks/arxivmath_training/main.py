@@ -111,17 +111,17 @@ def generate(
     """Render one arxivmath-training task into a fresh subdir of ``output``.
 
     The task-dir name (== Miles' ``instance_id``) is the dataset's real key,
-    ``paper_id`` (sanitized), NOT a fabricated row index -- this dataset has no
-    problem_idx and one row maps to one paper. If a paper_id repeats (dataset
-    changes / multiple questions from one paper), a ``-qN`` suffix keeps each
-    dir unique."""
+    ``paper_id`` (sanitized) -- this dataset has no problem_idx, one row maps to
+    one paper, and every task is python-only (no language suffix needed). If a
+    paper_id repeats (dataset changes / multiple questions from one paper), a
+    ``-qN`` suffix keeps each dir unique."""
     if language != "python":
         raise ValueError(f"HMMT math only supports 'python', got {language!r}")
     output = Path(output)
     base = _sanitize(problem.get("source") or "")
     n = _PAPER_COUNTER.get(base, 0)
     _PAPER_COUNTER[base] = n + 1
-    task = output / (f"{base}-q{n}-{language}" if n else f"{base}-{language}")
+    task = output / (f"{base}-q{n}" if n else base)
     if task.exists():
         raise FileExistsError(f"Use a fresh output directory: {task}")
     tpl = PKG / "task-template"
