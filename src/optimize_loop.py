@@ -561,6 +561,10 @@ def optimize(args: argparse.Namespace) -> None:
                     st["parent_scaffold"] = st["scaffold_dir"]
                     st["version"] += 1
                     st["try"] = 1
+                    # Persist the best harness so far to <run>/best/harness (overwrite), so the
+                    # accepted scaffold is easy to grab after the optimization run.
+                    shutil.rmtree(run_dir / "best", ignore_errors=True)
+                    shutil.copytree(st["scaffold_dir"], run_dir / "best" / "harness")
                 elif do_propose and st["scaffold_dir"]:
                     # rejected harness attempt (a real candidate) -> another try at same version.
                     # Guard on scaffold_dir so the baseline eval (scaffold_dir=None, improved=True
