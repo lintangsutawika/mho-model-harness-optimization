@@ -256,18 +256,17 @@ def _data_env(data: str) -> dict[str, str]:
 
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
-                tag: str, stage: str | None = None) -> str:
+                job_name: str) -> str:
     # The loop hands eval.sh the (model, harness, data) explicitly via MHO_* -- exactly the
     # manual form `MHO_MODEL=<model> MHO_DATA=<data> MHO_HARNESS=<harness> bash .../eval.sh`.
-    # Name + locate the output by the iteration tag (baseline, iter1, ...), not a timestamp, so
-    # each iteration's eval is findable/scoreable at MHO_OUT/<tag>.
+    # Trials land at MHO_OUT/<job_name>/ (eval.sh: EVAL_JOBS_DIR= MHO_OUT, EVAL_JOB_NAME= job_name).
     extra = {
         "AGENT_IMPORT": AGENT_IMPORT,
         "TASK_SET": "full",
         "N_ATTEMPTS": str(n_trials),
         "N_CONCURRENT": str(n_concurrent),
         "MHO_OUT": str(out_dir),
-        "EVAL_JOB_NAME": tag + (f"-{stage}" if stage else ""),
+        "EVAL_JOB_NAME": job_name,
         **_data_env(data),
     }
     if model:
@@ -444,6 +443,18 @@ def optimize(args: argparse.Namespace) -> None:
             return f"candidate_{st['iteration']}_{st['version']}_{st['try']}"
         return f"iter{st['iteration']}"
 
+    def tag_dir(tag: str) -> Path:
+        """Candidate-first layout under `candidates/`:
+        ```<run_dir>/candidates/<tag>/harness   (installable scaffold + CANDIDATE.md)
+        <run_dir>/candidates/<tag>/diff         (diff_from_base.patch + diff_from_parent.patch)
+        <run_dir>/candidates/<tag>/eval         (the ONE optimizer-visible eval: train-sample)
+        <run_dir>/candidates/<tag>/logs         (phase job logs)
+        <run_dir>/evaluation/<tag>/             (val-split eval -- accept/reject gate, hidden)```
+        The candidate unit (harness + eval + diff + logs) is mountable as one dir; the
+        validation eval is kept OUTSIDE it so the optimizer never sees it.
+        """
+        return run_dir / "candidates" / tag
+
     def advance(skip_rest: bool = False) -> None:
         """Move to the next stage, or (past the last, or on skip_rest) the next iteration."""
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
@@ -463,36 +474,40 @@ def optimize(args: argparse.Namespace) -> None:
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
         if action == "propose":
-            return submit_propose(sched, st["parent_scaffold"], candidate_dir=run_dir / "candidates" / tag,
+            return submit_propose(sched, st["parent_scaffold"], candidate_dir=tag_dir(tag) / "harness",
                                   frontier_path=frontier_path, summary_path=summary_path,
-                                  diff_dir=run_dir / "diffs" / tag, trials_dir=st["last_eval_dir"],
-                                  logs=logs_dir, tag=tag)
+                                  diff_dir=tag_dir(tag) / "diff", trials_dir=st["last_eval_dir"],
+                                  logs=tag_dir(tag) / "logs", tag=tag)
         if action == "train":
             return submit_train(sched, args.trainer, model=model, harness=harness,
-                                out_dir=run_dir / "train" / tag, logs=logs_dir, tag=tag)
-        # out_dir is the harbor jobs-dir; EVAL_JOB_NAME=<tag>[-<stage>] makes the per-iteration
-        # subdir, so trials land at run_dir/eval/<tag>-<stage>/.
-        # Single-set compat: `eval` has no stage suffix -> trials at run_dir/eval/<tag>/.
-        # Dual (--val-data): eval_train_sample/eval_val add a stage -> <tag>-<stage>/.
-        stage = action[5:] if action.startswith("eval_") else None
+                                out_dir=tag_dir(tag) / "train", logs=tag_dir(tag) / "logs", tag=tag)
+        # Trials destination per stage:
+        #   eval_train_sample -> candidates/<tag>/eval/   (the ONE optimizer-visible eval)
+        #   eval_val / eval   -> evaluation/<tag>/         (val accept/reject gate, hidden)
         data = args.train_data
         if action == "eval_train_sample":
+            # The train-sample eval is THE one eval the optimizer sees: candidates/<tag>/eval/.
+            # MHO_OUT=candidates/<tag>, EVAL_JOB_NAME=eval -> trials at candidates/<tag>/eval/.
+            eval_out = tag_dir(tag)
+            job_name = "eval"
             # BOUNDED, fresh-random subset of the full train task dir for the proposer's
             # improvement signal -- never the whole (often 1000s-problem) train set.
             seed = int(time.time()) % (2**31)
             data = str(_sample_subset(args.train_data, args.propose_sample,
                                       run_dir / "samples" / f"{tag}-train_sample", seed))
-        elif action == "eval_val":
-            data = args.val_data
+        else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
+            # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
+            eval_out = run_dir / "evaluation"
+            job_name = tag
         return submit_eval(sched, "", model=model, harness=harness, data=data,
                            n_trials=args.trials, n_concurrent=args.concurrent,
-                           out_dir=run_dir / "eval", logs=logs_dir, tag=tag, stage=stage)
+                           out_dir=eval_out, logs=tag_dir(tag) / "logs", job_name=job_name)
 
     def on_done(rc: int) -> None:
         """Handle the finished stage's result and advance the cursor."""
         action, tag, it = st["actions"][st["action_index"]], cur_tag(), st["iteration"]
         if action == "propose":
-            cand_dir = run_dir / "candidates" / tag
+            cand_dir = tag_dir(tag) / "harness"
             if rc == 0 and (cand_dir / "pyproject.toml").exists():
                 st["scaffold_dir"] = str(cand_dir)
                 advance()
@@ -506,7 +521,7 @@ def optimize(args: argparse.Namespace) -> None:
                 # the freshly-trained checkpoint becomes the model for this iteration's eval.
                 # miles saves HF checkpoints as <out>/checkpoints/hf/step_N (--save-hf); pick the
                 # latest step. If HF export is off/absent, keep the prior model.
-                ckpt = _latest_hf_ckpt(run_dir / "train" / tag / "checkpoints" / "hf")
+                ckpt = _latest_hf_ckpt(tag_dir(tag) / "train" / "checkpoints" / "hf")
                 if ckpt is not None:
                     st["model_dir"] = str(ckpt)
                 advance()
@@ -519,8 +534,10 @@ def optimize(args: argparse.Namespace) -> None:
             # eval.sh wrote trials to the deterministic MHO_OUT/<EVAL_JOB_NAME>. For the
             # single-set `eval` that is run_dir/eval/<tag>; for a dual stage it is
             # run_dir/eval/<tag>-<stage>. Either way score/record that dir directly.
-            stage = action[5:] if action.startswith("eval_") else None
-            trials_dir = (run_dir / "eval" / tag) if stage is None else (run_dir / "eval" / f"{tag}-{stage}")
+            if action == "eval_train_sample":
+                trials_dir = tag_dir(tag) / "eval"
+            else:  # eval_val (dual) or `eval` (single-set): the val accept gate.
+                trials_dir = run_dir / "evaluation" / tag
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
             if rc != 0 or not has_trials:
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
@@ -538,7 +555,12 @@ def optimize(args: argparse.Namespace) -> None:
             else:
                 # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)
-                st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
+                # Only the single-set `eval` doubles as the proposer signal (there is no
+                # separate train-sample eval). In dual mode, eval_val is the accept gate and
+                # MUST NOT feed last_eval_dir -- the train-sample eval already did, and the
+                # proposer must never see val trials.
+                if action == "eval":
+                    st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
                 improved = update_frontier(frontier_path, tag, score)
                 if improved and st["scaffold_dir"]:
                     # ACCEPTED: accumulate (next propose builds ON this new best), bump the
@@ -554,7 +576,7 @@ def optimize(args: argparse.Namespace) -> None:
                     st["try"] += 1
                 # record WHAT this candidate changed (its CANDIDATE.md), so the next proposer
                 # can learn from the outcome (build on winners, avoid repeating regressions).
-                hypothesis = _candidate_hypothesis(run_dir / "candidates" / tag)
+                hypothesis = _candidate_hypothesis(tag_dir(tag) / "harness")
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,

@@ -37,6 +37,7 @@ from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth f
 
 SKILL_PATH = Path(__file__).parent / "instructions" / "propose_harness.md"
 _MAX_SUMMARY_LINES = 40
+_MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
 
 
 def _attempts_table() -> str:
@@ -120,7 +121,55 @@ def _materialize_from(src: Path, dst: Path) -> None:
 # are copied with scaffold._IGNORE which strips these -- otherwise every .git/* file shows as a
 # spurious deletion, burying the real code change).
 _DIFF_EXCLUDE = ("/.git/", "/__pycache__/", "/.venv/", "/venv/", "/.pytest_cache/",
-                 "/.ruff_cache/", "/.mypy_cache/", ".egg-info/")
+                 "/.ruff_cache/", "/.mypy_cache/", ".egg-info/", "/eval_prior/")
+
+
+def _stage_prior_results(dst: Path) -> None:
+    """Copy prior eval results INTO the workspace (eval_prior/) so the proposer agent can
+    open them as files (not only as inline prompt text). Stages: frontier.json,
+    evolution_summary.jsonl, aggregated.jsonl, and a bounded sample of the raw trial dirs
+    (result.json + the readable + token-sparse trajectory transcripts). No-op when the
+    sources are absent (first iteration). Excluded from the candidate diff by /eval_prior/."""
+    # VALIDATION ISOLATION: the optimizer only ever sees the TRAIN-SAMPLE eval (the proposer's
+    # improvement signal). The val-split eval (eval-val/) is the held-out accept/reject gate and
+    # MUST NEVER be staged/read by the proposer -- doing so would contaminate the accept decision
+    # and overfit the val set. MHO_TRIALS_DIR is set by the loop ONLY from the train-sample eval,
+    # so staging from it is safe; refuse any path that looks like a val eval just in case.
+    prior = dst / "eval_prior"
+    trials = os.environ.get("MHO_TRIALS_DIR", "")
+    if "evaluation" in Path(trials).parts or "eval-val" in Path(trials).parts:
+        raise RuntimeError(
+            "refusing to stage val-split trials into the proposer workspace: "
+            f"{trials} (validation set must stay hidden from the optimizer)"
+        )
+    srcs = {
+        "frontier.json": os.environ.get("MHO_FRONTIER", ""),
+        "evolution_summary.jsonl": os.environ.get("MHO_SUMMARY", ""),
+        "aggregated.jsonl": str(Path(trials) / "aggregated.jsonl") if trials else "",
+    }
+    if not any(v and Path(v).exists() for v in srcs.values()) and not (trials and Path(trials).is_dir()):
+        return
+    prior.mkdir(parents=True, exist_ok=True)
+    for name, path in srcs.items():
+        p = Path(path) if path else None
+        if p and p.is_file():
+            shutil.copy2(p, prior / name)
+    if trials and Path(trials).is_dir():
+        traj = prior / "trials"
+        for i, trial_dir in enumerate(sorted(Path(trials).glob("*"))):
+            if i >= _MAX_TRIAL_DIRS:
+                break
+            if not trial_dir.is_dir():
+                continue
+            tgt = traj / trial_dir.name
+            tgt.mkdir(parents=True, exist_ok=True)
+            for rel in ("result.json", "agent/mini-swe-agent.txt", "agent/mini-swe-agent.trajectory.json"):
+                f = trial_dir / rel
+                if f.is_file():
+                    tf = tgt / rel
+                    tf.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, tf)
+    print(f"[propose] staged prior eval results in {prior}")
 
 
 def _filter_diff(diff_text: str) -> str:
@@ -186,6 +235,15 @@ def _build_instructions(dst: Path) -> str:
         f"- Keep it an installable package that still imports. Do not run destructive shell commands "
         f"(rm -rf, git clean, moving the whole tree, etc.).\n\n"
         f"## Prior results\n{_digest_prior_results()}\n\n"
+        f"The same prior results are ALSO mounted as files under `eval_prior/` in your "
+        f"workspace -- open them directly with the file editor for full detail: "
+        f"`eval_prior/frontier.json`, `eval_prior/evolution_summary.jsonl`, "
+        f"`eval_prior/aggregated.jsonl`, and `eval_prior/trials/` (one dir per trial, with "
+        f"`result.json` + `agent/mini-swe-agent.txt` + `agent/mini-swe-agent.trajectory.json`). "
+        f"NOTE: you see only the training-sample eval (eval_prior/trials). The validation set "
+        f"is deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT "
+        f"attempt to reconstruct or infer val results.\n"
+        f"Do NOT edit anything under `eval_prior/` -- it is read-only reference material.\n\n"
         f"Now: analyze the above, state ONE falsifiable hypothesis, make the single targeted "
         f"general-purpose change (minimal + additive), verify the package still imports, and write "
         f"CANDIDATE.md (hypothesis / changed files / expected effect)."
@@ -257,6 +315,7 @@ def main() -> int:
     parent = _parent_scaffold()
 
     _materialize_from(parent, dst)   # accumulate: build on the frontier-best
+    _stage_prior_results(dst)        # mount prior eval results (scores + trajectories) into eval_prior/
     _run_openhands(dst, _build_instructions(dst))
 
     ok, reason = _validate_candidate(dst, parent)

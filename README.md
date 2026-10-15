@@ -130,7 +130,12 @@ SSH session. Progress is the number of finished trials, not the driver log, whic
 silent for the hours a phase runs:
 
 ```bash
-find runs_output/optimize/<run-name>/eval -name result.json | wc -l
+# per-candidate trials (the train-sample eval the optimizer sees):
+find runs_output/optimize/<run-name>/candidates/*/eval -name result.json | wc -l
+# validation evals (accept/reject gate, kept separate from candidates):
+find runs_output/optimize/<run-name>/evaluation/* -name result.json | wc -l
+# Layout: runs_output/optimize/<run>/candidates/<candidate>/{harness,diff,eval,logs},
+#         runs_output/optimize/<run>/evaluation/<candidate>/  (val gate), + run-global *.jsonl
 ```
 
 A phase whose QOS forbids its resource request waits in the queue rather than failing. On a
