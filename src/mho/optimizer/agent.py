@@ -262,13 +262,9 @@ def _run_openhands(workspace: Path, instructions: str) -> None:
     from openhands.tools.task_tracker import TaskTrackerTool
     from openhands.tools.terminal import TerminalTool
 
-    model = os.environ.get("OPTIMIZER_MODEL", "anthropic/claude-opus-4-6")
-    api_key = (
-        os.environ.get("OPTIMIZER_LLM_API_KEY")
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-    )
-    base_url = os.environ.get("OPTIMIZER_LLM_BASE_URL") or None
+    model = os.environ.get("OPTIMIZER_MODEL", None)
+    api_key = os.environ.get("OPTIMIZER_LLM_API_KEY", None)
+    base_url = os.environ.get("OPTIMIZER_LLM_BASE_URL", None)
     llm = LLM(model=model, api_key=api_key, base_url=base_url)
     # Load the propose-harness skill (AgentSkills standard) so the SDK exposes it in
     # <available_skills> and auto-injects its content when triggered. `Skill.load` directly
