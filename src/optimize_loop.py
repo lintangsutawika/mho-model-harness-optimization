@@ -223,6 +223,25 @@ def _phase_env(extra: dict[str, str], scaffold_dir: Path | None) -> dict[str, st
 _ACCOUNT = os.environ.get("MHO_ACCOUNT", "")  # PBS -P / SLURM -A
 
 
+def _phase_res(phase: str) -> dict[str, str]:
+    """Resolve one phase's resource vars with per-phase override -> shared base -> default.
+
+    Global base vars (MHO_QUEUE/RTYPE/SELECT/WALLTIME/NGPUS) set the cluster defaults once;
+    per-phase MHO_<PHASE>_<VAR> override them for that phase only. This collapses the
+    ~18 EVAL/TRAIN/PROPOSE resource vars into ~6 globals + sparse per-phase overrides.
+    """
+    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
+    get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
+    return {
+        "queue": get("QUEUE") or "",
+        "select": get("SELECT") or "",
+        "resource_type": get("RTYPE") or "",
+        "walltime": get("WALLTIME") or ("08:00:00" if phase == "EVAL" else "24:00:00" if phase == "TRAIN" else "02:00:00"),
+        "ngpus": int(get("NGPUS") or (1 if phase == "EVAL" else 8 if phase == "TRAIN" else 0)),
+        "cpus": int(os.environ.get(f"MHO_{phase}_CPUS", 0) or 0),
+    }
+
+
 def _data_env(data: str) -> dict[str, str]:
     """Map a data spec to the phase script's -p/-d env: a path on disk -> MHO_DATA_PATH (-p),
     else a registry name -> MHO_DATA (-d)."""
@@ -254,12 +273,7 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B
     # fits on one H200); set MHO_EVAL_NGPUS=0 for an API/litellm model (no self-serve).
     return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{tag}",
-                        queue=os.environ.get("MHO_EVAL_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_EVAL_SELECT", ""),
-                        resource_type=os.environ.get("MHO_EVAL_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_EVAL_NGPUS", 1)),
-                        cpus=int(os.environ.get("MHO_EVAL_CPUS", 0) or 0),
-                        walltime=os.environ.get("MHO_EVAL_WALLTIME", "08:00:00"), out_dir=logs)
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("EVAL"))
 
 
 def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: str | None,
@@ -270,11 +284,7 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
     if harness:
         extra["MHO_HARNESS"] = harness
     return sched.submit(TRAIN_SCRIPT, _phase_env(extra, None), name=f"mho-train-{tag}",
-                        queue=os.environ.get("MHO_TRAIN_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_TRAIN_SELECT", ""),
-                        resource_type=os.environ.get("MHO_TRAIN_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_TRAIN_NGPUS", 8)),
-                        walltime=os.environ.get("MHO_TRAIN_WALLTIME", "24:00:00"), out_dir=logs)
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("TRAIN"))
 
 
 def submit_propose(sched: Scheduler, parent_scaffold: str | None, *, candidate_dir: Path,
@@ -297,11 +307,7 @@ def submit_propose(sched: Scheduler, parent_scaffold: str | None, *, candidate_d
         "MHO_TRIALS_DIR": trials_dir or "",
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
-                        queue=os.environ.get("MHO_PROPOSE_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_PROPOSE_SELECT", ""),
-                        resource_type=os.environ.get("MHO_PROPOSE_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_PROPOSE_NGPUS", 0) or 0),
-                        walltime=os.environ.get("MHO_PROPOSE_WALLTIME", "02:00:00"), out_dir=logs)
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
 
 
 def latest_trials_dir() -> str | None:
@@ -589,7 +595,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--model", default=os.environ.get("MHO_MODEL", ""),
                    help="starting model: HF name/local dir (self-served) or a litellm id (API). "
                         "In model modes, each iteration's eval uses the freshly-trained checkpoint instead.")
-    p.add_argument("--train-data", default=os.environ.get("MHO_DATA", "aime/aime"),
+    p.add_argument("--train-data", default=os.environ.get("MHO_TRAIN_DATA", "aime/aime"),
                    help="eval data: a registry name (e.g. aime/aime -> -d) or a local task/dataset dir (-> -p). "
                         "In dual mode this is the FULL train task dir the proposer's signal samples from.")
     p.add_argument("--val-data", default=os.environ.get("MHO_VAL_DATA", ""),
