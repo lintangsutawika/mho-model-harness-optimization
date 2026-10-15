@@ -35,6 +35,7 @@ from pathlib import Path
 from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth for the copy)
 
 SKILL_DIR = Path(__file__).parent / "propose-harness"   # AgentSkills dir: must contain SKILL.md
+INSTRUCTIONS_MD = SKILL_DIR / "instructions.md"       # proposer message template (only {{prior_results}})
 _MAX_SUMMARY_LINES = 40
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
 
@@ -237,39 +238,11 @@ def _emit_diffs(dst: Path, paths: dict[str, Path]) -> None:
 
 
 def _build_instructions(dst: Path, paths: dict[str, Path]) -> str:
-    # The full scaffold-evolution workflow lives in the registered `propose-harness` skill
-    # (propose-harness/SKILL.md), exposed to the agent via AgentContext. This message carries
-    # the per-run context (workspace, constraints, prior results) + a pointer to follow the skill.
-    return (
-        f"Follow the **propose-harness** skill (available in <available_skills>) for the "
-        f"scaffold-evolution workflow: analyze, state ONE falsifiable hypothesis, implement a "
-        f"single minimal additive change, validate the package, and write CANDIDATE.md.\n\n"
-        f"## Your workspace\n"
-        f"The micro-swe-agent scaffold snapshot is your working directory -- it already contains "
-        f"the accumulated changes from the best iteration so far (you are building ON TOP of it, "
-        f"not from scratch). Edit files here in place to add ONE more improvement; keep it an "
-        f"installable package (pyproject.toml + src/).\n\n"
-        f"## HARD CONSTRAINTS (a candidate that violates these is REJECTED)\n"
-        f"- Make MINIMAL, mostly-ADDITIVE edits for your ONE mechanism. Change only the files that "
-        f"mechanism needs.\n"
-        f"- NEVER delete existing files, NEVER empty or rewrite the src/ tree, NEVER recreate the "
-        f"package from scratch. The snapshot must remain the FULL working scaffold PLUS your change.\n"
-        f"- Keep it an installable package that still imports. Do not run destructive shell commands "
-        f"(rm -rf, git clean, moving the whole tree, etc.).\n\n"
-        f"## Prior results\n{_digest_prior_results(paths)}\n\n"
-        f"The same prior results are ALSO mounted as files under `eval_prior/` in your "
-        f"workspace -- open them directly with the file editor for full detail: "
-        f"`eval_prior/frontier.json`, `eval_prior/evolution_summary.jsonl`, "
-        f"`eval_prior/aggregated.jsonl`, and `eval_prior/trials/` (one dir per trial, with "
-        f"`result.json` + `agent/mini-swe-agent.txt` + `agent/mini-swe-agent.trajectory.json`). "
-        f"NOTE: you see only the training-sample eval (eval_prior/trials). The validation set "
-        f"is deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT "
-        f"attempt to reconstruct or infer val results.\n"
-        f"Do NOT edit anything under `eval_prior/` -- it is read-only reference material.\n\n"
-        f"Now: analyze the above, state ONE falsifiable hypothesis, make the single targeted "
-        f"general-purpose change (minimal + additive), verify the package still imports, and write "
-        f"CANDIDATE.md (hypothesis / changed files / expected effect)."
-    )
+    """Render the proposer message from propose-harness/instructions.md (a Markdown template)
+    with the dynamic {prior_results} block injected from _digest_prior_results(paths). All
+    static prose lives in the .md itself -- one file, full message in one place."""
+    tmpl = INSTRUCTIONS_MD.read_text() if INSTRUCTIONS_MD.exists() else ""
+    return tmpl.replace("{{prior_results}}", _digest_prior_results(paths))
 
 
 def _run_openhands(workspace: Path, instructions: str) -> None:
