@@ -3,21 +3,24 @@
 Run as its own batch job by ``optimize_loop`` (via ``MHO_PROPOSE_JOB``). Contract:
 
   in  (env):
-    MHO_CANDIDATE_DIR  destination for the new scaffold snapshot (required)
-    MHO_RUN_DIR        the experiment root (runs_output/optimize/<run>); everything else
-                       derives from it: frontier.json, evolution_summary.jsonl, the parent
-                       scaffold (frontier-best candidate's harness), the diff dir, and the
-                       train-sample eval trials to analyze (see _derive_paths).
+    MHO_RUN_DIR        the experiment root (runs_output/optimize/<run>); EVERYTHING derives
+                       from it: the candidate destination <RUN>/candidates/<tag>/harness,
+                       frontier.json, evolution_summary.jsonl, the parent scaffold
+                       (frontier-best candidate's harness), the diff dir, and the train-sample
+                       eval trials to analyze (see _derive_paths).
+    MHO_TAG            this iteration's candidate tag (e.g. candidate_1_0_1); the loop picks
+                       it (encodes iteration/version/try). Only the loop knows it, so it is
+                       passed explicitly; the destination path itself derives from RUN + TAG.
     MICRO_SCAFFOLD_BASE  the original/immutable base scaffold (for diff_from_base); default
                        scaffold.DEFAULT_BASE when unset.
     OPTIMIZER_MODEL / OPTIMIZER_LLM_API_KEY / OPTIMIZER_LLM_BASE_URL   the proposer LLM
   out:
-    a VALID installable micro-swe-agent snapshot at MHO_CANDIDATE_DIR (pyproject.toml present),
+    a VALID installable micro-swe-agent snapshot at <RUN>/candidates/<tag>/harness (pyproject.toml present),
     plus two git-format patches in <candidate>/../diff: diff_from_base.patch (cumulative, base->cand)
     and diff_from_parent.patch (incremental, parent->cand). exit 0 on success; nonzero if invalid.
 
 Flow: materialize the PARENT scaffold (frontier-best, so changes ACCUMULATE) into
-MHO_CANDIDATE_DIR, drive an OpenHands Conversation (FileEditor + Terminal, workspace = the
+In the derived candidate dir, drive an OpenHands Conversation (FileEditor + Terminal, workspace = the
 snapshot) with the adapted meta-harness instructions (instructions/propose_harness.md) + a digest of prior
 results to make ONE targeted general-purpose change, then emit the two provenance diffs. Full
 code edits are allowed; the only invariant is the snapshot stays an installable package. The
@@ -41,8 +44,8 @@ _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into ev
 
 def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     """Derive every proposer input path from the run layout + the target candidate dir,
-    instead of ~6 individual env vars. Requires MHO_RUN_DIR (the experiment root) and the
-    candidate's harness dir (MHO_CANDIDATE_DIR):
+    instead of ~6 individual env vars. Requires MHO_RUN_DIR (the experiment root); the
+    candidate's harness dir is derived as <RUN>/candidates/<tag>/harness:
       frontier  = <RUN>/frontier.json
       summary   = <RUN>/evolution_summary.jsonl
       diff_dir  = <candidate>/../diff                 (sibling of harness under the candidate)
@@ -232,11 +235,12 @@ def _validate_candidate(dst: Path, parent: Path) -> tuple[bool, str]:
 
 
 def main() -> int:
-    cand = os.environ.get("MHO_CANDIDATE_DIR")
-    if not cand:
-        sys.exit("[propose] MHO_CANDIDATE_DIR not set")
-    dst = Path(cand)
-    paths = _derive_paths(dst)       # everything else derives from MHO_RUN_DIR + the candidate dir
+    run = Path(os.environ.get("MHO_RUN_DIR") or "")
+    tag = os.environ.get("MHO_TAG", "")
+    if not run.is_dir() or not tag:
+        sys.exit("[propose] MHO_RUN_DIR (experiment root) and MHO_TAG are required")
+    dst = run / "candidates" / tag / "harness"   # destination derived from the run layout
+    paths = _derive_paths(dst)
     parent = paths["parent"]
 
     _materialize_from(parent, dst)   # accumulate: build on the frontier-best
