@@ -1,3 +1,20 @@
+---
+name: propose-harness
+description: >
+  One iteration of agent-scaffold evolution for the MHO project. Use when asked to
+  propose/evolve/improve the micro-swe-agent scaffold: analyze prior eval results, form ONE
+  falsifiable hypothesis, and make a single minimal additive change to the harness snapshot.
+license: MIT
+compatibility: Python / OpenHands SDK
+metadata:
+  author: mho
+  version: "1.0"
+triggers:
+  - propose harness
+  - evolve scaffold
+  - improve the agent
+  - optimize harness
+---
 # Meta-Harness — scaffold evolution (one iteration)
 
 Run **ONE** iteration of agent-scaffold evolution. Adapted from stanford-iris-lab/meta-harness

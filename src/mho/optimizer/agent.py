@@ -35,7 +35,7 @@ from pathlib import Path
 
 from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth for the copy)
 
-SKILL_PATH = Path(__file__).parent / "instructions" / "propose_harness.md"
+SKILL_DIR = Path(__file__).parent / "propose-harness"   # AgentSkills dir: must contain SKILL.md
 _MAX_SUMMARY_LINES = 40
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
 
@@ -219,9 +219,13 @@ def _emit_diffs(dst: Path) -> None:
 
 
 def _build_instructions(dst: Path) -> str:
-    skill = SKILL_PATH.read_text() if SKILL_PATH.exists() else ""
+    # The full scaffold-evolution workflow lives in the registered `propose-harness` skill
+    # (propose-harness/SKILL.md), exposed to the agent via AgentContext. This message carries
+    # the per-run context (workspace, constraints, prior results) + a pointer to follow the skill.
     return (
-        f"{skill}\n\n---\n\n"
+        f"Follow the **propose-harness** skill (available in <available_skills>) for the "
+        f"scaffold-evolution workflow: analyze, state ONE falsifiable hypothesis, implement a "
+        f"single minimal additive change, validate the package, and write CANDIDATE.md.\n\n"
         f"## Your workspace\n"
         f"The micro-swe-agent scaffold snapshot is your working directory -- it already contains "
         f"the accumulated changes from the best iteration so far (you are building ON TOP of it, "
@@ -252,7 +256,8 @@ def _build_instructions(dst: Path) -> str:
 
 def _run_openhands(workspace: Path, instructions: str) -> None:
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
-    from openhands.sdk import LLM, Agent, Conversation, LocalWorkspace, Tool
+    from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
+    from openhands.sdk.skills.skill import Skill
     from openhands.tools.file_editor import FileEditorTool
     from openhands.tools.task_tracker import TaskTrackerTool
     from openhands.tools.terminal import TerminalTool
@@ -265,6 +270,14 @@ def _run_openhands(workspace: Path, instructions: str) -> None:
     )
     base_url = os.environ.get("OPTIMIZER_LLM_BASE_URL") or None
     llm = LLM(model=model, api_key=api_key, base_url=base_url)
+    # Load the propose-harness skill (AgentSkills standard) so the SDK exposes it in
+    # <available_skills> and auto-injects its content when triggered. `Skill.load` directly
+    # on SKILL.md is used because load_skills_from_dir's dir discovery did not pick it up.
+    skill = Skill.load(SKILL_DIR / "SKILL.md")
+    agent_context = AgentContext(
+        skills=[skill],
+        load_public_skills=False,
+    )
     agent = Agent(
         llm=llm,
         tools=[
@@ -272,6 +285,7 @@ def _run_openhands(workspace: Path, instructions: str) -> None:
             Tool(name=FileEditorTool.name),
             Tool(name=TaskTrackerTool.name),
         ],
+        agent_context=agent_context,
     )
     # Operate IN-PLACE on the candidate dir. Passing a bare string coerces OpenHands into a
     # default/isolated workspace, so the agent's edits never touch our dir (candidate == parent).
