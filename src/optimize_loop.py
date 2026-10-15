@@ -226,9 +226,13 @@ _ACCOUNT = os.environ.get("MHO_ACCOUNT", "")  # PBS -P / SLURM -A
 def _phase_res(phase: str) -> dict[str, str]:
     """Resolve one phase's resource vars with per-phase override -> shared base -> default.
 
-    Global base vars (MHO_QUEUE/RTYPE/SELECT/WALLTIME/NGPUS) set the cluster defaults once;
-    per-phase MHO_<PHASE>_<VAR> override them for that phase only. This collapses the
-    ~18 EVAL/TRAIN/PROPOSE resource vars into ~6 globals + sparse per-phase overrides.
+    Scheduler-agnostic: NGPUS/CPUS are the PORTABLE primary signal -- the Scheduler builds
+    PBS ``-l select=1:ngpus=N:ncpus=C`` and SLURM ``--gres=gpu:N --cpus-per-task=C`` from
+    them, so the same MHO_<PHASE>_NGPUS/CPUS works on either backend. QUEUE/ACCOUNT/WALLTIME
+    are already neutral (PBS -q/-P/-l walltime vs SLURM -p/-A/-t). SELECT (raw PBS
+    ``-l select=`` for full-node/reservation shapes) and RTYPE (PBS ``-v RTYPE=``, ABCI RESERVE
+    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. Per-phase
+    MHO_<PHASE>_<VAR> overrides the shared base MHO_<VAR>; unset falls back to phase defaults.
     """
     base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
     get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
