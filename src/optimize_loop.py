@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -232,19 +233,18 @@ def _data_env(data: str) -> dict[str, str]:
 
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
-                tag: str) -> str:
+                tag: str, stage: str | None = None) -> str:
     # The loop hands eval.sh the (model, harness, data) explicitly via MHO_* -- exactly the
     # manual form `MHO_MODEL=<model> MHO_DATA=<data> MHO_HARNESS=<harness> bash .../eval.sh`.
     # Name + locate the output by the iteration tag (baseline, iter1, ...), not a timestamp, so
     # each iteration's eval is findable/scoreable at MHO_OUT/<tag>.
     extra = {
-        "MHO_TASK": task,
         "AGENT_IMPORT": AGENT_IMPORT,
         "TASK_SET": "full",
         "N_ATTEMPTS": str(n_trials),
         "N_CONCURRENT": str(n_concurrent),
         "MHO_OUT": str(out_dir),
-        "EVAL_JOB_NAME": tag,
+        "EVAL_JOB_NAME": tag + (f"-{stage}" if stage else ""),
         **_data_env(data),
     }
     if model:
@@ -337,18 +337,49 @@ def _latest_hf_ckpt(hf_dir: Path) -> Path | None:
 # Persisted after every transition so the driver can die and resume (re-attaching
 # to an in-flight job rather than resubmitting).
 # --------------------------------------------------------------------------- #
-def actions_for(iteration: int, do_propose: bool, do_train: bool) -> list[str]:
+def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = False) -> list[str]:
     """The ordered stages for one iteration. Iteration 0 is the baseline (measure the
-    starting model+harness); later iterations run the mode's full cycle."""
+    starting model+harness); later iterations run the mode's full cycle.
+
+    `dual` (harness-only with --val-data): each iteration runs TWO evals --
+    `eval_train_sample` (a fresh random-K subset of the train task dir, whose trials feed
+    the proposer's improvement signal) and `eval_val` (the held-out val-split, whose score
+    drives accept/frontier). Proposer samples from the full task; val-split accepts."""
     if iteration == 0:
-        return ["eval"]
+        return ["eval_val", "eval_train_sample"] if dual else ["eval"]
     acts: list[str] = []
     if do_propose:
         acts.append("propose")
     if do_train:
         acts.append("train")
-    acts.append("eval")
+    if dual:
+        acts.append("eval_train_sample")
+        acts.append("eval_val")
+    else:
+        acts.append("eval")
     return acts
+
+
+def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int) -> Path:
+    """Copy `k` random problem dirs from a local harbor task dir (`task_dir`) into a fresh
+    `out_dir` (a valid `harbor run -p` target). Each problem = a subdir (e.g. `<id>-python/`)
+    holding instruction.md + task.toml + tests/. Gives the proposer a BOUNDED,
+    fresh-random subset of the full training task instead of eval'ing the whole train set.
+    The sample is deterministic for a given (k, seed); fresh per iteration via a new seed."""
+    task_dir, out_dir = Path(task_dir), Path(out_dir)
+    if k <= 0:
+        raise ValueError(f"propose-sample k must be > 0 (got {k})")
+    problems = sorted(p for p in task_dir.iterdir() if p.is_dir())
+    if not problems:
+        raise ValueError(f"no problem dirs under train task dir: {task_dir}")
+    sample = problems  # if k covers them all, no need to randomize beyond order
+    if k < len(problems):
+        rng = random.Random(seed)
+        sample = rng.sample(problems, k)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for p in sample:
+        shutil.copytree(p, out_dir / p.name, dirs_exist_ok=True)
+    return out_dir
 
 
 def _load_state(path: Path) -> dict | None:
@@ -379,7 +410,7 @@ def optimize(args: argparse.Namespace) -> None:
     if st is None:
         start = 0 if not args.skip_baseline else 1
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
-              "actions": actions_for(start, do_propose, do_train), "job_id": None,
+              "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
               "scaffold_dir": None,        # the candidate currently being trained/evaled
               "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
@@ -387,7 +418,7 @@ def optimize(args: argparse.Namespace) -> None:
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1}                    # attempts at the current version; resets on acceptance
         _save_state(state_path, st)
-        print(f"{datetime.now():%H:%M:%S} MHO optimize  run={run_id}  mode={args.mode}  task={args.task}  "
+        print(f"{datetime.now():%H:%M:%S} MHO optimize  run={run_id}  mode={args.mode}  "
               f"trainer={args.trainer}  scheduler={sched.kind}  iters={args.iterations}")
     else:
         print(f"{datetime.now():%H:%M:%S} MHO optimize  RESUME run={run_id}  iter={st['iteration']}  "
@@ -407,7 +438,7 @@ def optimize(args: argparse.Namespace) -> None:
         """Move to the next stage, or (past the last, or on skip_rest) the next iteration."""
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
             st["iteration"] += 1
-            st["actions"] = actions_for(st["iteration"], do_propose, do_train)
+            st["actions"] = actions_for(st["iteration"], do_propose, do_train, dual=args.val_data)
             st["action_index"] = 0
         else:
             st["action_index"] += 1
@@ -429,11 +460,23 @@ def optimize(args: argparse.Namespace) -> None:
         if action == "train":
             return submit_train(sched, args.trainer, model=model, harness=harness,
                                 out_dir=run_dir / "train" / tag, logs=logs_dir, tag=tag)
-        # out_dir is the harbor jobs-dir; EVAL_JOB_NAME=tag makes the per-iteration subdir,
-        # so trials land at run_dir/eval/<tag>/.
-        return submit_eval(sched, args.task, model=model, harness=harness, data=args.data,
+        # out_dir is the harbor jobs-dir; EVAL_JOB_NAME=<tag>[-<stage>] makes the per-iteration
+        # subdir, so trials land at run_dir/eval/<tag>-<stage>/.
+        # Single-set compat: `eval` has no stage suffix -> trials at run_dir/eval/<tag>/.
+        # Dual (--val-data): eval_train_sample/eval_val add a stage -> <tag>-<stage>/.
+        stage = action[5:] if action.startswith("eval_") else None
+        data = args.train_data
+        if action == "eval_train_sample":
+            # BOUNDED, fresh-random subset of the full train task dir for the proposer's
+            # improvement signal -- never the whole (often 1000s-problem) train set.
+            seed = int(time.time()) % (2**31)
+            data = str(_sample_subset(args.train_data, args.propose_sample,
+                                      run_dir / "samples" / f"{tag}-train_sample", seed))
+        elif action == "eval_val":
+            data = args.val_data
+        return submit_eval(sched, "", model=model, harness=harness, data=data,
                            n_trials=args.trials, n_concurrent=args.concurrent,
-                           out_dir=run_dir / "eval", logs=logs_dir, tag=tag)
+                           out_dir=run_dir / "eval", logs=logs_dir, tag=tag, stage=stage)
 
     def on_done(rc: int) -> None:
         """Handle the finished stage's result and advance the cursor."""
@@ -462,17 +505,28 @@ def optimize(args: argparse.Namespace) -> None:
                                               "status": f"rc={rc}"})
                 print(f"  train failed (rc={rc}); skipping to next iteration")
                 advance(skip_rest=True)
-        else:  # eval (last stage of the iteration)
-            # eval.sh wrote trials to the deterministic MHO_OUT/<tag> = run_dir/eval/<tag>
-            # (job name = tag). Score that dir directly -- not the Ray-session glob.
-            trials_dir = run_dir / "eval" / tag
+        else:  # eval stage (single `eval`, or dual eval_train_sample / eval_val)
+            # eval.sh wrote trials to the deterministic MHO_OUT/<EVAL_JOB_NAME>. For the
+            # single-set `eval` that is run_dir/eval/<tag>; for a dual stage it is
+            # run_dir/eval/<tag>-<stage>. Either way score/record that dir directly.
+            stage = action[5:] if action.startswith("eval_") else None
+            trials_dir = (run_dir / "eval" / tag) if stage is None else (run_dir / "eval" / f"{tag}-{stage}")
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
             if rc != 0 or not has_trials:
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "eval",
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "status": f"rc={rc}" if rc else "no_trials",
                                               "trials_dir": str(trials_dir)})
-                print(f"  eval produced no score (rc={rc}, trials={trials_dir})")
+                print(f"  {action} produced no score (rc={rc}, trials={trials_dir})")
+            elif action == "eval_train_sample":
+                # Proposer-signal eval (fresh random subset of the train task): hand its trials
+                # to the next propose for the harness-improvement signal. NO frontier/accept
+                # decision here -- the val-split eval holds that. Record it for the summary.
+                st["last_eval_dir"] = str(trials_dir)
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
+                                              "trials_dir": str(trials_dir)})
+                print(f"  proposer-signal eval recorded trials for next propose: {trials_dir}")
             else:
+                # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)
                 st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
                 improved = update_frontier(frontier_path, tag, score)
@@ -491,7 +545,7 @@ def optimize(args: argparse.Namespace) -> None:
                 # record WHAT this candidate changed (its CANDIDATE.md), so the next proposer
                 # can learn from the outcome (build on winners, avoid repeating regressions).
                 hypothesis = _candidate_hypothesis(run_dir / "candidates" / tag)
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "eval",
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
                                               "hypothesis": hypothesis})
@@ -530,13 +584,25 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mode", choices=["model-only", "harness-only", "model-harness"],
                    default="model-harness")
-    p.add_argument("--task", choices=["math", "aime", "tb2"], default="math")
+
     p.add_argument("--trainer", choices=["skyrl", "miles"], default="miles")
     p.add_argument("--model", default=os.environ.get("MHO_MODEL", ""),
                    help="starting model: HF name/local dir (self-served) or a litellm id (API). "
                         "In model modes, each iteration's eval uses the freshly-trained checkpoint instead.")
-    p.add_argument("--data", default=os.environ.get("MHO_DATA", "aime/aime"),
-                   help="eval data: a registry name (e.g. aime/aime -> -d) or a local task/dataset dir (-> -p).")
+    p.add_argument("--train-data", default=os.environ.get("MHO_DATA", "aime/aime"),
+                   help="eval data: a registry name (e.g. aime/aime -> -d) or a local task/dataset dir (-> -p). "
+                        "In dual mode this is the FULL train task dir the proposer's signal samples from.")
+    p.add_argument("--val-data", default=os.environ.get("MHO_VAL_DATA", ""),
+                   help="dual-mode held-out eval set (a local task/dataset dir, e.g. the --val-size "
+                        "val-split). Enables the dual-data harness loop: each iteration evals a fresh "
+                        "random-K subset of --train-data (full train task, for the proposer's improvement "
+                        "signal) AND --val-data (whose score drives accept/frontier). Unset -> the "
+                        "original single-set loop.")
+    p.add_argument("--propose-sample", type=int,
+                   default=int(os.environ.get("MHO_PROPOSE_SAMPLE", 64)),
+                   help="dual-mode only: how many problems to draw (random, fresh each iteration) "
+                        "from the FULL train task dir (--train-data) for the proposer's improvement signal. "
+                        "Keeps a 1000s-problem train set from being eval'd in full. Env: MHO_PROPOSE_SAMPLE.")
     p.add_argument("--iterations", type=int, default=5)
     p.add_argument("--trials", type=int, default=int(os.environ.get("EVAL_N_ATTEMPTS", 5)),
                    help="attempts per problem (harbor --n-attempts): each eval task is sampled "
@@ -555,6 +621,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "harness-only" and not args.model:
         p.error("harness-only mode needs a fixed model to evaluate the harness against; pass "
                 "--model <HF name/dir or litellm id> (or set MHO_MODEL), e.g. --model Qwen/Qwen3.5-4B")
+    if args.val_data:  # dual mode: the proposer's signal samples come from a LOCAL train dir
+        if not Path(args.train_data).is_dir():
+            p.error("--val-data (dual mode) requires --train-data to be a LOCAL train task dir (a path), "
+                    "because the proposer's signal is a random subset of it; got: " + args.train_data)
+        if args.propose_sample <= 0:
+            p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
     optimize(args)
 
 

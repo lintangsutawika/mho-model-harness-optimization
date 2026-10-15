@@ -110,8 +110,18 @@ Resources are per phase: `MHO_{EVAL,TRAIN,PROPOSE}_{QUEUE,NGPUS,WALLTIME}`, plus
 in `.env` as well.
 
 ```bash
-tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B --task math \
-  --data data-harbor/<task> --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
+tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B \
+  --train-data data-harbor/<task> --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
+  2>&1 | tee -a ~/logs/r1.log"
+```
+### Dual-data harness-only (train + val)
+Each iteration evals a fresh random-K subset of `--train-data` (the FULL train task dir,
+`--propose-sample`, default 64) for the proposer's improvement signal, plus `--val-data`
+(a held-out eval set) whose score drives the accept/frontier decision:
+```bash
+tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B \
+  --train-data data-harbor/<task> --val-data data-harbor/<task>-val-split \
+  --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
   2>&1 | tee -a ~/logs/r1.log"
 ```
 

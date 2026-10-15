@@ -86,9 +86,10 @@ if [ -z "${MINI_FORK_LOCAL:-}" ]; then
     || { echo "ERROR: no harness set and base scaffold not found (set MHO_HARNESS or MICRO_SCAFFOLD_BASE)" >&2; exit 2; }
   echo "[eval] no harness passed -> using base scaffold: ${MINI_FORK_LOCAL}"
 fi
-# Agent config: configs/task/<task>.yaml then configs/sampling/<model>.yaml, layered over
-# the scaffold's mini.yaml that harbor loads as `-c mini`. Override with AGENT_TASK_CONFIG /
-# AGENT_CONFIG, or pass "none" to drop a layer. The model id is MHO_MODEL because the
+# Agent config: an optional agent-task YAML (AGENT_TASK_CONFIG, usually a proposed-scaffold config)
+# then configs/sampling/<model>.yaml, layered over the scaffold's mini.yaml that harbor loads
+# as `-c mini`. Override with AGENT_TASK_CONFIG / AGENT_CONFIG, or pass "none" to drop a
+# layer. The model id is MHO_MODEL because the
 # serving block below overwrites MODEL with litellm_proxy/<served-name>. A missing sampling
 # config exits here, before vLLM starts: the `--ak temperature=` this replaces was ignored
 # by harbor's MiniSweAgent, and every trial ran at mini.yaml's defaults without saying so.
@@ -105,8 +106,11 @@ elif [ ! -f "${AGENT_CONFIG}" ]; then
   echo "       add it, or pass AGENT_CONFIG=<file>, or AGENT_CONFIG=none to use mini.yaml as-is" >&2
   exit 2
 fi
-AGENT_TASK_CONFIG="${AGENT_TASK_CONFIG:-${REPO_DIR}/configs/task/${MHO_TASK:-}.yaml}"
-if [ "${AGENT_TASK_CONFIG}" = "none" ] || [ ! -f "${AGENT_TASK_CONFIG}" ]; then
+# Agent-task config: optional, explicit path via AGENT_TASK_CONFIG (the harness config
+# normally comes from the proposed scaffold's mini.yaml). "none" / a missing path drops the
+# layer (scaffold mini.yaml only).
+AGENT_TASK_CONFIG="${AGENT_TASK_CONFIG:-}"
+if [ "${AGENT_TASK_CONFIG}" = "none" ] || { [ -n "${AGENT_TASK_CONFIG}" ] && [ ! -f "${AGENT_TASK_CONFIG}" ]; }; then
   AGENT_TASK_CONFIG=""
 fi
 echo "[eval] task config:     ${AGENT_TASK_CONFIG:-<none, scaffold mini.yaml only>}"
