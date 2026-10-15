@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Optimizer propose phase: analyze a completed (model, harness) eval and emit a new harness.
-# Env-only. Runs the OpenHands scaffold-evolution agent (mho.optimizer.meta_harness); the SDK
+# Env-only. Runs the OpenHands scaffold-evolution agent (mho.optimizer.agent); the SDK
 # + litellm are installed on demand via uv at job time.
 #
 # Env:
@@ -24,4 +24,4 @@ OPENHANDS_PKGS="${OPENHANDS_PKGS:-openhands-sdk openhands-tools litellm}"
 WITH_ARGS=(); for _p in $OPENHANDS_PKGS; do WITH_ARGS+=(--with "$_p"); done
 echo "[propose] run=${MHO_TRIALS_DIR:-?} out=${MHO_CANDIDATE_DIR} model=${OPTIMIZER_MODEL:-<default>}"
 exec uv run --no-project --python "${OPTIMIZER_PYTHON_VERSION:-3.12}" "${WITH_ARGS[@]}" \
-  python -m mho.optimizer.meta_harness
+  python -m mho.optimizer.agent

@@ -19,7 +19,7 @@ Run as its own batch job by ``optimize_loop`` (via ``MHO_PROPOSE_JOB``). Contrac
 
 Flow: materialize the PARENT scaffold (frontier-best, so changes ACCUMULATE) into
 MHO_CANDIDATE_DIR, drive an OpenHands Conversation (FileEditor + Terminal, workspace = the
-snapshot) with the adapted meta-harness instructions (propose_skill.md) + a digest of prior
+snapshot) with the adapted meta-harness instructions (instructions/propose_harness.md) + a digest of prior
 results to make ONE targeted general-purpose change, then emit the two provenance diffs. Full
 code edits are allowed; the only invariant is the snapshot stays an installable package. The
 OpenHands import is lazy so this module can be imported/validated without the SDK present.
@@ -35,7 +35,7 @@ from pathlib import Path
 
 from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth for the copy)
 
-SKILL_PATH = Path(__file__).parent / "propose_skill.md"
+SKILL_PATH = Path(__file__).parent / "instructions" / "propose_harness.md"
 _MAX_SUMMARY_LINES = 40
 
 
