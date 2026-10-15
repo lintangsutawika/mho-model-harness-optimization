@@ -8,7 +8,7 @@ the accumulated changes from the best iteration so far (you are building ON TOP 
 not from scratch). Edit files here in place to add ONE more improvement; keep it an
 installable package (pyproject.toml + src/).
 
-## HARD CONSTRAINTS (a candidate that violates these is REJECTED)
+## HARD CONSTRAINTS (a candidate that violates these will be REJECTED)
 - Make MINIMAL, mostly-ADDITIVE edits for your ONE mechanism. Change only the files that
   mechanism needs.
 - NEVER delete existing files, NEVER empty or rewrite the src/ tree, NEVER recreate the
@@ -17,13 +17,15 @@ installable package (pyproject.toml + src/).
   (rm -rf, git clean, moving the whole tree, etc.).
 
 ## Prior results
-{{prior_results}}
+Prior eval results are mounted under `eval_prior/` in your workspace -- read them directly
+with the file editor for full detail:
+- `eval_prior/frontier.json`
+- `eval_prior/evolution_summary.jsonl`
+- `eval_prior/aggregated.jsonl`
+- `eval_prior/trials/` (one dir per trial, with `result.json` + `agent/mini-swe-agent.txt` +
+  `agent/mini-swe-agent.trajectory.json`)
 
-The same prior results are ALSO mounted as files under `eval_prior/` in your workspace --
-open them directly with the file editor for full detail:
-`eval_prior/frontier.json`, `eval_prior/evolution_summary.jsonl`, `eval_prior/aggregated.jsonl`,
-and `eval_prior/trials/` (one dir per trial, with `result.json` + `agent/mini-swe-agent.txt` +
-`agent/mini-swe-agent.trajectory.json`).
+Start by reading these to identify the single most promising failure mode.
 
 NOTE: you see only the training-sample eval (eval_prior/trials). The validation set is
 deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT attempt to

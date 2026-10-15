@@ -35,8 +35,7 @@ from pathlib import Path
 from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth for the copy)
 
 SKILL_DIR = Path(__file__).parent / "propose-harness"   # AgentSkills dir: must contain SKILL.md
-INSTRUCTIONS_MD = SKILL_DIR / "instructions.md"       # proposer message template (only {{prior_results}})
-_MAX_SUMMARY_LINES = 40
+INSTRUCTIONS_MD = SKILL_DIR / "instructions.md"       # proposer message, read verbatim (prior results are mounted)
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
 
 
@@ -67,81 +66,6 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     trials = (run / "candidates" / best_tag / "eval") if best_tag else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
-
-
-def _attempts_table(summary: Path) -> str:
-    """A ranked 'what was tried -> result' view from evolution_summary.jsonl, so the proposer
-    LEARNS from history: build on what improved, avoid repeating what regressed. Each eval row is
-    expected to carry {candidate, score, improved, hypothesis} (the loop records hypothesis from
-    the candidate's CANDIDATE.md)."""
-    if not (summary and summary.exists()):
-        return ""
-    attempts = []
-    for line in summary.read_text().splitlines():
-        try:
-            r = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if r.get("phase") != "eval" or not r.get("score"):
-            continue
-        p1 = r["score"].get("solved_pass@1")
-        attempts.append((r.get("candidate", "?"), p1, r.get("improved"), (r.get("hypothesis") or "").strip()))
-    if not attempts:
-        return ""
-    best = max((a[1] for a in attempts if a[1] is not None), default=None)
-    rows = []
-    for cand, p1, improved, hyp in attempts:
-        tag = "BEST" if (p1 is not None and p1 == best) else ("REGRESSED" if improved is False else "improved" if improved else "")
-        delta = f" (Δ{p1 - best:+.3f})" if (p1 is not None and best is not None) else ""
-        hyp1 = (hyp.splitlines()[0][:160] if hyp else "(no hypothesis recorded)")
-        rows.append(f"- {cand}: pass@1={p1}{delta} [{tag}] — {hyp1}")
-    return ("### What has been tried (learn from this: build on the BEST, do NOT repeat a "
-            "REGRESSED idea)\n" + "\n".join(rows))
-
-
-def _digest_prior_results(paths: dict[str, Path]) -> str:
-    """Bounded text digest: attempts+outcomes table, frontier, recent summary, last trials."""
-    parts: list[str] = []
-    table = _attempts_table(paths["summary"])
-    if table:
-        parts.append(table)
-    frontier = paths["frontier"]
-    if frontier and frontier.exists():
-        parts.append("### frontier.json\n```json\n" + frontier.read_text().strip() + "\n```")
-    summary = paths["summary"]
-    if summary and summary.exists():
-        lines = summary.read_text().splitlines()[-_MAX_SUMMARY_LINES:]
-        if lines:
-            parts.append("### evolution_summary.jsonl (recent)\n```\n" + "\n".join(lines) + "\n```")
-    agg = paths["trials"] / "aggregated.jsonl" if (paths["trials"] and paths["trials"].exists()) else None
-    if agg and agg.exists():
-        rows = agg.read_text().splitlines()[:60]
-        parts.append("### recent trials digest (aggregated.jsonl sample)\n```\n" + "\n".join(rows) + "\n```")
-    return "\n\n".join(parts) if parts else "(no prior results — treat this as the first iteration)"
-
-
-def _original_base() -> Path:
-    """The immutable original scaffold, for the cumulative diff_from_base."""
-    return Path(os.environ.get("MICRO_SCAFFOLD_BASE") or scaffold.DEFAULT_BASE)
-
-
-def _materialize_from(src: Path, dst: Path) -> None:
-    """Copy the parent scaffold `src` -> candidate dir `dst`. Changes accumulate because `src`
-    is the frontier-best (not the fixed base)."""
-    if not (src / "pyproject.toml").exists():
-        sys.exit(f"[propose] parent scaffold {src} is not an installable package; set MICRO_SCAFFOLD_BASE / a valid MHO_RUN_DIR layout")
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst, ignore=scaffold._IGNORE)  # noqa: SLF001 (same-repo reuse)
-    print(f"[propose] materialized parent scaffold {src} -> {dst}")
-
-
-# Path fragments that are noise in a scaffold diff (the base checkout has .git, but candidates
-# are copied with scaffold._IGNORE which strips these -- otherwise every .git/* file shows as a
-# spurious deletion, burying the real code change).
-_DIFF_EXCLUDE = ("/.git/", "/__pycache__/", "/.venv/", "/venv/", "/.pytest_cache/",
-                 "/.ruff_cache/", "/.mypy_cache/", ".egg-info/", "/eval_prior/")
 
 
 def _stage_prior_results(dst: Path, paths: dict[str, Path]) -> None:
@@ -237,12 +161,11 @@ def _emit_diffs(dst: Path, paths: dict[str, Path]) -> None:
     _write_diff(paths["parent"], dst, diff_dir / "diff_from_parent.patch")
 
 
-def _build_instructions(dst: Path, paths: dict[str, Path]) -> str:
-    """Render the proposer message from propose-harness/instructions.md (a Markdown template)
-    with the dynamic {prior_results} block injected from _digest_prior_results(paths). All
-    static prose lives in the .md itself -- one file, full message in one place."""
-    tmpl = INSTRUCTIONS_MD.read_text() if INSTRUCTIONS_MD.exists() else ""
-    return tmpl.replace("{{prior_results}}", _digest_prior_results(paths))
+def _build_instructions() -> str:
+    """The full proposer message, read verbatim from propose-harness/instructions.md. Prior
+    results are MOUNTED under eval_prior/ in the workspace (see _stage_prior_results), so the
+    message only points the agent at them -- nothing is inlined here."""
+    return INSTRUCTIONS_MD.read_text() if INSTRUCTIONS_MD.exists() else ""
 
 
 def _run_openhands(workspace: Path, instructions: str) -> None:
@@ -318,7 +241,7 @@ def main() -> int:
 
     _materialize_from(parent, dst)   # accumulate: build on the frontier-best
     _stage_prior_results(dst, paths)  # mount prior eval results (scores + trajectories) into eval_prior/
-    _run_openhands(dst, _build_instructions(dst, paths))
+    _run_openhands(dst, _build_instructions())
 
     ok, reason = _validate_candidate(dst, parent)
     _emit_diffs(dst, paths)  # always emit diffs -- useful to inspect even a rejected candidate
