@@ -4,17 +4,16 @@ Run as its own batch job by ``optimize_loop`` (via ``MHO_PROPOSE_JOB``). Contrac
 
   in  (env):
     MHO_CANDIDATE_DIR  destination for the new scaffold snapshot (required)
-    MHO_PARENT_SCAFFOLD  scaffold to BUILD ON (accumulation) -- the loop sets this to the
-                       frontier-best candidate dir; empty/unset -> the original base (iter 1)
-    MICRO_SCAFFOLD_BASE  the original/immutable base scaffold (for diff_from_base)
-    MHO_DIFF_DIR       where to write the two provenance patches (default: <candidate>_diffs)
-    MHO_FRONTIER       path to frontier.json (optional)
-    MHO_SUMMARY        path to evolution_summary.jsonl (optional)
-    MHO_TRIALS_DIR     recent harbor trials dir, for a trajectory/metrics digest (optional)
+    MHO_RUN_DIR        the experiment root (runs_output/optimize/<run>); everything else
+                       derives from it: frontier.json, evolution_summary.jsonl, the parent
+                       scaffold (frontier-best candidate's harness), the diff dir, and the
+                       train-sample eval trials to analyze (see _derive_paths).
+    MICRO_SCAFFOLD_BASE  the original/immutable base scaffold (for diff_from_base); default
+                       scaffold.DEFAULT_BASE when unset.
     OPTIMIZER_MODEL / OPTIMIZER_LLM_API_KEY / OPTIMIZER_LLM_BASE_URL   the proposer LLM
   out:
     a VALID installable micro-swe-agent snapshot at MHO_CANDIDATE_DIR (pyproject.toml present),
-    plus two git-format patches in MHO_DIFF_DIR: diff_from_base.patch (cumulative, base->cand)
+    plus two git-format patches in <candidate>/../diff: diff_from_base.patch (cumulative, base->cand)
     and diff_from_parent.patch (incremental, parent->cand). exit 0 on success; nonzero if invalid.
 
 Flow: materialize the PARENT scaffold (frontier-best, so changes ACCUMULATE) into
@@ -40,16 +39,44 @@ _MAX_SUMMARY_LINES = 40
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
 
 
-def _attempts_table() -> str:
+def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
+    """Derive every proposer input path from the run layout + the target candidate dir,
+    instead of ~6 individual env vars. Requires MHO_RUN_DIR (the experiment root) and the
+    candidate's harness dir (MHO_CANDIDATE_DIR):
+      frontier  = <RUN>/frontier.json
+      summary   = <RUN>/evolution_summary.jsonl
+      diff_dir  = <candidate>/../diff                 (sibling of harness under the candidate)
+      parent    = <RUN>/candidates/<best>/harness     (frontier-best; else the base scaffold)
+      trials    = <RUN>/candidates/<best>/eval        (the frontier-best's train-sample eval --
+                    the eval the proposer analyzes). `best` is read from frontier _best.candidate.
+    """
+    run = Path(os.environ.get("MHO_RUN_DIR") or "").expanduser()
+    if not run.is_dir():
+        sys.exit(f"[propose] MHO_RUN_DIR not set or missing: {run}")
+    frontier = run / "frontier.json"
+    summary = run / "evolution_summary.jsonl"
+    diff_dir = candidate_dir.parent / "diff"
+    best_tag = ""
+    if frontier.is_file():
+        try:
+            best_tag = str(json.loads(frontier.read_text()).get("_best", {}).get("candidate", ""))
+        except json.JSONDecodeError:
+            pass
+    parent = (run / "candidates" / best_tag / "harness") if best_tag else _original_base()
+    trials = (run / "candidates" / best_tag / "eval") if best_tag else Path("")
+    return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
+            "parent": parent, "trials": trials}
+
+
+def _attempts_table(summary: Path) -> str:
     """A ranked 'what was tried -> result' view from evolution_summary.jsonl, so the proposer
     LEARNS from history: build on what improved, avoid repeating what regressed. Each eval row is
     expected to carry {candidate, score, improved, hypothesis} (the loop records hypothesis from
     the candidate's CANDIDATE.md)."""
-    summary = os.environ.get("MHO_SUMMARY", "")
-    if not (summary and Path(summary).exists()):
+    if not (summary and summary.exists()):
         return ""
     attempts = []
-    for line in Path(summary).read_text().splitlines():
+    for line in summary.read_text().splitlines():
         try:
             r = json.loads(line)
         except json.JSONDecodeError:
@@ -71,22 +98,21 @@ def _attempts_table() -> str:
             "REGRESSED idea)\n" + "\n".join(rows))
 
 
-def _digest_prior_results() -> str:
+def _digest_prior_results(paths: dict[str, Path]) -> str:
     """Bounded text digest: attempts+outcomes table, frontier, recent summary, last trials."""
     parts: list[str] = []
-    table = _attempts_table()
+    table = _attempts_table(paths["summary"])
     if table:
         parts.append(table)
-    frontier = os.environ.get("MHO_FRONTIER", "")
-    if frontier and Path(frontier).exists():
-        parts.append("### frontier.json\n```json\n" + Path(frontier).read_text().strip() + "\n```")
-    summary = os.environ.get("MHO_SUMMARY", "")
-    if summary and Path(summary).exists():
-        lines = Path(summary).read_text().splitlines()[-_MAX_SUMMARY_LINES:]
+    frontier = paths["frontier"]
+    if frontier and frontier.exists():
+        parts.append("### frontier.json\n```json\n" + frontier.read_text().strip() + "\n```")
+    summary = paths["summary"]
+    if summary and summary.exists():
+        lines = summary.read_text().splitlines()[-_MAX_SUMMARY_LINES:]
         if lines:
             parts.append("### evolution_summary.jsonl (recent)\n```\n" + "\n".join(lines) + "\n```")
-    trials = os.environ.get("MHO_TRIALS_DIR", "")
-    agg = Path(trials) / "aggregated.jsonl" if trials else None
+    agg = paths["trials"] / "aggregated.jsonl" if (paths["trials"] and paths["trials"].exists()) else None
     if agg and agg.exists():
         rows = agg.read_text().splitlines()[:60]
         parts.append("### recent trials digest (aggregated.jsonl sample)\n```\n" + "\n".join(rows) + "\n```")
@@ -98,18 +124,11 @@ def _original_base() -> Path:
     return Path(os.environ.get("MICRO_SCAFFOLD_BASE") or scaffold.DEFAULT_BASE)
 
 
-def _parent_scaffold() -> Path:
-    """The scaffold this iteration BUILDS ON (accumulation). The loop sets MHO_PARENT_SCAFFOLD
-    to the frontier-best candidate dir; empty/unset -> the original base (first iteration)."""
-    p = os.environ.get("MHO_PARENT_SCAFFOLD", "").strip()
-    return Path(p) if p else _original_base()
-
-
 def _materialize_from(src: Path, dst: Path) -> None:
     """Copy the parent scaffold `src` -> candidate dir `dst`. Changes accumulate because `src`
     is the frontier-best (not the fixed base)."""
     if not (src / "pyproject.toml").exists():
-        sys.exit(f"[propose] parent scaffold {src} is not an installable package; set MHO_PARENT_SCAFFOLD/MICRO_SCAFFOLD_BASE")
+        sys.exit(f"[propose] parent scaffold {src} is not an installable package; set MICRO_SCAFFOLD_BASE / a valid MHO_RUN_DIR layout")
     if dst.exists():
         shutil.rmtree(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -124,7 +143,7 @@ _DIFF_EXCLUDE = ("/.git/", "/__pycache__/", "/.venv/", "/venv/", "/.pytest_cache
                  "/.ruff_cache/", "/.mypy_cache/", ".egg-info/", "/eval_prior/")
 
 
-def _stage_prior_results(dst: Path) -> None:
+def _stage_prior_results(dst: Path, paths: dict[str, Path]) -> None:
     """Copy prior eval results INTO the workspace (eval_prior/) so the proposer agent can
     open them as files (not only as inline prompt text). Stages: frontier.json,
     evolution_summary.jsonl, aggregated.jsonl, and a bounded sample of the raw trial dirs
@@ -133,30 +152,29 @@ def _stage_prior_results(dst: Path) -> None:
     # VALIDATION ISOLATION: the optimizer only ever sees the TRAIN-SAMPLE eval (the proposer's
     # improvement signal). The val-split eval (eval-val/) is the held-out accept/reject gate and
     # MUST NEVER be staged/read by the proposer -- doing so would contaminate the accept decision
-    # and overfit the val set. MHO_TRIALS_DIR is set by the loop ONLY from the train-sample eval,
+    # and overfit the val set. The trials are derived (paths["trials"]) ONLY from the train-sample eval,
     # so staging from it is safe; refuse any path that looks like a val eval just in case.
     prior = dst / "eval_prior"
-    trials = os.environ.get("MHO_TRIALS_DIR", "")
-    if "evaluation" in Path(trials).parts or "eval-val" in Path(trials).parts:
+    trials = paths["trials"]
+    if "evaluation" in trials.parts or "eval-val" in trials.parts:
         raise RuntimeError(
             "refusing to stage val-split trials into the proposer workspace: "
             f"{trials} (validation set must stay hidden from the optimizer)"
         )
     srcs = {
-        "frontier.json": os.environ.get("MHO_FRONTIER", ""),
-        "evolution_summary.jsonl": os.environ.get("MHO_SUMMARY", ""),
-        "aggregated.jsonl": str(Path(trials) / "aggregated.jsonl") if trials else "",
+        "frontier.json": paths["frontier"],
+        "evolution_summary.jsonl": paths["summary"],
+        "aggregated.jsonl": trials / "aggregated.jsonl",
     }
-    if not any(v and Path(v).exists() for v in srcs.values()) and not (trials and Path(trials).is_dir()):
+    if not any(v.exists() for v in srcs.values()) and not trials.is_dir():
         return
     prior.mkdir(parents=True, exist_ok=True)
     for name, path in srcs.items():
-        p = Path(path) if path else None
-        if p and p.is_file():
-            shutil.copy2(p, prior / name)
-    if trials and Path(trials).is_dir():
+        if path and path.is_file():
+            shutil.copy2(path, prior / name)
+    if trials and trials.is_dir():
         traj = prior / "trials"
-        for i, trial_dir in enumerate(sorted(Path(trials).glob("*"))):
+        for i, trial_dir in enumerate(sorted(trials.glob("*"))):
             if i >= _MAX_TRIAL_DIRS:
                 break
             if not trial_dir.is_dir():
@@ -208,17 +226,17 @@ def _write_diff(a: Path, b: Path, out: Path) -> None:
     print(f"[propose] wrote {out} ({len(filtered.splitlines())} lines of real changes)")
 
 
-def _emit_diffs(dst: Path) -> None:
+def _emit_diffs(dst: Path, paths: dict[str, Path]) -> None:
     """Two provenance patches per iteration: cumulative (base->candidate) + incremental
     (parent->candidate). Written OUTSIDE dst so they don't pollute the installable package or
-    each other's diff. Loc: MHO_DIFF_DIR, else a `<candidate>_diffs` sibling."""
-    diff_dir = Path(os.environ.get("MHO_DIFF_DIR") or (dst.parent / f"{dst.name}_diffs"))
+    each other's diff. Loc: <candidate>/../diff (sibling of the harness dir)."""
+    diff_dir = paths["diff_dir"]
     diff_dir.mkdir(parents=True, exist_ok=True)
     _write_diff(_original_base(), dst, diff_dir / "diff_from_base.patch")
-    _write_diff(_parent_scaffold(), dst, diff_dir / "diff_from_parent.patch")
+    _write_diff(paths["parent"], dst, diff_dir / "diff_from_parent.patch")
 
 
-def _build_instructions(dst: Path) -> str:
+def _build_instructions(dst: Path, paths: dict[str, Path]) -> str:
     # The full scaffold-evolution workflow lives in the registered `propose-harness` skill
     # (propose-harness/SKILL.md), exposed to the agent via AgentContext. This message carries
     # the per-run context (workspace, constraints, prior results) + a pointer to follow the skill.
@@ -238,7 +256,7 @@ def _build_instructions(dst: Path) -> str:
         f"package from scratch. The snapshot must remain the FULL working scaffold PLUS your change.\n"
         f"- Keep it an installable package that still imports. Do not run destructive shell commands "
         f"(rm -rf, git clean, moving the whole tree, etc.).\n\n"
-        f"## Prior results\n{_digest_prior_results()}\n\n"
+        f"## Prior results\n{_digest_prior_results(paths)}\n\n"
         f"The same prior results are ALSO mounted as files under `eval_prior/` in your "
         f"workspace -- open them directly with the file editor for full detail: "
         f"`eval_prior/frontier.json`, `eval_prior/evolution_summary.jsonl`, "
@@ -322,16 +340,17 @@ def main() -> int:
     if not cand:
         sys.exit("[propose] MHO_CANDIDATE_DIR not set")
     dst = Path(cand)
-    parent = _parent_scaffold()
+    paths = _derive_paths(dst)       # everything else derives from MHO_RUN_DIR + the candidate dir
+    parent = paths["parent"]
 
     _materialize_from(parent, dst)   # accumulate: build on the frontier-best
-    _stage_prior_results(dst)        # mount prior eval results (scores + trajectories) into eval_prior/
-    _run_openhands(dst, _build_instructions(dst))
+    _stage_prior_results(dst, paths)  # mount prior eval results (scores + trajectories) into eval_prior/
+    _run_openhands(dst, _build_instructions(dst, paths))
 
     ok, reason = _validate_candidate(dst, parent)
-    _emit_diffs(dst)  # always emit diffs -- useful to inspect even a rejected candidate
+    _emit_diffs(dst, paths)  # always emit diffs -- useful to inspect even a rejected candidate
     if not ok:
-        print(f"[propose] ERROR: candidate invalid -- {reason} (diffs in MHO_DIFF_DIR)", file=sys.stderr)
+        print(f"[propose] ERROR: candidate invalid -- {reason} (diffs in the candidate diff dir)", file=sys.stderr)
         return 1
     # No-op guard: a candidate byte-identical to the parent (agent changed nothing) is useless --
     # the loop would eval a duplicate. Fail so the loop notes it rather than wasting an eval.

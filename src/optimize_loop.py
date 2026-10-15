@@ -290,24 +290,23 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
                         account=_ACCOUNT, out_dir=logs, **_phase_res("TRAIN"))
 
 
-def submit_propose(sched: Scheduler, parent_scaffold: str | None, *, candidate_dir: Path,
-                   frontier_path: Path, summary_path: Path, diff_dir: Path, trials_dir: str | None,
+def submit_propose(sched: Scheduler, *, candidate_dir: Path, run_root: Path,
                    logs: Path, tag: str) -> str | None:
-    """Submit the harness-mutation job (MHO_PROPOSE_JOB). It builds the new candidate ON TOP of
-    `parent_scaffold` (the frontier-best, so changes accumulate; None -> the base) and writes it
-    to $MHO_CANDIDATE_DIR (a valid installable scaffold) + two provenance diffs. Returns None if
+    """Submit the harness-mutation job (MHO_PROPOSE_JOB). The proposer derives the parent
+    scaffold (frontier-best, so changes accumulate) itself from MHO_RUN_DIR/frontier, and writes
+    the new candidate to $MHO_CANDIDATE_DIR + two provenance diffs in its diff dir. None if
     unconfigured."""
     if not PROPOSE_JOB:
         print("  MHO_PROPOSE_JOB unset -> skipping harness proposal this iteration")
         return None
+    # The proposer derives everything but the destination from MHO_RUN_DIR + the candidate
+    # dir (see agent.py::_derive_paths): frontier, summary, diff dir, parent scaffold, and
+    # the train-sample trials. MHO_CANDIDATE_DIR stays explicit (the write target).
+    assert candidate_dir.parent.parent == run_root, (
+        "candidate dir must live under <run>/candidates/<tag>/harness")
     env = _phase_env({
         "MHO_CANDIDATE_DIR": str(candidate_dir),
-        "MHO_PARENT_SCAFFOLD": parent_scaffold or "",   # accumulate on the frontier-best
-        "MHO_DIFF_DIR": str(diff_dir),
-        "MHO_FRONTIER": str(frontier_path),
-        "MHO_SUMMARY": str(summary_path),
-        # the previous eval's trials, for the proposer to analyze (empty before any eval)
-        "MHO_TRIALS_DIR": trials_dir or "",
+        "MHO_RUN_DIR": str(run_root),
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
@@ -474,10 +473,8 @@ def optimize(args: argparse.Namespace) -> None:
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
         if action == "propose":
-            return submit_propose(sched, st["parent_scaffold"], candidate_dir=tag_dir(tag) / "harness",
-                                  frontier_path=frontier_path, summary_path=summary_path,
-                                  diff_dir=tag_dir(tag) / "diff", trials_dir=st["last_eval_dir"],
-                                  logs=tag_dir(tag) / "logs", tag=tag)
+            return submit_propose(sched, candidate_dir=tag_dir(tag) / "harness",
+                                  run_root=run_dir, logs=tag_dir(tag) / "logs", tag=tag)
         if action == "train":
             return submit_train(sched, args.trainer, model=model, harness=harness,
                                 out_dir=tag_dir(tag) / "train", logs=tag_dir(tag) / "logs", tag=tag)
