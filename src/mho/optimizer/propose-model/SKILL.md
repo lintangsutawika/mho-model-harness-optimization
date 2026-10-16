@@ -26,7 +26,7 @@ archive, form ONE hypothesis about what the model should learn, and write it as 
 spec into verifiable training data and trains the model; you only specify what to learn.
 
 ## CRITICAL CONSTRAINTS
-- You MUST produce at least one, ideally **1-3 focused** model specs this iteration. Do not
+- You MUST produce **exactly one** focused model spec this iteration (one capability, one hypothesis). Do not
   conclude "the model is already good enough" or stop early — always ship a proposal.
 - **Ability-first / hypothesis-first.** Identify a concrete model-side failure mode from the
   trajectories/metrics, then specify the capability that targets it. No speculative specs.
@@ -74,20 +74,20 @@ verifiable training tasks (select matching ones from the dataset or synthesize n
    capability) versus a harness artifact — you propose what the model should learn.
 2. **State a falsifiable hypothesis** — one sentence per capability on what behavior change
    will raise verified reward and why.
-3. **Write the spec(s)** — one `.md` file per capability under `model_specs/` in your
+3. **Write the spec** — exactly one `.md` file under `model_specs/` in your
    workspace. Each file: `name`, `hypothesis`, `evidence` (which trajectories support it),
    `spec` (the precise capability σ the model must learn, written so a realization map can
    turn it into training tasks), and `counterexample` (an input the current model gets wrong).
-4. **Validate** — run the spec validator on each file you write and fix anything it rejects:
+4. **Validate** — run the spec validator on the file you wrote and fix anything it rejects:
    `python -m mho.optimizer.model_spec validate model_specs/<name>.md`
    (or `... check model_specs/` for the whole dir). This enforces the schema: YAML frontmatter
    with `name`/`hypothesis`/`evidence`/`spec`/`counterexample`/`realization`, `name` matching the
-   file stem, and a non-empty capability spec. Also confirm each spec is standalone,
-   one-capability-per-file, non-overlapping, and general-purpose (no task/dataset references).
-5. **Record** — keep each spec self-contained; the set of spec files IS the proposal.
+   file stem, and a non-empty capability spec. Also confirm it is standalone and
+   general-purpose (no task/dataset references).
+5. **Record** — keep the spec self-contained; the single spec file IS the proposal.
 
 ## OUTPUT CONTRACT
-When you finish, the `model_specs/` directory **is** the proposal: one `.md` file per
-capability, each a standalone capability specification (name / hypothesis / evidence / spec /
-counterexample). There is no separate submission file — the realization step reads
-`model_specs/` directly to build the model's next training data.
+When you finish, the single spec file in `model_specs/` **is** the proposal: one standalone
+capability specification (name / hypothesis / evidence / spec / counterexample / realization).
+There is no separate submission file — the realization step reads `model_specs/` directly to
+build the model's next training data.

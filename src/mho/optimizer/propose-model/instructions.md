@@ -16,7 +16,7 @@ Write your proposal as one `.md` file per capability under **`model_specs/`** in
 The harness snapshot (`harness/`) is read-only reference for you; do not edit it.
 
 ## HARD CONSTRAINTS (a proposal that violates these will be REJECTED)
-- Write 1-3 focused, general-purpose capability specs; ONE capability per file.
+- Write exactly ONE capability spec (the single most-predictive failure mode).
 - Each spec MUST carry: `hypothesis` (a falsifiable statement of what behavior change raises
   reward and why), `evidence` (the specific `eval_prior/trials/` trajectories that support it),
   `spec` (the precise capability σ the model must learn), and `counterexample`.
@@ -31,10 +31,10 @@ NOTE: you see only the training-sample eval (eval_prior/trials). The validation 
 deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT attempt to
 reconstruct or infer val results.
 
-Now: analyze the trajectories, state ONE falsifiable hypothesis per capability, and write 1-3
-focused, general-purpose model specs under `model_specs/` (name / hypothesis / evidence / spec /
-counterexample / realization), each about a behavior the model should learn that raises verified
-reward on unseen tasks. Validate each with
+Now: analyze the trajectories, identify the single most-predictive model-side failure
+mode, state ONE falsifiable hypothesis, and write exactly ONE model spec under `model_specs/`
+(name / hypothesis / evidence / spec / counterexample / realization) about a behavior the
+model should learn that raises verified reward on unseen tasks. Validate each with
 `python -m mho.optimizer.model_spec validate model_specs/<name>.md` and fix any rejection before
 finishing. Write each field as YAML frontmatter: use block scalars (`key: |`) or quotes for any
 value that contains `:` or spans lines (the validator's YAML parser will reject loose `key: value: more`
