@@ -36,6 +36,10 @@ spec into verifiable training data and trains the model; you only specify what t
   `model_specs/`; do not touch the harness snapshot (`harness/`).
 
 ### Anti-overfitting (critical)
+- The current eval task is **math** (DAPO-Math-17k), but the model must stay
+  **general-purpose**. **Do NOT hardcode math knowledge or task-specific hints** — no
+  answer-format special-casing beyond what's already in the harness, no "if the problem
+  mentions…" behaviors, no dataset-specific heuristics.
 - **Never reference task names / families, datasets, or specific prompts** in the specs.
 - General guidance is OK: capabilities that help the model solve *many* unfamiliar tasks
   (know when to stop, recover from an error, structure a long multi-step solution, keep
@@ -44,7 +48,7 @@ spec into verifiable training data and trains the model; you only specify what t
 - If in doubt, make it more general.
 
 ## CONTEXT
-You are proposing what the **language model** should learn, given the current harness.
+You are proposing what the **model** (Qwen3.5-4B) should learn, given the current harness.
 The model is RL-trained on verified rollouts produced by (model, harness); the harness is
 improved in the same loop. Your job is to specify the *capabilities* (behaviors) the model
 should gain so the system gets more reward on tasks the harness's failures expose.
@@ -74,8 +78,12 @@ verifiable training tasks (select matching ones from the dataset or synthesize n
    workspace. Each file: `name`, `hypothesis`, `evidence` (which trajectories support it),
    `spec` (the precise capability σ the model must learn, written so a realization map can
    turn it into training tasks), and `counterexample` (an input the current model gets wrong).
-4. **Validate** — confirm each spec is standalone, one-capability-per-file, non-overlapping,
-   and general-purpose (no task/dataset references). Fix anything that isn't.
+4. **Validate** — run the spec validator on each file you write and fix anything it rejects:
+   `python -m mho.optimizer.model_spec validate model_specs/<name>.md`
+   (or `... check model_specs/` for the whole dir). This enforces the schema: YAML frontmatter
+   with `name`/`hypothesis`/`evidence`/`spec`/`counterexample`/`realization`, `name` matching the
+   file stem, and a non-empty capability spec. Also confirm each spec is standalone,
+   one-capability-per-file, non-overlapping, and general-purpose (no task/dataset references).
 5. **Record** — keep each spec self-contained; the set of spec files IS the proposal.
 
 ## OUTPUT CONTRACT

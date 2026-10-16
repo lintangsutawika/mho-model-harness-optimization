@@ -61,6 +61,12 @@ def _instructions_md(kind: str) -> Path:
     return _skill_dir(kind) / "instructions.md"
 
 
+def _original_base() -> Path:
+    """The immutable original scaffold, for the cumulative diff_from_base. Defaults to
+    scaffold.DEFAULT_BASE; override with MICRO_SCAFFOLD_BASE."""
+    return Path(os.environ.get("MICRO_SCAFFOLD_BASE") or scaffold.DEFAULT_BASE)
+
+
 def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     """Derive every proposer input path from the run layout + the target candidate dir,
     instead of ~6 individual env vars. Requires MHO_RUN_DIR (the experiment root); the
@@ -278,11 +284,21 @@ def main() -> int:
     _run_openhands(cand_unit, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
 
     if kind == "model":
+        from mho.optimizer import model_spec
         specs = sorted(p for p in spec_dst.rglob("*.md") if "eval_prior" not in str(p)) if spec_dst.is_dir() else []
         if not specs:
             print("[propose] ERROR: model proposer wrote no specs under " + str(spec_dst), file=sys.stderr)
             return 3
-        print(f"[propose] model proposal: {len(specs)} model spec(s) -> {spec_dst}")
+        bad: list[str] = []
+        for f in specs:
+            try:
+                model_spec.validate_file(f)
+            except (ValueError, OSError) as e:
+                bad.append(str(e))
+        if bad:
+            print("[propose] ERROR: invalid model spec(s):\n  " + "\n  ".join(bad), file=sys.stderr)
+            return 3
+        print(f"[propose] model proposal: {len(specs)} valid model spec(s) -> {spec_dst}")
         return 0
 
     # kind == harness

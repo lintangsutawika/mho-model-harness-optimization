@@ -33,5 +33,9 @@ reconstruct or infer val results.
 
 Now: analyze the trajectories, state ONE falsifiable hypothesis per capability, and write 1-3
 focused, general-purpose model specs under `model_specs/` (name / hypothesis / evidence / spec /
-counterexample), each about a behavior the model should learn that raises verified reward on
-unseen tasks.
+counterexample / realization), each about a behavior the model should learn that raises verified
+reward on unseen tasks. Validate each with
+`python -m mho.optimizer.model_spec validate model_specs/<name>.md` and fix any rejection before
+finishing. Write each field as YAML frontmatter: use block scalars (`key: |`) or quotes for any
+value that contains `:` or spans lines (the validator's YAML parser will reject loose `key: value: more`
+lines).
