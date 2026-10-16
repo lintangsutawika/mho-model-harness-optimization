@@ -1,23 +1,29 @@
-"""Propose job: evolve the micro-swe-agent scaffold with an OpenHands agent.
+"""Propose job: evolve the harness OR propose what the model should learn, via an OpenHands agent.
 
-Run as its own batch job by ``optimize_loop`` (via ``MHO_PROPOSE_JOB``). Contract:
+Run as its own batch job by ``optimize_loop`` (via ``MHO_PROPOSE_JOB``). Each proposal emits
+EXACTLY ONE kind of output, selected by MHO_PROPOSE_KIND:
+  harness  -> edits candidates/<tag>/harness (installable scaffold) + emits two diffs.
+  model    -> writes candidates/<tag>/model_specs/ (what-the-model-should-learn specs, S_k).
+A joint model-harness run is orchestrated by the LOOP scheduling harness- and model-steps
+across iterations; each proposer still emits one output.
 
   in  (env):
     MHO_RUN_DIR        the experiment root (runs_output/optimize/<run>); EVERYTHING derives
-                       from it: the candidate destination <RUN>/candidates/<tag>/harness,
-                       frontier.json, evolution_summary.jsonl, the parent scaffold
-                       (frontier-best candidate's harness), the diff dir, and the train-sample
-                       eval trials to analyze (see _derive_paths).
-    MHO_TAG            this iteration's candidate tag (e.g. candidate_1_0_1); the loop picks
-                       it (encodes iteration/version/try). Only the loop knows it, so it is
-                       passed explicitly; the destination path itself derives from RUN + TAG.
+                       from it: the candidate dir <RUN>/candidates/<tag>/, frontier.json,
+                       evolution_summary.jsonl, the parent scaffold (frontier-best candidate's
+                       harness), the diff dir, and the train-sample eval trials (see _derive_paths).
+    MHO_TAG            this iteration's tag (e.g. candidate_1_0_1); the loop picks it
+                       (encodes iteration/version/try).
+    MHO_PROPOSE_KIND   "harness" (default) or "model".
     MICRO_SCAFFOLD_BASE  the original/immutable base scaffold (for diff_from_base); default
                        scaffold.DEFAULT_BASE when unset.
     OPTIMIZER_MODEL / OPTIMIZER_LLM_API_KEY / OPTIMIZER_LLM_BASE_URL   the proposer LLM
-  out:
-    a VALID installable micro-swe-agent snapshot at <RUN>/candidates/<tag>/harness (pyproject.toml present),
-    plus two git-format patches in <candidate>/../diff: diff_from_base.patch (cumulative, base->cand)
-    and diff_from_parent.patch (incremental, parent->cand). exit 0 on success; nonzero if invalid.
+  out (harness):
+    a VALID installable micro-swe-agent snapshot at <RUN>/candidates/<tag>/harness,
+    plus two git-format patches in <candidate>/../diff: diff_from_base.patch + diff_from_parent.patch.
+  out (model):
+    one or more model spec files under <RUN>/candidates/<tag>/model_specs/ (e.g. spec_1.md).
+  exit 0 on success; nonzero if invalid/missing output.
 
 Flow: materialize the PARENT scaffold (frontier-best, so changes ACCUMULATE) into
 In the derived candidate dir, drive an OpenHands Conversation (FileEditor + Terminal, workspace = the
@@ -37,9 +43,22 @@ from pathlib import Path
 
 from harness import scaffold  # DEFAULT_BASE + _IGNORE (single source of truth for the copy)
 
-SKILL_DIR = Path(__file__).parent / "propose-harness"   # AgentSkills dir: must contain SKILL.md
-INSTRUCTIONS_MD = SKILL_DIR / "instructions.md"       # proposer message, read verbatim (prior results are mounted)
+_OPT_DIR = Path(__file__).parent
+# Each proposer emits EXACTLY ONE kind of output:
+#   harness   -> propose-harness/  : edits candidates/<tag>/harness (the installable scaffold)
+#   model     -> propose-model/    : writes candidates/<tag>/model_specs/ (what the model should learn)
+# A "model-harness" RUN is orchestrated by the LOOP scheduling harness-steps and model-steps
+# across iterations (each proposer still emitting one output), not by a combined proposer.
+PROPOSE_KINDS = ("harness", "model")
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
+
+
+def _skill_dir(kind: str) -> Path:
+    return _OPT_DIR / f"propose-{kind}"
+
+
+def _instructions_md(kind: str) -> Path:
+    return _skill_dir(kind) / "instructions.md"
 
 
 def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
@@ -164,14 +183,14 @@ def _emit_diffs(dst: Path, paths: dict[str, Path]) -> None:
     _write_diff(paths["parent"], dst, diff_dir / "diff_from_parent.patch")
 
 
-def _build_instructions() -> str:
-    """The full proposer message, read verbatim from propose-harness/instructions.md. Prior
-    results are MOUNTED under eval_prior/ in the workspace (see _stage_prior_results), so the
-    message only points the agent at them -- nothing is inlined here."""
-    return INSTRUCTIONS_MD.read_text() if INSTRUCTIONS_MD.exists() else ""
+def _build_instructions(instructions_md: Path) -> str:
+    """The full proposer message, read verbatim from the kind's instructions.md. Prior results
+    are MOUNTED under eval_prior/ in the workspace (see _stage_prior_results), so the message
+    only points the agent at them -- nothing is inlined here."""
+    return instructions_md.read_text() if instructions_md.exists() else ""
 
 
-def _run_openhands(workspace: Path, instructions: str) -> None:
+def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
     from openhands.sdk.skills.skill import Skill
@@ -186,7 +205,7 @@ def _run_openhands(workspace: Path, instructions: str) -> None:
     # Load the propose-harness skill (AgentSkills standard) so the SDK exposes it in
     # <available_skills> and auto-injects its content when triggered. `Skill.load` directly
     # on SKILL.md is used because load_skills_from_dir's dir discovery did not pick it up.
-    skill = Skill.load(SKILL_DIR / "SKILL.md")
+    skill = Skill.load(skill_dir / "SKILL.md")
     agent_context = AgentContext(
         skills=[skill],
         load_public_skills=False,
@@ -237,29 +256,46 @@ def _validate_candidate(dst: Path, parent: Path) -> tuple[bool, str]:
 def main() -> int:
     run = Path(os.environ.get("MHO_RUN_DIR") or "")
     tag = os.environ.get("MHO_TAG", "")
+    kind = os.environ.get("MHO_PROPOSE_KIND", "harness")
     if not run.is_dir() or not tag:
         sys.exit("[propose] MHO_RUN_DIR (experiment root) and MHO_TAG are required")
-    dst = run / "candidates" / tag / "harness"   # destination derived from the run layout
-    paths = _derive_paths(dst)
+    if kind not in PROPOSE_KINDS:
+        sys.exit(f"[propose] unknown MHO_PROPOSE_KIND {kind!r} (choose from {PROPOSE_KINDS})")
+
+    cand_unit = run / "candidates" / tag          # one dir per candidate: harness/ + model_specs/ + eval_prior/
+    harness_dst = cand_unit / "harness"           # installable scaffold (kind == harness)
+    spec_dst = cand_unit / "model_specs"          # what-the-model-should-learn specs (kind == model)
+    paths = _derive_paths(harness_dst)
     parent = paths["parent"]
 
-    _materialize_from(parent, dst)   # accumulate: build on the frontier-best
-    _stage_prior_results(dst, paths)  # mount prior eval results (scores + trajectories) into eval_prior/
-    _run_openhands(dst, _build_instructions())
+    # Workspace = the candidate unit dir. The archive (parent harness + train-sample eval +
+    # frontier/summary) is mounted under eval_prior/ for the agent to analyze. The agent then
+    # edits harness/ (harness) OR writes model_specs/ (model) -- exactly one output kind.
+    cand_unit.mkdir(parents=True, exist_ok=True)
+    if kind == "harness":
+        _materialize_from(parent, harness_dst)    # accumulate: build on the frontier-best
+    _stage_prior_results(cand_unit, paths)        # mount prior eval results -> eval_prior/
+    _run_openhands(cand_unit, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
 
-    ok, reason = _validate_candidate(dst, parent)
-    _emit_diffs(dst, paths)  # always emit diffs -- useful to inspect even a rejected candidate
+    if kind == "model":
+        specs = sorted(p for p in spec_dst.rglob("*.md") if "eval_prior" not in str(p)) if spec_dst.is_dir() else []
+        if not specs:
+            print("[propose] ERROR: model proposer wrote no specs under " + str(spec_dst), file=sys.stderr)
+            return 3
+        print(f"[propose] model proposal: {len(specs)} model spec(s) -> {spec_dst}")
+        return 0
+
+    # kind == harness
+    ok, reason = _validate_candidate(harness_dst, parent)
+    _emit_diffs(harness_dst, paths)   # always emit diffs -- useful to inspect even a rejected candidate
     if not ok:
         print(f"[propose] ERROR: candidate invalid -- {reason} (diffs in the candidate diff dir)", file=sys.stderr)
         return 1
-    # No-op guard: a candidate byte-identical to the parent (agent changed nothing) is useless --
-    # the loop would eval a duplicate. Fail so the loop notes it rather than wasting an eval.
-    if _diff_only_vcs(parent, dst):
-        print("[propose] ERROR: candidate is identical to the parent (agent made no code change)",
-              file=sys.stderr)
+    if _diff_only_vcs(parent, harness_dst):
+        print("[propose] ERROR: candidate is identical to the parent (agent made no code change)", file=sys.stderr)
         return 2
-    rationale = dst / "CANDIDATE.md"
-    print(f"[propose] candidate ready at {dst} ({reason})"
+    rationale = harness_dst / "CANDIDATE.md"
+    print(f"[propose] candidate ready at {harness_dst} ({reason})"
           + (f"; rationale: {rationale}" if rationale.exists() else "; no CANDIDATE.md written"))
     return 0
 
