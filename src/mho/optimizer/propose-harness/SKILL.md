@@ -38,10 +38,6 @@ hypothesis, and implement it by editing the scaffold in your workspace. The loop
   make the change that targets it. No speculative changes.
 
 ### Anti-overfitting (critical)
-- The current eval task is **math** (DAPO-Math-17k), but the harness must stay
-  **general-purpose**. **Do NOT hardcode math knowledge or task-specific hints** — no
-  answer-format special-casing beyond what's already there, no "if the problem mentions…"
-  branches, no dataset-specific heuristics.
 - **Never reference task names / families** in code, prompts, or comments.
 - General guidance is OK: changes that help an agent solve *many* unfamiliar tasks (better
   tool-use discipline, cleaner reasoning scaffolding, more robust command execution, smarter
