@@ -44,7 +44,7 @@ spec into verifiable training data and trains the model; you only specify what t
 - If in doubt, make it more general.
 
 ## CONTEXT
-You are proposing what the **model** (Qwen3.5-4B) should learn, given the current harness.
+You are proposing what the **language model** should learn, given the current harness.
 The model is RL-trained on verified rollouts produced by (model, harness); the harness is
 improved in the same loop. Your job is to specify the *capabilities* (behaviors) the model
 should gain so the system gets more reward on tasks the harness's failures expose.
