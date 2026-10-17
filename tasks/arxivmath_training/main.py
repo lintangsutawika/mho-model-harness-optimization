@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -86,6 +87,90 @@ def load_problem(dataset_path: Path | str, problem_id: int) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------- task generation
+def _dockerfile_to_def(dockerfile: Path) -> str:
+    """Minimal Dockerfile -> Singularity recipe: our task Dockerfile is usually just
+    FROM + WORKDIR, so we only carry RUN/COPY/ENV deps into a %post/%files/%environment
+    fragment. None when there are no such layers."""
+    if not dockerfile.exists():
+        return ""
+    posts, files, envs = [], [], []
+    current: list[str] | None = None
+    def flush():
+        nonlocal current
+        if current:
+            block = " ".join(ln.strip() for ln in current).strip()
+            if block:
+                posts.append(block)
+            current = None
+    lines = dockerfile.read_text().splitlines()
+    i = 0
+    # Light translation: only capture RUN (continuations) and COPY/ENV simply.
+    while i < len(lines):
+        raw = lines[i]; line = raw.strip(); i += 1
+        if not line or line.startswith("#") or line.upper().startswith("FROM ") or line.upper().startswith("WORKDIR"):
+            flush(); continue
+        if line.upper().startswith("RUN "):
+            flush(); current = [line[4:].strip()]
+            while lines and lines[i-1].rstrip().endswith("\\") and i < len(lines):
+                current.append(lines[i].strip()); i += 1
+            flush()
+        elif line.upper().startswith("ENV "):
+            envs.append(line[4:].strip())
+        elif line.upper().startswith("COPY "):
+            files.append(line[5:].strip())
+    parts = []
+    if posts: parts += ["%post"] + ["    " + p for p in posts]
+    if files: parts += ["%files"] + ["    " + f for f in files]
+    if envs:  parts += ["%environment"] + ["    export " + e for e in envs]
+    return "\n".join(parts)
+
+
+def prebuild_sif(dockerfile: Path, out_sif: Path, *,
+                 container_bin: str = "singularity", force: bool = False) -> Path:
+    """Build a Singularity sif from the task's environment/Dockerfile into out_sif.
+    Idempotent (skip if exists unless force). Mirrors msl's prebuild_sif."""
+    dockerfile, out_sif = Path(dockerfile).resolve(), Path(out_sif).resolve()
+    if out_sif.is_file() and not force:
+        print(f"[prebuild] {out_sif.name} exists; skipping (--prebuild-force to rebuild)")
+        return out_sif
+    out_sif.parent.mkdir(parents=True, exist_ok=True)
+    base_image = "python:3.11-slim"
+    try:
+        for raw in dockerfile.read_text().splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and line.upper().startswith("FROM "):
+                ref = line.split(None, 1)[1].strip()
+                base_image = ref.split()[0]
+                break
+    except OSError:
+        pass
+    fragment = _dockerfile_to_def(dockerfile)
+    def_path = out_sif.with_name(out_sif.name + ".def")
+    def_lines = ["Bootstrap: docker", f"From: {base_image}", ""]
+    if fragment:
+        def_lines.append(fragment)
+    def_path.write_text("\n".join(def_lines))
+    subprocess.run([container_bin, "build", "--fakeroot", str(out_sif), str(def_path)],
+                   check=True, cwd=str(dockerfile.parent))
+    print(f"[prebuild] built {out_sif}")
+    return out_sif
+
+
+def _install_sif(gen_dir: Path, sif: Path) -> Path:
+    """Place the shared prebuilt sif as <gen_dir>/image.sif and relink every task's
+    task.toml docker_image to it. Runs AFTER generation so <gen_dir> is fresh."""
+    dest = gen_dir / "image.sif"
+    shutil.copy2(sif, dest)
+    for task in gen_dir.iterdir():
+        toml = task / "task.toml"
+        if toml.is_file():
+            txt = toml.read_text()
+            txt = txt.replace(f'docker_image = "{sif}"', f'docker_image = "{dest}"')
+            toml.write_text(txt)
+    print(f"[prebuild-sif] installed {dest}")
+    return dest
+
+
 def _fill(path: Path, **kw: str) -> None:
     text = path.read_text()
     for key, value in kw.items():
@@ -226,9 +311,29 @@ def main() -> None:
                              "python:3.11-slim) or a prebuilt .sif path. A .sif already carries the "
                              "toolchain (no runtime install/network needed), so the task's "
                              "environment/Dockerfile is neutralized (msl leetcode --images pattern).")
+    parser.add_argument("--prebuild-sif", action="store_true",
+                        help="Build a prebuilt Singularity sif (from the task's environment/Dockerfile) "
+                             "into the output dir and use it as this dataset's docker_image -- no "
+                             "runtime install/network needed in the sandbox. Idempotent; "
+                             "--prebuild-force rebuilds. Mirrors msl leetcode --prebuild-sif.")
+    parser.add_argument("--prebuild-force", action="store_true",
+                        help="With --prebuild-sif, rebuild the sif even if it already exists.")
+    parser.add_argument("--container-bin", default="singularity",
+                        help="Container binary for --prebuild-sif (default: singularity).")
     args = parser.parse_args()
 
     output_dir = args.output_dir or Path("tasks")
+    docker_image = args.image
+    built_sif = None
+    if args.prebuild_sif:
+        # Build the shared sif into a staging sibling (<out>.sif) so output_dir stays fresh for
+        # generation; after generation, _install_sif places it as <out>/image.sif and relinks.
+        built_sif = prebuild_sif(
+            PKG / "task-template" / "environment" / "Dockerfile",
+            output_dir.with_name(output_dir.name + ".sif"),
+            container_bin=args.container_bin, force=args.prebuild_force,
+        )
+        docker_image = str(built_sif)
     if not args.dataset.is_file():
         build_dataset(args.dataset)
     problems = load_problems(args.dataset, build=False)
@@ -269,7 +374,9 @@ def main() -> None:
         for out_, subset, label in ((train_out, train, "train"), (val_out, val, "val")):
             if out_.exists():
                 raise SystemExit(f"Output directory already exists: {out_}. Use a fresh --output-dir.")
-            _ex, _count = generate_all(subset, output=out_, docker_image=args.image)
+            _ex, _count = generate_all(subset, output=out_, docker_image=docker_image)
+            if built_sif:
+                _install_sif(out_, built_sif)          # do NOT unlink here -- val-split still needs it
             print(f"[split] generated {_count} {label} tasks in {out_}; excluded {len(_ex)}")
         (output_dir.parent / f"{output_dir.name}_split_manifest.json").write_text(
             json.dumps(
@@ -292,7 +399,10 @@ def main() -> None:
         return
     if output_dir.exists():
         raise SystemExit(f"Output directory already exists: {output_dir}. Use a fresh --output-dir.")
-    exclusions, count = generate_all(problems, output=output_dir, docker_image=args.image)
+    exclusions, count = generate_all(problems, output=output_dir, docker_image=docker_image)
+    if built_sif:
+        _install_sif(output_dir, built_sif)
+        built_sif.unlink(missing_ok=True)              # staging sif was copied in as image.sif
     if args.sample is not None:
         (output_dir / "selection_manifest.json").write_text(
             json.dumps(
