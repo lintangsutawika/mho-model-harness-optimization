@@ -280,30 +280,36 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
 
 
 def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: str | None,
-                 out_dir: Path, logs: Path, tag: str) -> str:
+                 out_dir: Path, logs: Path, tag: str,
+                 sigma_reward: str | None = None, train_data: str | None = None) -> str:
     extra = {"MHO_TRAINER": trainer, "MHO_OUT": str(out_dir)}
     if model:
         extra["MHO_MODEL"] = model
     if harness:
         extra["MHO_HARNESS"] = harness
+    if sigma_reward:
+        # The training script realizes this sigma-reward over the train cohort (injects it into
+        # the staged train tasks just-in-time) so the model trains on sigma-shaped rewards.
+        extra["MHO_SIGMA_REWARD"] = sigma_reward
+    if train_data:
+        extra["MHO_TRAIN_DATA"] = train_data
     return sched.submit(TRAIN_SCRIPT, _phase_env(extra, None), name=f"mho-train-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("TRAIN"))
 
 
-def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str) -> str | None:
-    """Submit the harness-mutation job (MHO_PROPOSE_JOB). The proposer derives the parent
-    scaffold (frontier-best) + candidate dest from MHO_RUN_DIR/MHO_TAG, and writes the new
-    candidate + two provenance diffs. None if unconfigured."""
+def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
+                   kind: str = "harness") -> str | None:
+    """Submit the HARNNES-mutation or MODEL-proposal job (MHO_PROPOSE_JOB). The proposer derives
+    the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
+    writes either a harness edit (candidates/<tag>/harness) or a model sigma-reward config
+    (candidates/<tag>/model/sigma_rewards/<sigma>.json). None if unconfigured."""
     if not PROPOSE_JOB:
-        print("  MHO_PROPOSE_JOB unset -> skipping harness proposal this iteration")
+        print("  MHO_PROPOSE_JOB unset -> skipping proposal this iteration")
         return None
-    # The proposer derives EVERYTHING from MHO_RUN_DIR + MHO_TAG (see agent.py::_derive_paths):
-    # the candidate dest <RUN>/candidates/<tag>/harness, frontier, summary, diff dir, parent
-    # scaffold, and the train-sample trials. Only the loop knows the tag (iteration/version/try),
-    # so it is passed explicitly.
     env = _phase_env({
         "MHO_RUN_DIR": str(run_root),
         "MHO_TAG": tag,
+        "MHO_PROPOSE_KIND": kind,
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
@@ -420,6 +426,12 @@ def optimize(args: argparse.Namespace) -> None:
 
     do_train = "model" in args.mode
     do_propose = "harness" in args.mode
+    # model-harness batching: a harness phase runs M_harness harness proposals, then a model
+    # phase runs M_model model proposals (sigma -> realize+train), then cycles. N=1 (sequential)
+    # for now; M_harness typically >> M_model.
+    do_model_harness = args.mode == "model-harness"
+    M_harness = max(1, args.harness_proposals)
+    M_model = max(1, args.model_proposals)
     sched = Scheduler()
 
     st = None if args.fresh else _load_state(state_path)
@@ -432,7 +444,11 @@ def optimize(args: argparse.Namespace) -> None:
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
               "version": 0,                # # of ACCEPTED (improving) candidates so far
-              "try": 1}                    # attempts at the current version; resets on acceptance
+              "try": 1,                    # attempts at the current version; resets on acceptance
+              # model-harness batching: which kind is being proposed this phase + index within it.
+              # e.g. harness phase (M_harness proposals), then model phase (M_model), cycling.
+              "propose_kind": "harness" if "harness" in args.mode else "model",
+              "phase_proposed": 0}         # proposals emitted so far in the current phase
         _save_state(state_path, st)
         print(f"{datetime.now():%H:%M:%S} MHO optimize  run={run_id}  mode={args.mode}  "
               f"trainer={args.trainer}  scheduler={sched.kind}  iters={args.iterations}")
@@ -463,9 +479,20 @@ def optimize(args: argparse.Namespace) -> None:
         return run_dir / "candidates" / tag
 
     def advance(skip_rest: bool = False) -> None:
-        """Move to the next stage, or (past the last, or on skip_rest) the next iteration."""
+        """Move to the next stage, or (past the last, or on skip_rest) the next iteration.
+        In model-harness batching, a completed proposal cycle bumps phase_proposed; when it
+        reaches the phase's M it flips the phase kind (harness <-> model) and resets the counter,
+        so the loop alternately emits M_harness harness proposals then M_model model proposals.
+        """
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
             st["iteration"] += 1
+            if do_model_harness:
+                st["phase_proposed"] += 1
+                M_cur = M_harness if st["propose_kind"] == "harness" else M_model
+                if st["phase_proposed"] >= M_cur:
+                    st["propose_kind"] = "model" if st["propose_kind"] == "harness" else "harness"
+                    st["phase_proposed"] = 0
+                    print(f"  [batch] phase switch -> {st['propose_kind']} proposals")
             st["actions"] = actions_for(st["iteration"], do_propose, do_train, dual=args.val_data)
             st["action_index"] = 0
         else:
@@ -481,10 +508,23 @@ def optimize(args: argparse.Namespace) -> None:
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
         if action == "propose":
-            return submit_propose(sched, run_root=run_dir, logs=tag_dir(tag) / "logs", tag=tag)
+            return submit_propose(sched, run_root=run_dir, logs=tag_dir(tag) / "logs", tag=tag,
+                                  kind=st["propose_kind"])
         if action == "train":
+            # In model-harness batching, train only runs during the MODEL phase (realize the
+            # sigma-reward over the train cohort + train the model). Harness phase skips it.
+            if do_model_harness and st["propose_kind"] != "model":
+                print(f"  [batch] harness phase ({st['phase_proposed']}/{M_harness}) -> skip train")
+                advance()
+                return None
+            # Model-phase train: realize the candidate's sigma-reward (model/sigma_rewards/*.json)
+            # over the train cohort and train on it. Harness phase has no sigma config.
+            sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
+            sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
             return submit_train(sched, args.trainer, model=model, harness=harness,
-                                out_dir=tag_dir(tag) / "train", logs=tag_dir(tag) / "logs", tag=tag)
+                                out_dir=tag_dir(tag) / "train", logs=tag_dir(tag) / "logs", tag=tag,
+                                sigma_reward=str(sigma_cfg) if sigma_cfg else None,
+                                train_data=args.train_data)
         # Trials destination per stage:
         #   eval_train_sample -> candidates/<tag>/eval/   (the ONE optimizer-visible eval)
         #   eval_val / eval   -> evaluation/<tag>/         (val accept/reject gate, hidden)
@@ -516,14 +556,21 @@ def optimize(args: argparse.Namespace) -> None:
         """Handle the finished stage's result and advance the cursor."""
         action, tag, it = st["actions"][st["action_index"]], cur_tag(), st["iteration"]
         if action == "propose":
-            cand_dir = tag_dir(tag) / "harness"
-            if rc == 0 and (cand_dir / "pyproject.toml").exists():
-                st["scaffold_dir"] = str(cand_dir)
+            kind_now = st["propose_kind"]
+            if kind_now == "model":
+                # model phase: the proposal is a sigma-reward config under model/sigma_rewards/.
+                sr = tag_dir(tag) / "model" / "sigma_rewards"
+                ok = rc == 0 and sr.is_dir() and any(sr.glob("*.json"))
+            else:
+                cand_dir = tag_dir(tag) / "harness"
+                ok = rc == 0 and (cand_dir / "pyproject.toml").exists()
+            if ok:
+                st["scaffold_dir"] = str(tag_dir(tag) / "harness") if kind_now != "model" else st["scaffold_dir"]
                 advance()
             else:
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "propose",
-                                              "status": "no_candidate", "rc": rc})
-                print(f"  propose failed (rc={rc}); skipping to next iteration")
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": f"{kind_now}_propose",
+                                              "status": "no_proposal", "rc": rc})
+                print(f"  {kind_now} propose failed (rc={rc}); skipping to next iteration")
                 advance(skip_rest=True)
         elif action == "train":
             if rc == 0:
@@ -649,6 +696,10 @@ def main(argv: list[str] | None = None) -> None:
                         "from the FULL train task dir (--train-data) for the proposer's improvement signal. "
                         "Keeps a 1000s-problem train set from being eval'd in full. Env: MHO_PROPOSE_SAMPLE.")
     p.add_argument("--iterations", type=int, default=5)
+    p.add_argument("--harness-proposals", type=int, default=int(os.environ.get("MHO_HARNESS_PROPOSALS", 10)),
+                   help="model-harness: # harness proposals in a harness phase before switching to model (M_harness)")
+    p.add_argument("--model-proposals", type=int, default=int(os.environ.get("MHO_MODEL_PROPOSALS", 2)),
+                   help="model-harness: # model proposals in a model phase before switching to harness")
     p.add_argument("--trials", type=int, default=int(os.environ.get("EVAL_N_ATTEMPTS", 5)),
                    help="attempts per problem (harbor --n-attempts): each eval task is sampled "
                         "this many times and pass@1 is the mean solve rate. NOT concurrency. "
