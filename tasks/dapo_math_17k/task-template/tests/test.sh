@@ -1,5 +1,22 @@
 #!/bin/bash
 set -Eeuo pipefail
+echo "=== STARTING TEST EXECUTION ==="
+mkdir -p /logs/verifier
+
+# Sigma-aware reward: when a realization.json (sigma config) is injected next to the task,
+# delegate the reward to the shared generic reward_rule.py; else fall back to the original
+# verifier below. Apply this to any task to make it sigma-aware without changing its problem.
+REALIZATION_MANIFEST="${REALIZATION_MANIFEST:-/tests/../realization.json}"
+OUTPUT_ARTIFACT="${OUTPUT_ARTIFACT:-/workspace/output.txt}"
+TRAJ_ARTIFACT="${TRAJ_ARTIFACT:-/workspace/trajectory.json}"
+
+if [ -f "$REALIZATION_MANIFEST" ] && [ -f "/tests/reward_rule.py" ]; then
+    echo "=== sigma reward rule active (realization.json present) ==="
+    exec python3 /tests/reward_rule.py "$REALIZATION_MANIFEST" "$OUTPUT_ARTIFACT" "$TRAJ_ARTIFACT"
+fi
+
+#!/bin/bash
+set -Eeuo pipefail
 echo "=== STARTING DAPO MATH TEST EXECUTION ==="
 mkdir -p /logs/verifier
 # Self-contained answer-string grading (final Answer: $A, normalized compare):

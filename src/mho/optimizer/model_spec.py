@@ -39,6 +39,10 @@ class ModelSpec(BaseModel):
     spec: str
     counterexample: str
     realization: str = Field(default="synthesize")
+    # Explicit, objectively-checkable conditions the reward verifier can assert. Each is a
+    # boolean expression over `output` (the model's final answer) and `traj` (trajectory text).
+    # f (mho.data.reward_synthesis) compiles these into verifier assertions; reward = fraction met.
+    checks: list[str] = Field(default_factory=list)
 
 
 def parse_spec(path: Path) -> tuple[ModelSpec, str]:
