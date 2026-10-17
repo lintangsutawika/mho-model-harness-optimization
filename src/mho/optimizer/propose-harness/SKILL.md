@@ -1,3 +1,20 @@
+---
+name: propose-harness
+description: >
+  One iteration of agent-scaffold evolution for the MHO project. Use when asked to
+  propose/evolve/improve the micro-swe-agent scaffold: analyze prior eval results, form ONE
+  falsifiable hypothesis, and make a single minimal additive change to the harness snapshot.
+license: MIT
+compatibility: Python / OpenHands SDK
+metadata:
+  author: mho
+  version: "1.0"
+triggers:
+  - propose harness
+  - evolve scaffold
+  - improve the agent
+  - optimize harness
+---
 # Meta-Harness — scaffold evolution (one iteration)
 
 Run **ONE** iteration of agent-scaffold evolution. Adapted from stanford-iris-lab/meta-harness
@@ -21,10 +38,6 @@ hypothesis, and implement it by editing the scaffold in your workspace. The loop
   make the change that targets it. No speculative changes.
 
 ### Anti-overfitting (critical)
-- The current eval task is **math** (DAPO-Math-17k), but the harness must stay
-  **general-purpose**. **Do NOT hardcode math knowledge or task-specific hints** — no
-  answer-format special-casing beyond what's already there, no "if the problem mentions…"
-  branches, no dataset-specific heuristics.
 - **Never reference task names / families** in code, prompts, or comments.
 - General guidance is OK: changes that help an agent solve *many* unfamiliar tasks (better
   tool-use discipline, cleaner reasoning scaffolding, more robust command execution, smarter

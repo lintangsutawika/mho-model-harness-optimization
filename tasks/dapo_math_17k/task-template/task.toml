@@ -2,7 +2,7 @@ schema_version = "1.4"
 [task]
 name = "{name}"
 [environment]
-docker_image = "python:3.11-slim"
+docker_image = "{docker_image}"
 network_mode = "public"
 [agent]
 override_timeout_sec = 1800.0

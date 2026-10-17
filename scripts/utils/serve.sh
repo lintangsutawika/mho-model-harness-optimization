@@ -33,6 +33,10 @@ REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0
 cd "$REPO_ROOT"
 MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
 PORT="${PORT:-8000}"
+# Name vLLM registers the served model under. Must match what the agent sends to the litellm
+# proxy (eval.sh sets MODEL="litellm_proxy/<SERVED_NAME>" and the agent resolves that to the
+# served name). Default = basename of MODEL, e.g. Qwen/Qwen3.5-4B -> Qwen3.5-4B.
+SERVED_NAME="${SERVED_NAME:-$(basename "${MODEL}")}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-1}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.85}"
 APPTAINER_BIN="${APPTAINER_BIN:-$(command -v apptainer || command -v singularity || echo singularity)}"
@@ -88,6 +92,7 @@ vllm_argv=(
         --data-parallel-size "${DATA_PARALLEL}"
         --max-model-len "${MAX_MODEL_LEN}"
         --gpu-memory-utilization "${GPU_MEM_UTIL}"
+        --served-model-name "${SERVED_NAME}"
 )
 # shellcheck disable=SC2206   # VLLM_ARGS_EXTRA is deliberately word-split into flags.
 vllm_argv+=( ${VLLM_ARGS_EXTRA:-} )

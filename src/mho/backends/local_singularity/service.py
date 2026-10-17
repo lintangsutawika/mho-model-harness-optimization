@@ -1,28 +1,19 @@
 """Host-side sandbox service for the local_singularity backend.
 
-Runs as a SEPARATE process on the HPC node (outside the training SIF). Serves two
-calling conventions (see .client):
-
-  * POST /trial            -- whole-trial (SkyRL): runs the entire harbor Trial
-                              (agent + verifier + sandbox) on the host and returns a
-                              TrialResult. The agent reaches the trainer's vLLM endpoint
-                              via the localhost api_base in the config.
-
-  * POST   /sandbox        -- sandbox lifecycle (Miles / lossless): launches ONLY the
-    DELETE /sandbox/{id}      sandbox container on the host (reusing
-                              WritableSingularityEnvironment.start()/stop()) and returns
-                              its server_port + staging_dir. The agent + verifier run
-                              in the CALLER's process (inside the training SIF), reachable
-                              at localhost:{port} because singularity shares the host net
-                              namespace -- so the trainer records token-in/out natively.
+Runs as a SEPARATE process on the HPC node (outside the training SIF). Serves the
+sandbox-lifecycle convention (Miles): POST /sandbox launches ONLY the sandbox container
+on the host (using harbor-singularity-hpc's SingularityWritableEnvironment) and returns
+its server_port + staging_dir. The agent + verifier run in the CALLER's process (inside
+the training SIF), reachable at localhost:{port} because singularity shares the host net
+namespace -- so the trainer records token-in/out natively.
 
 Run (on the node):
     EXECUTOR_PORT=8900 HB_STAGING_ROOT=$BASE_DIR/hbstaging PYTHONPATH=$REPO/src \
         python -m mho.backends.local_singularity.service
 """
+
 from __future__ import annotations
 
-import json
 import logging
 import os
 import sys
@@ -55,10 +46,7 @@ except Exception as _e:  # pragma: no cover
           f"  __file__={__file__}\n  repo={_REPO_ROOT}\n  sys.path={sys.path}", flush=True)
 
 from harbor.models.task.config import EnvironmentConfig  # noqa: E402
-from harbor.models.trial.config import TrialConfig  # noqa: E402
 from harbor.models.trial.paths import TrialPaths  # noqa: E402
-from harbor.models.trial.result import TrialResult  # noqa: E402
-from harbor.trial.trial import Trial  # noqa: E402
 
 # Host-side sandbox engine: harbor-singularity-hpc's writable-rootfs Singularity
 # environment (drift-guarded against harbor c178c20, proven on this cluster by the
@@ -85,41 +73,9 @@ if _STAGING_ROOT:
 
 app = FastAPI(title="mho-local-singularity-service")
 
-_BACKEND_IMPORT_PATH = "harbor_singularity_hpc.environment:SingularityWritableEnvironment"
 
 # Live sandboxes provisioned via /sandbox, keyed by sandbox_id.
 _SANDBOXES: dict[str, _WritableEnv] = {}
-
-
-# --------------------------------------------------------------------------- #
-# Whole-trial path (SkyRL)
-# --------------------------------------------------------------------------- #
-async def _run_trial(config: dict) -> TrialResult:
-    # The service IS the sandbox host: pin the backend to our writable singularity
-    # environment regardless of what the training-side config said.
-    config = json.loads(json.dumps(config))  # defensively copy
-    env = config.setdefault("environment", {})
-    env["type"] = "singularity"
-    env["import_path"] = _BACKEND_IMPORT_PATH
-    env.pop("mounts", None)
-    config.setdefault("timeout_multiplier", 1.0)
-    trial_config = TrialConfig.model_validate(config)
-    trial = await Trial.create(trial_config)
-    return await trial.run()
-
-
-@app.post("/trial")
-async def post_trial(request: Request) -> JSONResponse:
-    try:
-        config = await request.json()
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
-    try:
-        result = await _run_trial(config)
-        return JSONResponse(json.loads(result.model_dump_json()))
-    except Exception as e:  # noqa: BLE001
-        log.exception("trial failed")
-        return JSONResponse({"error": str(e), "type": type(e).__name__}, status_code=500)
 
 
 # --------------------------------------------------------------------------- #

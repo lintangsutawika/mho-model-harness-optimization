@@ -5,7 +5,7 @@
 #
 # Miles runs Harbor trials IN-PROCESS in the rollout worker; the sandbox container is
 # provisioned on the host via the local_singularity backend (HARBOR_ENV_TYPE=singularity +
-# the remote_env registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
+# the backend registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
 # is recorded natively (--tito-model). HF->Megatron conversion is done by run.py prepare().
 # The Miles launcher is src/run_training.py, bind-mounted over the example run.py.
 #
@@ -35,20 +35,14 @@ MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data
 MATH_TRAIN_DIR="${MATH_TRAIN_DIR:-${MATH_DATA_DIR}/train}"
 MAX_TRAIN="${MAX_TRAIN:-500}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
-# Prepare training task dirs if absent (prepare.py writes both the harbor task dirs
-# AND the Miles rollout.jsonl). If the dirs already exist from a pre-jsonl prep, the
-# --emit-rollout-only backfill below (re)writes rollout.jsonl from them -- idempotent,
-# no dataset download, and single-sourced with prepare() so the two never drift.
-if [ ! -d "$MATH_TRAIN_DIR" ]; then
-  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
-fi
-if [ ! -f "${MATH_TRAIN_DIR}/rollout.jsonl" ]; then
-  uv run --no-project tasks/dapo_math_17k/prepare.py --emit-rollout-only --out "$MATH_TRAIN_DIR"
-fi
-MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test_${EVAL_BATCH_SIZE}}"
-if [ ! -d "$MATH_VAL_DIR" ]; then
-  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_VAL_DIR" --split train --max-tasks "$((MAX_TRAIN + EVAL_BATCH_SIZE))" --start "$MAX_TRAIN"
-fi
+# The train/val task dirs + their seed.jsonl are produced by tasks/<task>/main.py
+# (e.g. `uv run --with datasets python -m tasks.arxivmath_training --val-size 1000
+# --output-dir out/x` -> out/x-train-split + out/x-val-split). Each split dir carries a
+# seed.jsonl: one row per task dir {prompt, metadata.instance_id} that SEEDS Miles'
+# rollout dataset (the RL loop generates the rollouts from it). Point MHO_TRAIN_DATA /
+# MHO_VAL_DATA at those split dirs; require seed.jsonl (--prompt-data consumes it).
+[ -f "${MATH_TRAIN_DIR}/seed.jsonl" ] || {   echo "ERROR: no ${MATH_TRAIN_DIR}/seed.jsonl -- prepare the task first (tasks/<task>/main.py), then set MHO_TRAIN_DATA." >&2;   exit 2; }
+MATH_VAL_DIR="${MATH_VAL_DIR:-}"
 
 # Harbor task dir consumed by the connector (one task dir per instance_id).
 HARBOR_TASKS_DIR="${HARBOR_TASKS_DIR:-${MATH_TRAIN_DIR}}"
@@ -88,7 +82,7 @@ LOGGER="${LOGGER:-wandb}"
 
 # --- local_singularity executor auto-start (same pattern as SkyRL) ---------------
 # HARBOR_ENV_TYPE=singularity -> the connector builds EnvironmentType.SINGULARITY,
-# which (via the registry swap in remote_env.py) resolves to RemoteSingularityEnvironment,
+# which (via the registry swap in backend.py) resolves to RemoteSingularityEnvironment,
 # which POSTs /sandbox to this host service. It must be running before training.
 if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL:-}" ]; then
   EXECUTOR_PYTHON="${EXECUTOR_PYTHON:-/home/aci18914wh/executor_env/.venv/bin/python}"
@@ -165,7 +159,7 @@ singularity exec --nv \
       --hf-checkpoint "$HF_MODEL" \
       --ref-load "$SAVE_DIR/${MODEL_KEY}_torch_dist" \
       --save-dir "$SAVE_DIR" \
-      --prompt-data "${MATH_TRAIN_DIR}/rollout.jsonl" \
+      --prompt-data "${MATH_TRAIN_DIR}/seed.jsonl" \
       --harbor-tasks-dir "$HARBOR_TASKS_DIR" \
       --num-gpus-per-node "$NUM_GPUS" \
       --num-nodes "$NUM_NODES" \

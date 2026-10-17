@@ -1,7 +1,6 @@
 """Modal-style remote Singularity backend for harbor trials under Miles.
 
-Unlike the whole-trial external executor (see .service `/trial`), this backend keeps
-the harbor Trial -- agent (mini-swe-agent) and verifier -- running IN-PROCESS inside
+Keeps the harbor Trial -- agent (mini-swe-agent) and verifier -- running IN-PROCESS inside
 the training container, so the agent's model calls flow through the trainer's native
 generate path and token-in/out is recorded losslessly. Only the *sandbox container*
 is provisioned out-of-process, on a HOST manager, exactly mirroring how the Modal
@@ -26,7 +25,7 @@ training SIF. This subclass therefore overrides ONLY the provisioning half:
     are inherited UNCHANGED.
 
 Select per trial via
-``environment.import_path = mho.backends.local_singularity.remote_env:RemoteSingularityEnvironment``
+``environment.import_path = mho.backends.local_singularity.backend:RemoteSingularityEnvironment``
 with ``environment.type = singularity``.
 
 Staging: the manager creates its staging dir under a host path that is bind-mounted into
@@ -37,6 +36,7 @@ reads it at ``/staging``.
 from __future__ import annotations
 
 import logging
+import sys as _sys
 from pathlib import Path
 from typing import Any
 
@@ -44,9 +44,50 @@ import httpx
 
 from harbor.environments.singularity.singularity import SingularityEnvironment
 
-from . import client as _client
+# Sandbox-lifecycle HTTP helpers to the host service (folded from the former client.py).
+_EXECUTOR_URL = None
 
-log = logging.getLogger("mho.backends.local_singularity.remote_env")
+
+def _executor_url() -> str:
+    global _EXECUTOR_URL
+    if _EXECUTOR_URL is None:
+        import os as _os
+        _EXECUTOR_URL = _os.environ.get("EXECUTOR_URL", "http://127.0.0.1:8900").rstrip("/")
+    return _EXECUTOR_URL
+
+
+async def _provision_sandbox(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST /sandbox; return {sandbox_id, server_port, staging_dir, sif_path}."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+        r = await c.post(f"{_executor_url()}/sandbox", json=payload)
+        r.raise_for_status()
+        data = r.json()
+    if "error" in data:
+        raise RuntimeError(f"sandbox provision failed: {data.get('type')}: {data.get('error')}")
+    return data
+
+
+async def _stop_sandbox(sandbox_id: str, *, delete: bool = True) -> None:
+    """DELETE /sandbox/{id} to tear down a host-side sandbox."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+        r = await c.request("DELETE", f"{_executor_url()}/sandbox/{sandbox_id}",
+                            params={"delete": str(delete).lower()})
+        r.raise_for_status()
+
+log = logging.getLogger("mho.backends.local_singularity.backend")
+
+
+# The repo ROOT has its own `harness/` package that can shadow src/harness/ whenever the repo
+# root lands on the worker's sys.path (cwd, etc.). Force src/ to the FRONT and drop any
+# already-imported `harness` that resolved outside src, so src/harness (agent harness) wins.
+_SRC = str(Path(__file__).resolve().parents[3])  # .../src
+while _SRC in _sys.path:
+    _sys.path.remove(_SRC)
+_sys.path.insert(0, _SRC)
+for _m in [m for m in list(_sys.modules) if m == "harness" or m.startswith("harness.")]:
+    _f = getattr(_sys.modules.get(_m), "__file__", "") or ""
+    if not _f.startswith(_SRC):
+        del _sys.modules[_m]
 
 
 class RemoteSingularityEnvironment(SingularityEnvironment):
@@ -73,11 +114,8 @@ class RemoteSingularityEnvironment(SingularityEnvironment):
             "mounts": [dict(m) for m in self._mounts],
             "persistent_env": dict(self._persistent_env),
             "task_env_config": self.task_env_config.model_dump(mode="json"),
+            # Sandbox operating knobs only (resource overrides are null/no-op and omitted).
             "env_kwargs": {
-                "override_cpus": self._override_cpus,
-                "override_memory_mb": self._override_memory_mb,
-                "override_storage_mb": self._override_storage_mb,
-                "override_gpus": self._override_gpus,
                 "singularity_image_cache_dir": str(self._image_cache_dir),
                 "singularity_no_mount": self._singularity_no_mount,
                 "singularity_force_pull": self._force_pull,
@@ -86,7 +124,7 @@ class RemoteSingularityEnvironment(SingularityEnvironment):
 
     async def start(self, force_build: bool) -> None:
         """Provision the sandbox on the host manager instead of spawning singularity."""
-        info = await _client.provision_sandbox(self._provision_payload(force_build))
+        info = await _provision_sandbox(self._provision_payload(force_build))
         self._sandbox_id = info["sandbox_id"]
         self._server_port = int(info["server_port"])
         self._staging_dir = Path(info["staging_dir"])
@@ -108,7 +146,7 @@ class RemoteSingularityEnvironment(SingularityEnvironment):
         sid = self._sandbox_id
         if sid:
             try:
-                await _client.stop_sandbox(sid, delete=delete)
+                await _stop_sandbox(sid, delete=delete)
             except Exception:  # noqa: BLE001
                 log.exception("failed to stop sandbox %s", sid)
             finally:
@@ -136,7 +174,7 @@ def _install_registry_swap() -> None:
     except (KeyError, AttributeError):
         pass
     factory._ENVIRONMENT_REGISTRY[EnvironmentType.SINGULARITY] = factory._EnvEntry(
-        "mho.backends.local_singularity.remote_env",
+        "mho.backends.local_singularity.backend",
         "RemoteSingularityEnvironment",
         None,
     )
@@ -144,3 +182,13 @@ def _install_registry_swap() -> None:
 
 
 _install_registry_swap()
+
+# --------------------------------------------------------------------------- #
+# Miles connector hook: re-export the agent function and be the --custom-agent-function-path.
+# Importing backend (as the hook) arms the registry swap above, then re-exports
+# harbor_agent_function.run unchanged -- so the connector's agent<->generate wiring and
+# native token recording are untouched. run_training.py points --custom-agent-function-path
+# at this module.
+# --------------------------------------------------------------------------- #
+import harbor_agent_function as _haf  # noqa: E402
+run = _haf.run

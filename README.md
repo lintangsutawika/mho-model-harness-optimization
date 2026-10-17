@@ -110,8 +110,18 @@ Resources are per phase: `MHO_{EVAL,TRAIN,PROPOSE}_{QUEUE,NGPUS,WALLTIME}`, plus
 in `.env` as well.
 
 ```bash
-tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B --task math \
-  --data data-harbor/<task> --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
+tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B \
+  --train-data data-harbor/<task> --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
+  2>&1 | tee -a ~/logs/r1.log"
+```
+### Dual-data harness-only (train + val)
+Each iteration evals a fresh random-K subset of `--train-data` (the FULL train task dir,
+`--propose-sample`, default 64) for the proposer's improvement signal, plus `--val-data`
+(a held-out eval set) whose score drives the accept/frontier decision:
+```bash
+tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B \
+  --train-data data-harbor/<task> --val-data data-harbor/<task>-val-split \
+  --trials 5 --concurrent 12 --iterations 3 --run-name r1 \
   2>&1 | tee -a ~/logs/r1.log"
 ```
 
@@ -120,7 +130,14 @@ SSH session. Progress is the number of finished trials, not the driver log, whic
 silent for the hours a phase runs:
 
 ```bash
-find runs_output/optimize/<run-name>/eval -name result.json | wc -l
+# per-candidate trials (the train-sample eval the optimizer sees):
+find runs_output/optimize/<run-name>/candidates/*/eval -name result.json | wc -l
+# validation evals (accept/reject gate, kept separate from candidates):
+find runs_output/optimize/<run-name>/evaluation/* -name result.json | wc -l
+# Layout: runs_output/optimize/<run>/candidates/<candidate>/{harness,diff,eval,logs},
+#         runs_output/optimize/<run>/evaluation/<candidate>/  (val gate),
+#         runs_output/optimize/<run>/best/harness  (accepted best scaffold, updated on each
+#           frontier improvement -- grab this after the run), + run-global *.jsonl
 ```
 
 A phase whose QOS forbids its resource request waits in the queue rather than failing. On a

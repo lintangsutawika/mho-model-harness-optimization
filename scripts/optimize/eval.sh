@@ -35,8 +35,8 @@ cd "$REPO_DIR"
 echo "[eval] repo: ${REPO_DIR}${MHO_REPO_DIR:+ (MHO_REPO_DIR)}"
 export PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
-# would shadow src/harness/ (agent_harness/math_verifier live only in src). src stays on
-# PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/miles_agent_fn.
+# would shadow src/harness/ (agent_harness lives only in src). src stays on
+# PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/backend.
 export PYTHONSAFEPATH=1
 # Use the prebuilt project .venv directly (harbor + deps already installed, shared home) rather
 # than `uv run`, which re-syncs the git harbor dep per job on a fresh node-local uv cache and
@@ -86,9 +86,10 @@ if [ -z "${MINI_FORK_LOCAL:-}" ]; then
     || { echo "ERROR: no harness set and base scaffold not found (set MHO_HARNESS or MICRO_SCAFFOLD_BASE)" >&2; exit 2; }
   echo "[eval] no harness passed -> using base scaffold: ${MINI_FORK_LOCAL}"
 fi
-# Agent config: configs/task/<task>.yaml then configs/sampling/<model>.yaml, layered over
-# the scaffold's mini.yaml that harbor loads as `-c mini`. Override with AGENT_TASK_CONFIG /
-# AGENT_CONFIG, or pass "none" to drop a layer. The model id is MHO_MODEL because the
+# Agent config: an optional agent-task YAML (AGENT_TASK_CONFIG, usually a proposed-scaffold config)
+# then configs/sampling/<model>.yaml, layered over the scaffold's mini.yaml that harbor loads
+# as `-c mini`. Override with AGENT_TASK_CONFIG / AGENT_CONFIG, or pass "none" to drop a
+# layer. The model id is MHO_MODEL because the
 # serving block below overwrites MODEL with litellm_proxy/<served-name>. A missing sampling
 # config exits here, before vLLM starts: the `--ak temperature=` this replaces was ignored
 # by harbor's MiniSweAgent, and every trial ran at mini.yaml's defaults without saying so.
@@ -105,8 +106,11 @@ elif [ ! -f "${AGENT_CONFIG}" ]; then
   echo "       add it, or pass AGENT_CONFIG=<file>, or AGENT_CONFIG=none to use mini.yaml as-is" >&2
   exit 2
 fi
-AGENT_TASK_CONFIG="${AGENT_TASK_CONFIG:-${REPO_DIR}/configs/task/${MHO_TASK:-}.yaml}"
-if [ "${AGENT_TASK_CONFIG}" = "none" ] || [ ! -f "${AGENT_TASK_CONFIG}" ]; then
+# Agent-task config: optional, explicit path via AGENT_TASK_CONFIG (the harness config
+# normally comes from the proposed scaffold's mini.yaml). "none" / a missing path drops the
+# layer (scaffold mini.yaml only).
+AGENT_TASK_CONFIG="${AGENT_TASK_CONFIG:-}"
+if [ "${AGENT_TASK_CONFIG}" = "none" ] || { [ -n "${AGENT_TASK_CONFIG}" ] && [ ! -f "${AGENT_TASK_CONFIG}" ]; }; then
   AGENT_TASK_CONFIG=""
 fi
 echo "[eval] task config:     ${AGENT_TASK_CONFIG:-<none, scaffold mini.yaml only>}"
@@ -211,9 +215,10 @@ else
   [ -n "${MODAL_SANDBOX_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_timeout_secs=${MODAL_SANDBOX_TIMEOUT_SEC}" )
   [ -n "${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" ] && ENV_FLAGS+=( --ek "sandbox_idle_timeout_secs=${MODAL_SANDBOX_IDLE_TIMEOUT_SEC}" )
   [ -n "${ALLOW_HOST}" ] && ENV_FLAGS+=( --allow-agent-host "${ALLOW_HOST}" )
-# Math verifier for standalone harbor evals (defaults to the repo custom grader,
-# mirroring miles_agent_fn.py). Passed to `harbor run --verifier`.
-MHO_VERIFIER="${MHO_VERIFIER:-harness.math_verifier:MathVerifier}"
+# Verifier: when MHO_VERIFIER is set (e.g. a task needing an in-process verifier), pass it
+# to `harbor run --verifier`. Tasks that self-grade via tests/test.sh -> verifier/reward.txt
+# (harbor's file verifier) need no --verifier, so we do NOT default it to a global verifier --
+# keeping tasks isolated from src/.
 fi
 # Output location: write to a deterministic dir (MHO_OUT, else runs_output/eval) with a stable
 # job name, so results are findable (harbor's default is a timestamped dir under ./jobs).

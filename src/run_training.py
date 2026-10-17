@@ -162,13 +162,13 @@ def execute(args: ScriptArgs):
     )
     agent_args = agentic_train_args(tito_model="qwen35", session_server_workers=32)
     # Redirect the agent function to our shim so the rollout worker imports
-    # mho.backends.local_singularity.remote_env (arming the EnvironmentType.SINGULARITY
+    # mho.backends.local_singularity.backend (arming the EnvironmentType.SINGULARITY
     # -> RemoteSingularityEnvironment registry swap) BEFORE any trial builds its env.
     # Without this the worker uses harbor's stock SingularityEnvironment and tries to run
     # apptainer nested inside the Miles container (fails: no apptainer binary there).
     agent_args = agent_args.replace(
         "--custom-agent-function-path harbor_agent_function.run",
-        "--custom-agent-function-path mho.backends.local_singularity.miles_agent_fn.run",
+        "--custom-agent-function-path mho.backends.local_singularity.backend.run",
     )
     misc_args = (
         "--attention-dropout 0.0 "
