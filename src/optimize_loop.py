@@ -275,7 +275,7 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
         extra["MHO_HARNESS"] = harness
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B
     # fits on one H200); set MHO_EVAL_NGPUS=0 for an API/litellm model (no self-serve).
-    return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{tag}",
+    return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{job_name}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("EVAL"))
 
 
@@ -359,7 +359,9 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     if iteration == 0:
         return ["eval_val", "eval_train_sample"] if dual else ["eval"]
     acts: list[str] = []
-    if do_propose:
+    # Propose step: harness-modes propose a harness edit (do_propose). Model-only, which trains
+    # the model, ALSO proposes -- a MODEL proposal (sigma), so model improvement produces sigma.
+    if do_propose or do_train:
         acts.append("propose")
     if do_train:
         acts.append("train")

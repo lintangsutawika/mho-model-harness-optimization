@@ -67,6 +67,19 @@ def _original_base() -> Path:
     return Path(os.environ.get("MICRO_SCAFFOLD_BASE") or scaffold.DEFAULT_BASE)
 
 
+def _materialize_from(src: Path, dst: Path) -> None:
+    """Copy the parent scaffold `src` -> candidate harness dir `dst`. Changes accumulate because
+    `src` is the frontier-best (not the fixed base). `scaffold._IGNORE` strips VCS/cache noise."""
+    if not (src / "pyproject.toml").exists():
+        sys.exit(f"[propose] parent scaffold {src} is not an installable package; "
+                 f"set MICRO_SCAFFOLD_BASE / a valid MHO_RUN_DIR layout")
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst, ignore=scaffold._IGNORE)
+    print(f"[propose] materialized parent scaffold {src} -> {dst}")
+
+
 def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     """Derive every proposer input path from the run layout + the target candidate dir,
     instead of ~6 individual env vars. Requires MHO_RUN_DIR (the experiment root); the
