@@ -107,6 +107,7 @@ def generate(
     problem: dict[str, Any],
     language: str = "python",
     output: Path | str = "tasks",
+    docker_image: str = "python:3.11-slim",
 ) -> Path:
     """Render one arxivmath-training task into a fresh subdir of ``output``.
 
@@ -132,7 +133,15 @@ def generate(
         "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
         "name": f"mho/arxivmath-training-{_sanitize(problem.get('source') or '')}",
+        "docker_image": docker_image,
     }
+    # A prebuilt .sif already carries the full toolchain -> the task's environment/Dockerfile
+    # must NOT re-trigger runtime image layering; replace it with a minimal no-RUN recipe that
+    # keeps WORKDIR /workspace (msl leetcode adapter pattern).
+    if docker_image.lower().endswith(".sif"):
+        df = task / "environment" / "Dockerfile"
+        if df.exists():
+            df.write_text("FROM scratch\nWORKDIR /workspace\n")
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
     _fill(task / "tests" / "test.py", **fills)
@@ -144,6 +153,7 @@ def generate_all(
     output: Path | str,
     languages: tuple[str, ...] = LANGUAGES,
     skip_unsupported: bool = False,
+    docker_image: str = "python:3.11-slim",
 ) -> tuple[list[dict[str, Any]], int]:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -155,7 +165,7 @@ def generate_all(
         for row in problems:
             for language in languages:
                 try:
-                    generate(row, language, staged)
+                    generate(row, language, staged, docker_image=docker_image)
                 except (NotImplementedError, ValueError) as exc:
                     if not skip_unsupported:
                         raise
@@ -211,6 +221,11 @@ def main() -> None:
                              "<out>-train-split + <out>-val-split. 0 disables (generate one dir).")
     parser.add_argument("--skip-unsupported", action="store_true",
                         help="Record unsupported problems in exclusions.json instead of aborting.")
+    parser.add_argument("--image", default="python:3.11-slim",
+                        help="docker_image for the generated tasks: either a registry image (default "
+                             "python:3.11-slim) or a prebuilt .sif path. A .sif already carries the "
+                             "toolchain (no runtime install/network needed), so the task's "
+                             "environment/Dockerfile is neutralized (msl leetcode --images pattern).")
     args = parser.parse_args()
 
     output_dir = args.output_dir or Path("tasks")
@@ -254,7 +269,7 @@ def main() -> None:
         for out_, subset, label in ((train_out, train, "train"), (val_out, val, "val")):
             if out_.exists():
                 raise SystemExit(f"Output directory already exists: {out_}. Use a fresh --output-dir.")
-            _ex, _count = generate_all(subset, output=out_)
+            _ex, _count = generate_all(subset, output=out_, docker_image=args.image)
             print(f"[split] generated {_count} {label} tasks in {out_}; excluded {len(_ex)}")
         (output_dir.parent / f"{output_dir.name}_split_manifest.json").write_text(
             json.dumps(
@@ -277,7 +292,7 @@ def main() -> None:
         return
     if output_dir.exists():
         raise SystemExit(f"Output directory already exists: {output_dir}. Use a fresh --output-dir.")
-    exclusions, count = generate_all(problems, output=output_dir)
+    exclusions, count = generate_all(problems, output=output_dir, docker_image=args.image)
     if args.sample is not None:
         (output_dir / "selection_manifest.json").write_text(
             json.dumps(

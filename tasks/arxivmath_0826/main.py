@@ -91,6 +91,7 @@ def generate(
     problem: dict[str, Any],
     language: str = "python",
     output: Path | str = "tasks",
+    docker_image: str = "python:3.11-slim",
 ) -> Path:
     """Render one HMMT math task into a fresh subdir of ``output``."""
     if language != "python":
@@ -106,8 +107,13 @@ def generate(
         "language": language,
         "problem": problem["problem"].strip(),
         "answer": json.dumps(problem.get("answer") or "", ensure_ascii=False),
+        "docker_image": docker_image,
         "name": f"mho/arxivmath-0826-{problem['problem_id']}",
     }
+    if docker_image.lower().endswith(".sif"):
+        df = task / "environment" / "Dockerfile"
+        if df.exists():
+            df.write_text("FROM scratch\nWORKDIR /workspace\n")
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
     _fill(task / "tests" / "test.py", **fills)
@@ -119,6 +125,7 @@ def generate_all(
     output: Path | str,
     languages: tuple[str, ...] = LANGUAGES,
     skip_unsupported: bool = False,
+    docker_image: str = "python:3.11-slim",
 ) -> tuple[list[dict[str, Any]], int]:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -129,7 +136,7 @@ def generate_all(
         for row in problems:
             for language in languages:
                 try:
-                    generate(row, language, staged)
+                    generate(row, language, staged, docker_image=docker_image)
                 except (NotImplementedError, ValueError) as exc:
                     if not skip_unsupported:
                         raise
@@ -175,6 +182,10 @@ def main() -> None:
                         help="Generate only this problem ID (repeatable).")
     parser.add_argument("--skip-unsupported", action="store_true",
                         help="Record unsupported problems in exclusions.json instead of aborting.")
+    parser.add_argument("--image", default="python:3.11-slim",
+                        help="docker_image for the generated tasks: a registry image (default "
+                             "python:3.11-slim) or a prebuilt .sif path (toolchain baked in, no "
+                             "runtime install/network; environment/Dockerfile is neutralized).")
     args = parser.parse_args()
 
     output_dir = args.output_dir or Path("tasks")
@@ -196,7 +207,7 @@ def main() -> None:
 
     if output_dir.exists():
         raise SystemExit(f"Output directory already exists: {output_dir}. Use a fresh --output-dir.")
-    exclusions, count = generate_all(problems, output=output_dir)
+    exclusions, count = generate_all(problems, output=output_dir, docker_image=args.image)
     print(f"Generated {count} tasks in {output_dir}; excluded {len(exclusions)}")
 
 
