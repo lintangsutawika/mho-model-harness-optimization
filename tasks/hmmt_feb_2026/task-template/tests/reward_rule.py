@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generic executable reward rule (shared across sigma realizations).
 
-Usage: reward_rule.py <realization.json> <output_path> <trajectory_path>
+Usage: reward_rule.py <sigma_reward.json> <output_path> <trajectory_path>
 Reads expected answer + sigma-checks from the JSON config, scores answer correctness and the
 checks over the output/trajectory, and writes /logs/verifier/reward.txt (float [0,1]).
 """
@@ -81,6 +81,6 @@ def run(manifest: str, output_path: str, traj_path: str) -> int:
 
 if __name__ == "__main__":
     if len(sys.argv) < 4:
-        print("usage: reward_rule.py <realization.json> <output_path> <trajectory_path>", file=sys.stderr)
+        print("usage: reward_rule.py <sigma_reward.json> <output_path> <trajectory_path>", file=sys.stderr)
         raise SystemExit(2)
     raise SystemExit(run(sys.argv[1], sys.argv[2], sys.argv[3]))
