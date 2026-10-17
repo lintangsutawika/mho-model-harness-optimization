@@ -365,12 +365,19 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     return acts
 
 
-def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int) -> Path:
+def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int,
+                   sigma_reward: Path | None = None) -> Path:
     """Copy `k` random problem dirs from a local harbor task dir (`task_dir`) into a fresh
     `out_dir` (a valid `harbor run -p` target). Each problem = a subdir (e.g. `<id>-python/`)
     holding instruction.md + task.toml + tests/. Gives the proposer a BOUNDED,
     fresh-random subset of the full training task instead of eval'ing the whole train set.
-    The sample is deterministic for a given (k, seed); fresh per iteration via a new seed."""
+    The sample is deterministic for a given (k, seed); fresh per iteration via a new seed.
+
+    `sigma_reward` (e.g. <RUN>/candidates/<tag>/model/sigma_rewards/<check>.json) is the ONE
+    sigma config for this candidate, applied to ALL of its train tasks: when given, it is copied
+    into every staged task as sigma_reward.json JUST-IN-TIME, so the sigma-aware test.sh applies
+    the sigma reward for this rollout batch without mutating the base train cohort.
+    """
     task_dir, out_dir = Path(task_dir), Path(out_dir)
     if k <= 0:
         raise ValueError(f"propose-sample k must be > 0 (got {k})")
@@ -382,8 +389,12 @@ def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int) -> Pa
         rng = random.Random(seed)
         sample = rng.sample(problems, k)
     out_dir.mkdir(parents=True, exist_ok=True)
+    sigma_path = Path(sigma_reward) if sigma_reward else None
     for p in sample:
-        shutil.copytree(p, out_dir / p.name, dirs_exist_ok=True)
+        dst = out_dir / p.name
+        shutil.copytree(p, dst, dirs_exist_ok=True)
+        if sigma_path and sigma_path.is_file():
+            shutil.copy2(sigma_path, dst / "sigma_reward.json")   # JIT: same sigma to all tasks
     return out_dir
 
 
@@ -486,8 +497,13 @@ def optimize(args: argparse.Namespace) -> None:
             # BOUNDED, fresh-random subset of the full train task dir for the proposer's
             # improvement signal -- never the whole (often 1000s-problem) train set.
             seed = int(time.time()) % (2**31)
+            # JIT: the candidate's single sigma config (model/sigma_rewards/<check>.json) applies
+            # to ALL its staged train tasks. Use the first sigma config found there, if any.
+            sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
+            sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
             data = str(_sample_subset(args.train_data, args.propose_sample,
-                                      run_dir / "samples" / f"{tag}-train_sample", seed))
+                                      run_dir / "samples" / f"{tag}-train_sample", seed,
+                                      sigma_reward=sigma_cfg))
         else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
             # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
             eval_out = run_dir / "evaluation"
