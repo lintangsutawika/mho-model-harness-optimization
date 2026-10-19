@@ -84,6 +84,7 @@ vllm_argv=(
     vllm serve "${MODEL}"
         --host 0.0.0.0
         --port "${PORT}"
+        --served-model-name "${SERVED_NAME:-${MODEL}}"
         --tensor-parallel-size "${TENSOR_PARALLEL}"
         --data-parallel-size "${DATA_PARALLEL}"
         --max-model-len "${MAX_MODEL_LEN}"
