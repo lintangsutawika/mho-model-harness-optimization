@@ -1,4 +1,4 @@
 Problem:
 {problem}
 
-The last line of your response should be of the form Answer: $Answer (without quotes) where $Answer is the final answer to the problem.
+Write your final answer directly to /workspace/output.txt
