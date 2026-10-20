@@ -92,8 +92,11 @@ if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL
   pkill -9 -f 'mho.backends.local_singularity.service' 2>/dev/null || true
   pkill -9 -f 'executor_service' 2>/dev/null || true
   sleep 2
+  # Stage trial sandbox rootfs on the PERSISTENT run dir (next to checkpoints) instead of
+  # node-local /local/<job>/hbstaging -- that scratch fills up from orphaned trials (killed
+  # runs never DELETE, so mkdtemp fails and every trial 500s). Override with MHO_STAGING_DIR.
   PYTHONPATH="${REPO_DIR}/src" EXECUTOR_PORT="${EXECUTOR_PORT}" \
-    HB_STAGING_ROOT="${BASE_DIR:-${TMP_DIR}}/hbstaging" SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
+    HB_STAGING_ROOT="${MHO_STAGING_DIR:-${RUN_DIR}/hbstaging}" SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
     nohup "${EXECUTOR_PYTHON}" -m mho.backends.local_singularity.service > "${EXECUTOR_LOG}" 2>&1 &
   for _i in $(seq 1 20); do
     curl -sf --max-time 2 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 && break
