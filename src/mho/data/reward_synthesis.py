@@ -87,6 +87,47 @@ def _correctness(cand: str, exp: str) -> float:
         pass
     return float(_norm(cand) == _norm(exp))
 
+# --- standard sigma-check predicate library -------------------------------
+# The proposer emits named trajectory/output predicates in a sigma spec's `checks`.
+# These are the IMPLEMENTED vocabulary; reward_rule evaluates checks against it. A check
+# with an unknown name -> NameError in the eval below -> that check fails (as before), but
+# anything listed here resolves. Each predicate takes (traj: str) and/or (output: str).
+
+def _msgs(traj: str) -> list:
+    try:
+        d = json.loads(traj)
+    except Exception:
+        return []
+    m = d.get("messages") if isinstance(d, dict) else d
+    return m if isinstance(m, list) else []
+
+def _has_answer_line(text: str) -> bool:
+    return bool(ANSWER_RE.search(str(text)))
+
+def has_final_agent_answer_line(traj: str) -> bool:
+    """An assistant turn in the trajectory carries an 'Answer:' line (the agent committed
+    a final answer to the graded artifact / its own reply)."""
+    return any(
+        isinstance(m, dict) and m.get("role") == "assistant"
+        and _has_answer_line(m.get("content", ""))
+        for m in _msgs(traj)
+    )
+
+def final_agent_answer_present_independent_of_tool_output(traj: str) -> bool:
+    """A final-answer line exists in an assistant turn regardless of what tool outputs
+    echoed -- i.e. the answer is the agent's own, not merely a tool reflect."""
+    return has_final_agent_answer_line(traj)
+
+def traj_has_text(traj: str, needle: str) -> bool:
+    """Generic: the raw trajectory text contains `needle` (substring search)."""
+    return needle in traj
+
+CHECK_NS = {
+    "has_final_agent_answer_line": has_final_agent_answer_line,
+    "final_agent_answer_present_independent_of_tool_output": final_agent_answer_present_independent_of_tool_output,
+    "traj_has_text": traj_has_text,
+}
+
 
 def run(manifest: str, output_path: str, traj_path: str) -> int:
     sigma, expected, checks = _load_config(manifest)
@@ -97,7 +138,10 @@ def run(manifest: str, output_path: str, traj_path: str) -> int:
     results = []
     for i, expr in enumerate(checks):
         try:
-            ok = bool(eval(expr, {"__builtins__": {}}, {"output": output, "traj": traj}))  # noqa: S307
+            # The standard predicate namespace (CHECK_NS) is exposed alongside the raw
+            # `output`/`traj` strings, so named sigma-checks resolve to real implementations.
+            ok = bool(eval(expr, {"__builtins__": {}, **CHECK_NS},
+                           {"output": output, "traj": traj}))  # noqa: S307
         except Exception as e:
             ok = False
             expr = f"{expr}  # ERROR: {e}"
@@ -121,6 +165,31 @@ if __name__ == "__main__":
 '''
 
 
+# --- realized-check vocabulary + validation ---------------------------------
+# The reward runtime (reward_rule.py, rendered from RULE_TEMPLATE above) evaluates a sigma
+# config's `checks` against a FIXED namespace of implemented predicates (its CHECK_NS). For the
+# realization to emit only RUNNABLE checks, this module mirrors that same vocabulary and
+# validates the proposer's checks against it at realization time. These names MUST stay in sync
+# with the CHECK_NS emitted in RULE_TEMPLATE.
+CHECK_NS = {
+    "has_final_agent_answer_line",
+    "final_agent_answer_present_independent_of_tool_output",
+    "traj_has_text",
+}
+_FUNC_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def unsupported_checks(checks: list[str]) -> list[str]:
+    """Return the checks whose leading function name is not in the implemented CHECK_NS."""
+    bad = []
+    for c in checks:
+        m = _FUNC_RE.match(str(c))
+        name = m.group(1) if m else ""
+        if not name or name not in CHECK_NS:
+            bad.append(str(c))
+    return bad
+
+
 def _extract_expected_answer(task: Path) -> str:
     """Grab the expected answer from x: task.toml [metadata] answer, else test.py EXPECTED_ANSWER."""
     toml = task / "task.toml"
@@ -137,7 +206,17 @@ def _extract_expected_answer(task: Path) -> str:
 
 
 def produce_config(task: Path, spec) -> dict:
-    """f(x, sigma) -> the sigma config (sigma_reward.json dict) to inject into a base task."""
+    """f(x, sigma) -> the sigma config (sigma_reward.json dict) to inject into a base task.
+
+    The checks are validated against the implemented CHECK_NS: an unsupported check name is
+    rejected (ValueError), so realization never emits a config the reward runtime cannot run.
+    """
+    bad = unsupported_checks(spec.checks)
+    if bad:
+        raise ValueError(
+            f"sigma '{spec.name}': unsupported check(s) -> {bad}. Implement the predicate in "
+            f"reward_synthesis.CHECK_NS (and the reward_rule template) or constrain the "
+            f"proposer to the supported vocabulary: {sorted(CHECK_NS)}")
     return {"sigma": spec.name,
             "from_task": str(task),
             "expected_answer": _extract_expected_answer(task),
