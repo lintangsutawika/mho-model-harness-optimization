@@ -197,6 +197,7 @@ def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) 
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
     frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
     frontier_path.write_text(json.dumps(frontier, indent=2))
+    return improved
 
 def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
     """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
