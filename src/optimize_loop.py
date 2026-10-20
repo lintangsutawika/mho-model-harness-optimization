@@ -197,7 +197,62 @@ def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) 
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
     frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
     frontier_path.write_text(json.dumps(frontier, indent=2))
-    return improved
+
+def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
+    """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
+    Idempotent + re-runnable: on resume we call this again for any spec file that has no
+    realized config yet, so a crash between "specs written" and "sigma_rewards written" is
+    recovered instead of re-running the whole propose job.
+    Returns (ok, sigma_rewards_dir | None). Already-realized configs are left untouched."""
+    spec_dir = cand_dir / "model_specs"
+    sr_dir = cand_dir / "model" / "sigma_rewards"
+    if not spec_dir.is_dir():
+        return False, None
+    from mho.data import reward_synthesis
+    from mho.optimizer import model_spec as _ms
+    train_root = Path(train_data)
+    src_task = next((p for p in sorted(train_root.iterdir()) if p.is_dir()), None)
+    sr_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for md in sorted(spec_dir.glob("*.md")):
+        if md.name.startswith("eval_prior") or md.name == "harness.md":
+            continue
+        out = sr_dir / f"{md.stem}.json"
+        if out.exists():           # already realized -> skip, don't clobber
+            continue
+        try:
+            spec, _ = _ms.parse_spec(md)
+            cfg = reward_synthesis.produce_config(src_task, spec) if src_task else \
+                {"sigma": spec.name, "expected_answer": "", "checks": spec.checks}
+            out.write_text(json.dumps(cfg, indent=2) + "\n")
+            n += 1
+        except Exception as e:
+            print(f"  [realize] {md.name} failed: {e}")
+    if n:
+        print(f"  [realize] realized {n} sigma-reward config(s) -> {sr_dir}")
+    # Uniform candidate record: a MODEL proposal gets a CANDIDATE.md too (synthesized from its
+    # model_spec's hypothesis + evidence), so _candidate_hypothesis / evolution_summary record
+    # model candidates exactly like harness candidates. Idempotent: won't overwrite an existing
+    # CANDIDATE.md (e.g. one the proposer already wrote).
+    if not (cand_dir / "CANDIDATE.md").exists():
+        src = None
+        for md in sorted(spec_dir.glob("*.md")):
+            if md.name.startswith("eval_prior") or md.name == "harness.md":
+                continue
+            try:
+                src = _ms.parse_spec(md)[0]
+                break
+            except Exception:
+                continue
+        if src is not None:
+            ev = "\n".join(f"- {e}" for e in (src.evidence or [])[:5])
+            _cand_md = (f"# Model Proposal: {src.name}\n\n"
+                        f"A sigma-reward capability proposal realized for training. "
+                        f"See model_specs/{src.name}.md for the full spec.\n\n"
+                        f"## Hypothesis\n{src.hypothesis}\n\n"
+                        f"## Evidence\n{ev or '- (none)'}\n")
+            (cand_dir / "CANDIDATE.md").write_text(_cand_md)
+    return True, sr_dir
 
 
 def append_summary(summary_path: Path, row: dict[str, Any]) -> None:
@@ -321,10 +376,12 @@ def latest_trials_dir() -> str | None:
 
 def _candidate_hypothesis(candidate_dir: Path) -> str | None:
     """The candidate's own description of what it changed (CANDIDATE.md), for the summary so the
-    next proposer sees what was tried. None if the agent didn't write one."""
-    md = candidate_dir / "CANDIDATE.md"
-    if md.exists():
-        return md.read_text()[:1000].strip()
+    next proposer sees what was tried. None if the agent didn't write one.
+    Harness candidates write <cand>/harness/CANDIDATE.md; model candidates write <cand>/CANDIDATE.md
+    (synthesized from the model_spec). Check both so the record is uniform across kinds."""
+    for md in (candidate_dir / "CANDIDATE.md", candidate_dir.parent / "CANDIDATE.md"):
+        if md.exists():
+            return md.read_text()[:1000].strip()
     return None
 
 
@@ -447,6 +504,7 @@ def optimize(args: argparse.Namespace) -> None:
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
+              "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
               # model-harness batching: which kind is being proposed this phase + index within it.
               # e.g. harness phase (M_harness proposals), then model phase (M_model), cycling.
               "propose_kind": "harness" if "harness" in args.mode else "model",
@@ -457,6 +515,9 @@ def optimize(args: argparse.Namespace) -> None:
     else:
         print(f"{datetime.now():%H:%M:%S} MHO optimize  RESUME run={run_id}  iter={st['iteration']}  "
               f"action={st['actions'][st['action_index']]}  job={st['job_id']}  scheduler={sched.kind}")
+        # Backward-compat: older state.json has no propose-substep cursor. Default it so the
+        # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
+        st.setdefault("substep", "none")
 
     def cur_tag() -> str:
         # candidate_{iteration}_{version}_{try}: iteration=total attempts, version=accepted
@@ -464,7 +525,9 @@ def optimize(args: argparse.Namespace) -> None:
         # only; model-only has no candidates -> iter{n}. Iteration 0 is the base-harness baseline.
         if st["iteration"] == 0:
             return "baseline"
-        if do_propose:
+        # All proposal modes (harness-only, model-only, model-harness) use the candidate
+        # convention (iteration/version/try); a pure no-propose run would fall back to iter{n}.
+        if do_propose or do_train:
             return f"candidate_{st['iteration']}_{st['version']}_{st['try']}"
         return f"iter{st['iteration']}"
 
@@ -499,6 +562,7 @@ def optimize(args: argparse.Namespace) -> None:
             st["action_index"] = 0
         else:
             st["action_index"] += 1
+        st["substep"] = "none"   # a new stage begins fresh; propose re-arms it when it submits
 
     def submit_current() -> str | None:
         # The loop initiates each stage; the model + harness + data are threaded in
@@ -548,6 +612,8 @@ def optimize(args: argparse.Namespace) -> None:
                                       sigma_reward=sigma_cfg))
         else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
             # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
+            # The accept gate uses the HELD-OUT VAL split (args.val_data), never the train split.
+            data = args.val_data or args.train_data
             eval_out = run_dir / "evaluation"
             job_name = tag
         return submit_eval(sched, "", model=model, harness=harness, data=data,
@@ -560,9 +626,12 @@ def optimize(args: argparse.Namespace) -> None:
         if action == "propose":
             kind_now = st["propose_kind"]
             if kind_now == "model":
-                # model phase: the proposal is a sigma-reward config under model/sigma_rewards/.
-                sr = tag_dir(tag) / "model" / "sigma_rewards"
-                ok = rc == 0 and sr.is_dir() and any(sr.glob("*.json"))
+                # Realize model_specs/*.md -> model/sigma_rewards/*.json (idempotent helper;
+                # a crash between "specs written" and "realized" is recovered on resume).
+                st["substep"] = "realize"
+                ok = rc == 0 and realize_model_specs(tag_dir(tag), args.train_data)[0]
+                if ok:
+                    st["substep"] = "done"
             else:
                 cand_dir = tag_dir(tag) / "harness"
                 ok = rc == 0 and (cand_dir / "pyproject.toml").exists()
@@ -643,8 +712,11 @@ def optimize(args: argparse.Namespace) -> None:
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
                                               "hypothesis": hypothesis})
-                print(f"  {'NEW BEST' if improved else 'no improvement'}  "
-                      f"pass@1={score.get('solved_pass@1')} mean_reward={score.get('mean_reward')}")
+                _cur = json.loads(frontier_path.read_text()).get("_best", {}) if frontier_path.exists() else {}
+                _inc = f"{_cur.get('candidate', 'none')} @ {_cur.get('metric')}"
+                print(f"  {'NEW BEST' if improved else 'no improvement'} {tag}: "
+                      f"pass@1={score.get('solved_pass@1')} mean_reward={score.get('mean_reward')} "
+                      f"| frontier best: {_inc}")
             advance()
 
     # ── The loop: wait on the in-flight job, else submit the current stage. ──
@@ -660,7 +732,19 @@ def optimize(args: argparse.Namespace) -> None:
             on_done(rc if rc is not None else 0)
             _save_state(state_path, st)
             continue
-        # nothing in flight -> submit the current stage (or skip it if unconfigured)
+        if action == "propose" and st["propose_kind"] == "model" and st["substep"] == "realize":
+            # RESUME gate: the propose job already ran and wrote model_specs/*.md, but the
+            # realization (-> model/sigma_rewards/*.json) crashed or never ran. Re-run ONLY
+            # the realization -- do NOT re-submit the whole (expensive) propose job. This is
+            # exactly the case a crash inside propose's on_done left behind.
+            print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} propose realize-substep"
+                  f" pending -> running realization in-line")
+            st["substep"] = "done" if realize_model_specs(tag_dir(cur_tag()), args.train_data)[0] else "realize"
+            if st["substep"] == "done":
+                st["scaffold_dir"] = st["scaffold_dir"] or str(tag_dir(cur_tag()))   # keep marker
+                advance()
+            _save_state(state_path, st)
+            continue
         print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} stage={action} -> submit")
         jid = submit_current()
         if jid is None:  # e.g. propose with MHO_PROPOSE_JOB unset

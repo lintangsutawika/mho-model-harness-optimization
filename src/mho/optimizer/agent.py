@@ -103,7 +103,12 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
             best_tag = str(json.loads(frontier.read_text()).get("_best", {}).get("candidate", ""))
         except json.JSONDecodeError:
             pass
-    parent = (run / "candidates" / best_tag / "harness") if best_tag else _original_base()
+    # Parent = the frontier-best candidate's harness dir. The baseline (iter 0) never
+    # materializes a harness (it is only an eval), so fall back to the base scaffold when the
+    # best candidate has no harness yet.
+    parent = (run / "candidates" / best_tag / "harness") if best_tag else Path("")
+    if not parent or not (parent / "pyproject.toml").exists():
+        parent = _original_base()
     trials = (run / "candidates" / best_tag / "eval") if best_tag else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
