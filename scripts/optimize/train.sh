@@ -69,6 +69,10 @@ NUM_NODES="${NUM_NODES:-1}"
 MODEL_KEY="${MODEL_KEY:-qwen3.5-4B}"
 HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-4B}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+# The rollout agent must call the SERVED model by its served name. run_training.py reads
+# AGENT_MODEL_NAME and defaults to a bogus "model"; without this the trial's agent config has
+# model_name="openai/model" and the agent makes zero model calls (No model calls recorded).
+export AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-${MODEL_KEY}}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-500}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
@@ -84,17 +88,21 @@ LOGGER="${LOGGER:-wandb}"
 # HARBOR_ENV_TYPE=singularity -> the connector builds EnvironmentType.SINGULARITY,
 # which (via the registry swap in backend.py) resolves to RemoteSingularityEnvironment,
 # which POSTs /sandbox to this host service. It must be running before training.
-if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL:-}" ]; then
+# EXECUTOR_URL is auto-inferred (defaults to 127.0.0.1:8900, matching backend.py's
+# _executor_url fallback) so the executor starts without the caller providing it.
+# Disable with MHO_SKIP_EXECUTOR=1.
+EXECUTOR_URL="${EXECUTOR_URL:-http://127.0.0.1:8900}"
+if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ "${MHO_SKIP_EXECUTOR:-0}" != "1" ]; then
   EXECUTOR_PYTHON="${EXECUTOR_PYTHON:-/home/aci18914wh/executor_env/.venv/bin/python}"
   EXECUTOR_LOG="${EXECUTOR_LOG:-${HOME}/executor_svc.log}"
   EXECUTOR_PORT="${EXECUTOR_PORT:-${EXECUTOR_URL##*:}}"; EXECUTOR_PORT="${EXECUTOR_PORT%%/*}"
   echo "[executor] (re)starting local_singularity service on ${EXECUTOR_URL} (log: ${EXECUTOR_LOG})"
-  pkill -9 -f 'mho.backends.local_singularity.service' 2>/dev/null || true
-  pkill -9 -f 'executor_service' 2>/dev/null || true
+  pkill -9 -f "mho.backends.local_singularity.service" 2>/dev/null || true
+  pkill -9 -f "executor_service" 2>/dev/null || true
   sleep 2
-  # Stage trial sandbox rootfs on the PERSISTENT run dir (next to checkpoints) instead of
-  # node-local /local/<job>/hbstaging -- that scratch fills up from orphaned trials (killed
-  # runs never DELETE, so mkdtemp fails and every trial 500s). Override with MHO_STAGING_DIR.
+  # Stage trial sandbox rootfs on the PERSISTENT run dir (next to checkpoints) instead
+  # of node-local /local/<job>/hbstaging -- that scratch fills up from orphaned trials
+  # (killed runs never DELETE, so mkdtemp fails and every trial 500s). Override MHO_STAGING_DIR.
   PYTHONPATH="${REPO_DIR}/src" EXECUTOR_PORT="${EXECUTOR_PORT}" \
     HB_STAGING_ROOT="${MHO_STAGING_DIR:-${RUN_DIR}/hbstaging}" SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
     nohup "${EXECUTOR_PYTHON}" -m mho.backends.local_singularity.service > "${EXECUTOR_LOG}" 2>&1 &
@@ -102,33 +110,36 @@ if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL
     curl -sf --max-time 2 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 && break
     sleep 1
   done
-  if curl -sf --max-time 3 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1; then
-    echo "[executor] healthy at ${EXECUTOR_URL}"
-  else
-    echo "[executor] ERROR: did not become healthy; see ${EXECUTOR_LOG}" >&2
-    exit 1
-  fi
+  curl -sf --max-time 3 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 \
+    || { echo "[executor] ERROR: did not become healthy; see ${EXECUTOR_LOG}" >&2; exit 1; }
+  echo "[executor] healthy at ${EXECUTOR_URL}"
 fi
 
 # --- launch via miles harbor run.py inside miles.sif -----------------------------
-MILES_SIF="${MILES_SIF:-$(dirname "${BASE_SIF}")/miles.sif}"
+# Trainer image: MHO_TRAINER_SIF is the explicit override (we use miles only), else MILES_SIF,
+# else the miles.sif sibling of BASE_SIF.
+MILES_SIF="${MHO_TRAINER_SIF:-${MILES_SIF:-$(dirname "${BASE_SIF}")/miles.sif}}"
 MILES_RUN_PY=/root/miles/examples/experimental/harbor/run.py
 [ -f "$MILES_SIF" ] || { echo "miles.sif not found: $MILES_SIF" >&2; exit 1; }
 # --- full HF model pre-download ---------------------------------------------------
-# The first conversion run raced an unauthenticated, streaming model download, leaving
-# the Qwen3.5-4B snapshot partial in the bound HF cache -- so convert_hf_to_torch_dist
-# could not find later-shard weights (e.g. model.language_model.layers.24...). Force the
-# whole snapshot into ${HF_DIR} (bound at /root/.cache/huggingface) up front.
-echo "[miles] ensuring full HF snapshot for ${HF_MODEL}"
-singularity exec \
-  --bind "${HF_DIR}:/root/.cache/huggingface" \
-  --env HF_HOME=/root/.cache/huggingface \
-  "$MILES_SIF" \
-    /opt/sglang/bin/python -c \
-      "from huggingface_hub import snapshot_download; \
-       p=snapshot_download('${HF_MODEL}'); \
-       print('HF snapshot complete:', p)" \
-  || echo "[miles] WARN: pre-download failed -- converter may hit shard gaps"
+# LOCAL CHECKPOINT: when HF_MODEL is a local dir (a prior candidate's saved HF checkpoint),
+# the weights are already on disk -- snapshot_download would try to hit the hub with a local
+# path and fail. Skip the hub download; the local dir is used directly as --hf-checkpoint.
+if [ -d "${HF_MODEL}" ]; then
+  echo "[miles] HF_MODEL is a LOCAL dir (prior checkpoint), skipping hub snapshot_download: ${HF_MODEL}"
+  HF_DIR="$(dirname "${HF_MODEL}")"
+else
+  echo "[miles] ensuring full HF snapshot for ${HF_MODEL}"
+  singularity exec \
+    --bind "${HF_DIR}:/root/.cache/huggingface" \
+    --env HF_HOME=/root/.cache/huggingface \
+    "$MILES_SIF" \
+      /opt/sglang/bin/python -c \
+        "from huggingface_hub import snapshot_download; \
+         p=snapshot_download('${HF_MODEL}'); \
+         print('HF snapshot complete:', p)" \
+    || echo "[miles] WARN: pre-download failed -- converter may hit shard gaps"
+fi
 
 
 singularity exec --nv \
@@ -151,6 +162,7 @@ singularity exec --nv \
   --env EXECUTOR_URL="${EXECUTOR_URL}" \
   --env MSWEA_API_KEY="${MSWEA_API_KEY:-dummy}" \
   --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-16384}" \
+  --env AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-qwen3.5-4B}" \
   --env AGENT_EXEC_TIMEOUT_SEC="${AGENT_EXEC_TIMEOUT_SEC:-1800}" \
   --env MILES_ROUTER_EXTERNAL_HOST="${MILES_ROUTER_EXTERNAL_HOST:-$(hostname)}" \
   --env CUDA_VISIBLE_DEVICES="${GPU_LIST:-$(seq -s, 0 $((NUM_GPUS - 1)))}" \
