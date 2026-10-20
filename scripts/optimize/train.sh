@@ -5,7 +5,7 @@
 #
 # Miles runs Harbor trials IN-PROCESS in the rollout worker; the sandbox container is
 # provisioned on the host via the local_singularity backend (HARBOR_ENV_TYPE=singularity +
-# the remote_env registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
+# the backend registry swap -> RemoteSingularityEnvironment -> POST /sandbox). Token-in/out
 # is recorded natively (--tito-model). HF->Megatron conversion is done by run.py prepare().
 # The Miles launcher is src/run_training.py, bind-mounted over the example run.py.
 #
@@ -35,20 +35,14 @@ MATH_DATA_DIR="${MATH_DATA_DIR:-${USER_DATA}/mho-model-harness-optimization/data
 MATH_TRAIN_DIR="${MATH_TRAIN_DIR:-${MATH_DATA_DIR}/train}"
 MAX_TRAIN="${MAX_TRAIN:-500}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-50}"
-# Prepare training task dirs if absent (prepare.py writes both the harbor task dirs
-# AND the Miles rollout.jsonl). If the dirs already exist from a pre-jsonl prep, the
-# --emit-rollout-only backfill below (re)writes rollout.jsonl from them -- idempotent,
-# no dataset download, and single-sourced with prepare() so the two never drift.
-if [ ! -d "$MATH_TRAIN_DIR" ]; then
-  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_TRAIN_DIR" --split train --max-tasks "$MAX_TRAIN"
-fi
-if [ ! -f "${MATH_TRAIN_DIR}/rollout.jsonl" ]; then
-  uv run --no-project tasks/dapo_math_17k/prepare.py --emit-rollout-only --out "$MATH_TRAIN_DIR"
-fi
-MATH_VAL_DIR="${MATH_VAL_DIR:-${MATH_DATA_DIR}/test_${EVAL_BATCH_SIZE}}"
-if [ ! -d "$MATH_VAL_DIR" ]; then
-  uv run --no-project --with datasets tasks/dapo_math_17k/prepare.py --out "$MATH_VAL_DIR" --split train --max-tasks "$((MAX_TRAIN + EVAL_BATCH_SIZE))" --start "$MAX_TRAIN"
-fi
+# The train/val task dirs + their seed.jsonl are produced by tasks/<task>/main.py
+# (e.g. `uv run --with datasets python -m tasks.arxivmath_training --val-size 1000
+# --output-dir out/x` -> out/x-train-split + out/x-val-split). Each split dir carries a
+# seed.jsonl: one row per task dir {prompt, metadata.instance_id} that SEEDS Miles'
+# rollout dataset (the RL loop generates the rollouts from it). Point MHO_TRAIN_DATA /
+# MHO_VAL_DATA at those split dirs; require seed.jsonl (--prompt-data consumes it).
+[ -f "${MATH_TRAIN_DIR}/seed.jsonl" ] || {   echo "ERROR: no ${MATH_TRAIN_DIR}/seed.jsonl -- prepare the task first (tasks/<task>/main.py), then set MHO_TRAIN_DATA." >&2;   exit 2; }
+MATH_VAL_DIR="${MATH_VAL_DIR:-}"
 
 # Harbor task dir consumed by the connector (one task dir per instance_id).
 HARBOR_TASKS_DIR="${HARBOR_TASKS_DIR:-${MATH_TRAIN_DIR}}"
@@ -75,6 +69,10 @@ NUM_NODES="${NUM_NODES:-1}"
 MODEL_KEY="${MODEL_KEY:-qwen3.5-4B}"
 HF_MODEL="${HF_MODEL:-Qwen/Qwen3.5-4B}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+# The rollout agent must call the SERVED model by its served name. run_training.py reads
+# AGENT_MODEL_NAME and defaults to a bogus "model"; without this the trial's agent config has
+# model_name="openai/model" and the agent makes zero model calls (No model calls recorded).
+export AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-${MODEL_KEY}}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-500}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
@@ -88,50 +86,60 @@ LOGGER="${LOGGER:-wandb}"
 
 # --- local_singularity executor auto-start (same pattern as SkyRL) ---------------
 # HARBOR_ENV_TYPE=singularity -> the connector builds EnvironmentType.SINGULARITY,
-# which (via the registry swap in remote_env.py) resolves to RemoteSingularityEnvironment,
+# which (via the registry swap in backend.py) resolves to RemoteSingularityEnvironment,
 # which POSTs /sandbox to this host service. It must be running before training.
-if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ -n "${EXECUTOR_URL:-}" ]; then
+# EXECUTOR_URL is auto-inferred (defaults to 127.0.0.1:8900, matching backend.py's
+# _executor_url fallback) so the executor starts without the caller providing it.
+# Disable with MHO_SKIP_EXECUTOR=1.
+EXECUTOR_URL="${EXECUTOR_URL:-http://127.0.0.1:8900}"
+if [ "${HARBOR_ENV_TYPE:-singularity}" = "singularity" ] && [ "${MHO_SKIP_EXECUTOR:-0}" != "1" ]; then
   EXECUTOR_PYTHON="${EXECUTOR_PYTHON:-/home/aci18914wh/executor_env/.venv/bin/python}"
   EXECUTOR_LOG="${EXECUTOR_LOG:-${HOME}/executor_svc.log}"
   EXECUTOR_PORT="${EXECUTOR_PORT:-${EXECUTOR_URL##*:}}"; EXECUTOR_PORT="${EXECUTOR_PORT%%/*}"
   echo "[executor] (re)starting local_singularity service on ${EXECUTOR_URL} (log: ${EXECUTOR_LOG})"
-  pkill -9 -f 'mho.backends.local_singularity.service' 2>/dev/null || true
-  pkill -9 -f 'executor_service' 2>/dev/null || true
+  pkill -9 -f "mho.backends.local_singularity.service" 2>/dev/null || true
+  pkill -9 -f "executor_service" 2>/dev/null || true
   sleep 2
+  # Stage trial sandbox rootfs on the PERSISTENT run dir (next to checkpoints) instead
+  # of node-local /local/<job>/hbstaging -- that scratch fills up from orphaned trials
+  # (killed runs never DELETE, so mkdtemp fails and every trial 500s). Override MHO_STAGING_DIR.
   PYTHONPATH="${REPO_DIR}/src" EXECUTOR_PORT="${EXECUTOR_PORT}" \
-    HB_STAGING_ROOT="${BASE_DIR:-${TMP_DIR}}/hbstaging" SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
+    HB_STAGING_ROOT="${MHO_STAGING_DIR:-${RUN_DIR}/hbstaging}" SIF_IMAGE_CACHE_DIR="${SIF_IMAGE_CACHE_DIR}" \
     nohup "${EXECUTOR_PYTHON}" -m mho.backends.local_singularity.service > "${EXECUTOR_LOG}" 2>&1 &
   for _i in $(seq 1 20); do
     curl -sf --max-time 2 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 && break
     sleep 1
   done
-  if curl -sf --max-time 3 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1; then
-    echo "[executor] healthy at ${EXECUTOR_URL}"
-  else
-    echo "[executor] ERROR: did not become healthy; see ${EXECUTOR_LOG}" >&2
-    exit 1
-  fi
+  curl -sf --max-time 3 "${EXECUTOR_URL%/}/health" >/dev/null 2>&1 \
+    || { echo "[executor] ERROR: did not become healthy; see ${EXECUTOR_LOG}" >&2; exit 1; }
+  echo "[executor] healthy at ${EXECUTOR_URL}"
 fi
 
 # --- launch via miles harbor run.py inside miles.sif -----------------------------
-MILES_SIF="${MILES_SIF:-$(dirname "${BASE_SIF}")/miles.sif}"
+# Trainer image: MHO_TRAINER_SIF is the explicit override (we use miles only), else MILES_SIF,
+# else the miles.sif sibling of BASE_SIF.
+MILES_SIF="${MHO_TRAINER_SIF:-${MILES_SIF:-$(dirname "${BASE_SIF}")/miles.sif}}"
 MILES_RUN_PY=/root/miles/examples/experimental/harbor/run.py
 [ -f "$MILES_SIF" ] || { echo "miles.sif not found: $MILES_SIF" >&2; exit 1; }
 # --- full HF model pre-download ---------------------------------------------------
-# The first conversion run raced an unauthenticated, streaming model download, leaving
-# the Qwen3.5-4B snapshot partial in the bound HF cache -- so convert_hf_to_torch_dist
-# could not find later-shard weights (e.g. model.language_model.layers.24...). Force the
-# whole snapshot into ${HF_DIR} (bound at /root/.cache/huggingface) up front.
-echo "[miles] ensuring full HF snapshot for ${HF_MODEL}"
-singularity exec \
-  --bind "${HF_DIR}:/root/.cache/huggingface" \
-  --env HF_HOME=/root/.cache/huggingface \
-  "$MILES_SIF" \
-    /opt/sglang/bin/python -c \
-      "from huggingface_hub import snapshot_download; \
-       p=snapshot_download('${HF_MODEL}'); \
-       print('HF snapshot complete:', p)" \
-  || echo "[miles] WARN: pre-download failed -- converter may hit shard gaps"
+# LOCAL CHECKPOINT: when HF_MODEL is a local dir (a prior candidate's saved HF checkpoint),
+# the weights are already on disk -- snapshot_download would try to hit the hub with a local
+# path and fail. Skip the hub download; the local dir is used directly as --hf-checkpoint.
+if [ -d "${HF_MODEL}" ]; then
+  echo "[miles] HF_MODEL is a LOCAL dir (prior checkpoint), skipping hub snapshot_download: ${HF_MODEL}"
+  HF_DIR="$(dirname "${HF_MODEL}")"
+else
+  echo "[miles] ensuring full HF snapshot for ${HF_MODEL}"
+  singularity exec \
+    --bind "${HF_DIR}:/root/.cache/huggingface" \
+    --env HF_HOME=/root/.cache/huggingface \
+    "$MILES_SIF" \
+      /opt/sglang/bin/python -c \
+        "from huggingface_hub import snapshot_download; \
+         p=snapshot_download('${HF_MODEL}'); \
+         print('HF snapshot complete:', p)" \
+    || echo "[miles] WARN: pre-download failed -- converter may hit shard gaps"
+fi
 
 
 singularity exec --nv \
@@ -154,6 +162,7 @@ singularity exec --nv \
   --env EXECUTOR_URL="${EXECUTOR_URL}" \
   --env MSWEA_API_KEY="${MSWEA_API_KEY:-dummy}" \
   --env AGENT_MAX_TOKENS="${AGENT_MAX_TOKENS:-16384}" \
+  --env AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-qwen3.5-4B}" \
   --env AGENT_EXEC_TIMEOUT_SEC="${AGENT_EXEC_TIMEOUT_SEC:-1800}" \
   --env MILES_ROUTER_EXTERNAL_HOST="${MILES_ROUTER_EXTERNAL_HOST:-$(hostname)}" \
   --env CUDA_VISIBLE_DEVICES="${GPU_LIST:-$(seq -s, 0 $((NUM_GPUS - 1)))}" \
@@ -165,7 +174,7 @@ singularity exec --nv \
       --hf-checkpoint "$HF_MODEL" \
       --ref-load "$SAVE_DIR/${MODEL_KEY}_torch_dist" \
       --save-dir "$SAVE_DIR" \
-      --prompt-data "${MATH_TRAIN_DIR}/rollout.jsonl" \
+      --prompt-data "${MATH_TRAIN_DIR}/seed.jsonl" \
       --harbor-tasks-dir "$HARBOR_TASKS_DIR" \
       --num-gpus-per-node "$NUM_GPUS" \
       --num-nodes "$NUM_NODES" \

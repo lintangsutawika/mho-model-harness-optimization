@@ -1,58 +1,61 @@
-"""DAPO math verifier (standalone tests/ form).
+"""ArXivMath math verifier (standalone tests/ form).
 
-Mirrors the grading harness.math_verifier applies in-process: read the agent's
-final "Answer: $A" line from the task output and compare it (normalized) to the
-expected ground-truth answer. In the real pipeline this verifier is run by
-harness.math_verifier directly from the trajectory; this file / test.sh supply
-a self-contained answer-string check wherever the tasks/ are executed.
+ArXivMath answers are exact expressions (fractions like ``\\frac{1}{576}`` or
+radicals like ``8\\sqrt{10}``), so this grades with ``math_verify`` (the same
+lib MathArena uses), falling back to sympy structural equality and then to a
+normalized string compare, so ``1/576``, ``\\frac{1}{576}``, ``\\dfrac{1}{576}``
+all match. The expected answer is injected by the adapter; the candidate answer
+is read directly from /workspace/output.txt (the agent writes it there).
 """
 
-import re
 import sys
 from pathlib import Path
 
 EXPECTED_ANSWER = {answer}
 
-# DAPO answer protocol marker: "Answer: $Answer" on the last substantive line.
-ANSWER_RE = re.compile(r"(?:^|\n)\s*Answer:\s*(.+?)\s*$", re.MULTILINE)
-
-
-def _normalize(text: str) -> str:
-    """Normalize an answer string for exact comparison."""
+def _norm(text: str) -> str:
     return " ".join(str(text).strip().lower().split())
 
 
-def _extract_answer(trajectory: str) -> str:
-    """Find the final 'Answer: $A' value in the agent output."""
-    matches = ANSWER_RE.findall(trajectory)
-    if not matches:
-        return ""
-    return matches[-1].lstrip("$").strip()
+def _grade(cand: str, exp: str) -> bool:
+    # 1) math_verify expression equivalence (LaTeX/plain fraction/radical).
+    try:
+        from math_verify import parse, verify
+        g = parse(exp)
+        c = parse(cand)
+        if verify(g, c):
+            return True
+    except Exception:
+        pass
+    # 2) sympy structural equality (fractions/radicals if math_verify missing).
+    try:
+        import sympy as sp
+        from sympy.parsing.latex import parse_latex
+        gg = parse_latex(exp)
+        cc = parse_latex(cand)
+        if sp.simplify(gg - cc) == 0:
+            return True
+    except Exception:
+        pass
+    # 3) normalized string compare (last resort).
+    return _norm(cand) == _norm(exp)
 
 
 def main() -> int:
-    # The agent's trajectory is placed at /workspace/output.txt by the harness;
-    # fall back to any *.txt in /workspace when it is absent.
-    candidates = [
-        Path("/workspace/output.txt"),
-        Path("/workspace/answer.txt"),
-    ]
-    trajectory = ""
-    for path in candidates:
-        if path.is_file():
-            trajectory = path.read_text()
-            break
-
-    got = _extract_answer(trajectory)
-    if not got:
-        print("X no Answer: $A line found in agent output")
+    # The agent is instructed to write its final answer to /workspace/output.txt.
+    out = Path("/workspace/output.txt")
+    if not out.is_file():
+        print("X no /workspace/output.txt written by agent")
+        return 1
+    cand = out.read_text().strip()   # agent writes the answer directly here
+    if not cand:
+        print("X /workspace/output.txt is empty")
         return 1
 
-    expected = _normalize(EXPECTED_ANSWER or "")
-    ok = _normalize(got) == expected
+    ok = _grade(cand, EXPECTED_ANSWER or "")
     print(
         ("OK" if ok else "X")
-        + f" expected={EXPECTED_ANSWER!r} got={got!r}"
+        + f" expected={EXPECTED_ANSWER!r} got={cand[:120]!r}"
     )
     return 0 if ok else 1
 

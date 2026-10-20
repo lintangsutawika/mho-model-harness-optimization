@@ -9,8 +9,16 @@ generation) with a 1-line `__main__.py` for `-m`; `prepare.py` and
 
 | Task | Dataset | Verifier |
 |------|---------|----------|
-| `dapo_math_17k` | `BytedTsinghua-SIA/DAPO-Math-17k` | answer-string (harness.math_verifier style: parse `Answer: $A`) |
-| `hmmt_feb_2025` | `MathArena/hmmt_feb_2025` | `math_verify` → sympy → normalized string compare |
+| `dapo_math_17k` | `BytedTsinghua-SIA/DAPO-Math-17k` | self-grade: `tests/test.sh` → `reward.txt` (parse `Answer: $A`, normalized) |
+| `hmmt_feb_2025` | `MathArena/hmmt_feb_2025` | self-grade: `tests/test.sh` → `reward.txt` (`math_verify` → sympy → string) |
+
+## Isolation
+
+Each task is a **self-contained harbor task package**: its `tests/test.sh` grades the trial
+and writes `verifier/reward.txt` (read by harbor's built-in file verifier). No task imports
+`src/` or relies on a global in-process verifier (`MHO_VERIFIER` is only an optional override
+for tasks needing an in-process verifier). New tasks (math or otherwise) add a self-contained
+`tests/test.sh` + `tests/test.py` (e.g. `test_outputs.py` + `ground_truth.json`).
 
 ## How to prepare
 

@@ -27,6 +27,7 @@ import argparse
 import importlib.util
 import json
 import os
+import random
 import shutil
 import subprocess
 import time
@@ -196,7 +197,62 @@ def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) 
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
     frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
     frontier_path.write_text(json.dumps(frontier, indent=2))
-    return improved
+
+def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
+    """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
+    Idempotent + re-runnable: on resume we call this again for any spec file that has no
+    realized config yet, so a crash between "specs written" and "sigma_rewards written" is
+    recovered instead of re-running the whole propose job.
+    Returns (ok, sigma_rewards_dir | None). Already-realized configs are left untouched."""
+    spec_dir = cand_dir / "model_specs"
+    sr_dir = cand_dir / "model" / "sigma_rewards"
+    if not spec_dir.is_dir():
+        return False, None
+    from mho.data import reward_synthesis
+    from mho.optimizer import model_spec as _ms
+    train_root = Path(train_data)
+    src_task = next((p for p in sorted(train_root.iterdir()) if p.is_dir()), None)
+    sr_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for md in sorted(spec_dir.glob("*.md")):
+        if md.name.startswith("eval_prior") or md.name == "harness.md":
+            continue
+        out = sr_dir / f"{md.stem}.json"
+        if out.exists():           # already realized -> skip, don't clobber
+            continue
+        try:
+            spec, _ = _ms.parse_spec(md)
+            cfg = reward_synthesis.produce_config(src_task, spec) if src_task else \
+                {"sigma": spec.name, "expected_answer": "", "checks": spec.checks}
+            out.write_text(json.dumps(cfg, indent=2) + "\n")
+            n += 1
+        except Exception as e:
+            print(f"  [realize] {md.name} failed: {e}")
+    if n:
+        print(f"  [realize] realized {n} sigma-reward config(s) -> {sr_dir}")
+    # Uniform candidate record: a MODEL proposal gets a CANDIDATE.md too (synthesized from its
+    # model_spec's hypothesis + evidence), so _candidate_hypothesis / evolution_summary record
+    # model candidates exactly like harness candidates. Idempotent: won't overwrite an existing
+    # CANDIDATE.md (e.g. one the proposer already wrote).
+    if not (cand_dir / "CANDIDATE.md").exists():
+        src = None
+        for md in sorted(spec_dir.glob("*.md")):
+            if md.name.startswith("eval_prior") or md.name == "harness.md":
+                continue
+            try:
+                src = _ms.parse_spec(md)[0]
+                break
+            except Exception:
+                continue
+        if src is not None:
+            ev = "\n".join(f"- {e}" for e in (src.evidence or [])[:5])
+            _cand_md = (f"# Model Proposal: {src.name}\n\n"
+                        f"A sigma-reward capability proposal realized for training. "
+                        f"See model_specs/{src.name}.md for the full spec.\n\n"
+                        f"## Hypothesis\n{src.hypothesis}\n\n"
+                        f"## Evidence\n{ev or '- (none)'}\n")
+            (cand_dir / "CANDIDATE.md").write_text(_cand_md)
+    return True, sr_dir
 
 
 def append_summary(summary_path: Path, row: dict[str, Any]) -> None:
@@ -222,6 +278,29 @@ def _phase_env(extra: dict[str, str], scaffold_dir: Path | None) -> dict[str, st
 _ACCOUNT = os.environ.get("MHO_ACCOUNT", "")  # PBS -P / SLURM -A
 
 
+def _phase_res(phase: str) -> dict[str, str]:
+    """Resolve one phase's resource vars with per-phase override -> shared base -> default.
+
+    Scheduler-agnostic: NGPUS/CPUS are the PORTABLE primary signal -- the Scheduler builds
+    PBS ``-l select=1:ngpus=N:ncpus=C`` and SLURM ``--gres=gpu:N --cpus-per-task=C`` from
+    them, so the same MHO_<PHASE>_NGPUS/CPUS works on either backend. QUEUE/ACCOUNT/WALLTIME
+    are already neutral (PBS -q/-P/-l walltime vs SLURM -p/-A/-t). SELECT (raw PBS
+    ``-l select=`` for full-node/reservation shapes) and RTYPE (PBS ``-v RTYPE=``, ABCI RESERVE
+    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. Per-phase
+    MHO_<PHASE>_<VAR> overrides the shared base MHO_<VAR>; unset falls back to phase defaults.
+    """
+    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
+    get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
+    return {
+        "queue": get("QUEUE") or "",
+        "select": get("SELECT") or "",
+        "resource_type": get("RTYPE") or "",
+        "walltime": get("WALLTIME") or ("08:00:00" if phase == "EVAL" else "24:00:00" if phase == "TRAIN" else "02:00:00"),
+        "ngpus": int(get("NGPUS") or (1 if phase == "EVAL" else 8 if phase == "TRAIN" else 0)),
+        "cpus": int(os.environ.get(f"MHO_{phase}_CPUS", 0) or 0),
+    }
+
+
 def _data_env(data: str) -> dict[str, str]:
     """Map a data spec to the phase script's -p/-d env: a path on disk -> MHO_DATA_PATH (-p),
     else a registry name -> MHO_DATA (-d)."""
@@ -232,19 +311,17 @@ def _data_env(data: str) -> dict[str, str]:
 
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
-                tag: str) -> str:
+                job_name: str) -> str:
     # The loop hands eval.sh the (model, harness, data) explicitly via MHO_* -- exactly the
     # manual form `MHO_MODEL=<model> MHO_DATA=<data> MHO_HARNESS=<harness> bash .../eval.sh`.
-    # Name + locate the output by the iteration tag (baseline, iter1, ...), not a timestamp, so
-    # each iteration's eval is findable/scoreable at MHO_OUT/<tag>.
+    # Trials land at MHO_OUT/<job_name>/ (eval.sh: EVAL_JOBS_DIR= MHO_OUT, EVAL_JOB_NAME= job_name).
     extra = {
-        "MHO_TASK": task,
         "AGENT_IMPORT": AGENT_IMPORT,
         "TASK_SET": "full",
         "N_ATTEMPTS": str(n_trials),
         "N_CONCURRENT": str(n_concurrent),
         "MHO_OUT": str(out_dir),
-        "EVAL_JOB_NAME": tag,
+        "EVAL_JOB_NAME": job_name,
         **_data_env(data),
     }
     if model:
@@ -253,55 +330,44 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
         extra["MHO_HARNESS"] = harness
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B
     # fits on one H200); set MHO_EVAL_NGPUS=0 for an API/litellm model (no self-serve).
-    return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{tag}",
-                        queue=os.environ.get("MHO_EVAL_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_EVAL_SELECT", ""),
-                        resource_type=os.environ.get("MHO_EVAL_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_EVAL_NGPUS", 1)),
-                        cpus=int(os.environ.get("MHO_EVAL_CPUS", 0) or 0),
-                        walltime=os.environ.get("MHO_EVAL_WALLTIME", "08:00:00"), out_dir=logs)
+    return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{job_name}",
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("EVAL"))
 
 
 def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: str | None,
-                 out_dir: Path, logs: Path, tag: str) -> str:
+                 out_dir: Path, logs: Path, tag: str,
+                 sigma_reward: str | None = None, train_data: str | None = None) -> str:
     extra = {"MHO_TRAINER": trainer, "MHO_OUT": str(out_dir)}
     if model:
         extra["MHO_MODEL"] = model
     if harness:
         extra["MHO_HARNESS"] = harness
+    if sigma_reward:
+        # The training script realizes this sigma-reward over the train cohort (injects it into
+        # the staged train tasks just-in-time) so the model trains on sigma-shaped rewards.
+        extra["MHO_SIGMA_REWARD"] = sigma_reward
+    if train_data:
+        extra["MHO_TRAIN_DATA"] = train_data
     return sched.submit(TRAIN_SCRIPT, _phase_env(extra, None), name=f"mho-train-{tag}",
-                        queue=os.environ.get("MHO_TRAIN_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_TRAIN_SELECT", ""),
-                        resource_type=os.environ.get("MHO_TRAIN_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_TRAIN_NGPUS", 8)),
-                        walltime=os.environ.get("MHO_TRAIN_WALLTIME", "24:00:00"), out_dir=logs)
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("TRAIN"))
 
 
-def submit_propose(sched: Scheduler, parent_scaffold: str | None, *, candidate_dir: Path,
-                   frontier_path: Path, summary_path: Path, diff_dir: Path, trials_dir: str | None,
-                   logs: Path, tag: str) -> str | None:
-    """Submit the harness-mutation job (MHO_PROPOSE_JOB). It builds the new candidate ON TOP of
-    `parent_scaffold` (the frontier-best, so changes accumulate; None -> the base) and writes it
-    to $MHO_CANDIDATE_DIR (a valid installable scaffold) + two provenance diffs. Returns None if
-    unconfigured."""
+def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
+                   kind: str = "harness") -> str | None:
+    """Submit the HARNNES-mutation or MODEL-proposal job (MHO_PROPOSE_JOB). The proposer derives
+    the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
+    writes either a harness edit (candidates/<tag>/harness) or a model sigma-reward config
+    (candidates/<tag>/model/sigma_rewards/<sigma>.json). None if unconfigured."""
     if not PROPOSE_JOB:
-        print("  MHO_PROPOSE_JOB unset -> skipping harness proposal this iteration")
+        print("  MHO_PROPOSE_JOB unset -> skipping proposal this iteration")
         return None
     env = _phase_env({
-        "MHO_CANDIDATE_DIR": str(candidate_dir),
-        "MHO_PARENT_SCAFFOLD": parent_scaffold or "",   # accumulate on the frontier-best
-        "MHO_DIFF_DIR": str(diff_dir),
-        "MHO_FRONTIER": str(frontier_path),
-        "MHO_SUMMARY": str(summary_path),
-        # the previous eval's trials, for the proposer to analyze (empty before any eval)
-        "MHO_TRIALS_DIR": trials_dir or "",
+        "MHO_RUN_DIR": str(run_root),
+        "MHO_TAG": tag,
+        "MHO_PROPOSE_KIND": kind,
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
-                        queue=os.environ.get("MHO_PROPOSE_QUEUE", ""), account=_ACCOUNT,
-                        select=os.environ.get("MHO_PROPOSE_SELECT", ""),
-                        resource_type=os.environ.get("MHO_PROPOSE_RTYPE", ""),
-                        ngpus=int(os.environ.get("MHO_PROPOSE_NGPUS", 0) or 0),
-                        walltime=os.environ.get("MHO_PROPOSE_WALLTIME", "02:00:00"), out_dir=logs)
+                        account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
 
 
 def latest_trials_dir() -> str | None:
@@ -310,10 +376,12 @@ def latest_trials_dir() -> str | None:
 
 def _candidate_hypothesis(candidate_dir: Path) -> str | None:
     """The candidate's own description of what it changed (CANDIDATE.md), for the summary so the
-    next proposer sees what was tried. None if the agent didn't write one."""
-    md = candidate_dir / "CANDIDATE.md"
-    if md.exists():
-        return md.read_text()[:1000].strip()
+    next proposer sees what was tried. None if the agent didn't write one.
+    Harness candidates write <cand>/harness/CANDIDATE.md; model candidates write <cand>/CANDIDATE.md
+    (synthesized from the model_spec). Check both so the record is uniform across kinds."""
+    for md in (candidate_dir / "CANDIDATE.md", candidate_dir.parent / "CANDIDATE.md"):
+        if md.exists():
+            return md.read_text()[:1000].strip()
     return None
 
 
@@ -337,18 +405,62 @@ def _latest_hf_ckpt(hf_dir: Path) -> Path | None:
 # Persisted after every transition so the driver can die and resume (re-attaching
 # to an in-flight job rather than resubmitting).
 # --------------------------------------------------------------------------- #
-def actions_for(iteration: int, do_propose: bool, do_train: bool) -> list[str]:
+def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = False) -> list[str]:
     """The ordered stages for one iteration. Iteration 0 is the baseline (measure the
-    starting model+harness); later iterations run the mode's full cycle."""
+    starting model+harness); later iterations run the mode's full cycle.
+
+    `dual` (harness-only with --val-data): each iteration runs TWO evals --
+    `eval_train_sample` (a fresh random-K subset of the train task dir, whose trials feed
+    the proposer's improvement signal) and `eval_val` (the held-out val-split, whose score
+    drives accept/frontier). Proposer samples from the full task; val-split accepts."""
     if iteration == 0:
-        return ["eval"]
+        return ["eval_val", "eval_train_sample"] if dual else ["eval"]
     acts: list[str] = []
-    if do_propose:
+    # Propose step: harness-modes propose a harness edit (do_propose). Model-only, which trains
+    # the model, ALSO proposes -- a MODEL proposal (sigma), so model improvement produces sigma.
+    if do_propose or do_train:
         acts.append("propose")
     if do_train:
         acts.append("train")
-    acts.append("eval")
+    if dual:
+        acts.append("eval_train_sample")
+        acts.append("eval_val")
+    else:
+        acts.append("eval")
     return acts
+
+
+def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int,
+                   sigma_reward: Path | None = None) -> Path:
+    """Copy `k` random problem dirs from a local harbor task dir (`task_dir`) into a fresh
+    `out_dir` (a valid `harbor run -p` target). Each problem = a subdir (e.g. `<id>-python/`)
+    holding instruction.md + task.toml + tests/. Gives the proposer a BOUNDED,
+    fresh-random subset of the full training task instead of eval'ing the whole train set.
+    The sample is deterministic for a given (k, seed); fresh per iteration via a new seed.
+
+    `sigma_reward` (e.g. <RUN>/candidates/<tag>/model/sigma_rewards/<check>.json) is the ONE
+    sigma config for this candidate, applied to ALL of its train tasks: when given, it is copied
+    into every staged task as sigma_reward.json JUST-IN-TIME, so the sigma-aware test.sh applies
+    the sigma reward for this rollout batch without mutating the base train cohort.
+    """
+    task_dir, out_dir = Path(task_dir), Path(out_dir)
+    if k <= 0:
+        raise ValueError(f"propose-sample k must be > 0 (got {k})")
+    problems = sorted(p for p in task_dir.iterdir() if p.is_dir())
+    if not problems:
+        raise ValueError(f"no problem dirs under train task dir: {task_dir}")
+    sample = problems  # if k covers them all, no need to randomize beyond order
+    if k < len(problems):
+        rng = random.Random(seed)
+        sample = rng.sample(problems, k)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sigma_path = Path(sigma_reward) if sigma_reward else None
+    for p in sample:
+        dst = out_dir / p.name
+        shutil.copytree(p, dst, dirs_exist_ok=True)
+        if sigma_path and sigma_path.is_file():
+            shutil.copy2(sigma_path, dst / "sigma_reward.json")   # JIT: same sigma to all tasks
+    return out_dir
 
 
 def _load_state(path: Path) -> dict | None:
@@ -373,25 +485,47 @@ def optimize(args: argparse.Namespace) -> None:
 
     do_train = "model" in args.mode
     do_propose = "harness" in args.mode
+    # model-harness batching: a harness phase runs M_harness harness proposals, then a model
+    # phase runs M_model model proposals (sigma -> realize+train), then cycles. N=1 (sequential)
+    # for now; M_harness typically >> M_model.
+    do_model_harness = args.mode == "model-harness"
+    M_harness = max(1, args.harness_proposals)
+    M_model = max(1, args.model_proposals)
     sched = Scheduler()
 
     st = None if args.fresh else _load_state(state_path)
     if st is None:
+        # Fresh start: reset the acceptance bar + any leftover accepted scaffold so this run
+        # seeds its OWN frontier from its baseline eval. Without this, a `--fresh` restart
+        # inherits a stale frontier _best (acceptance threshold) from a PREVIOUS run instance,
+        # so every candidate is rejected against a bar this run never earned -> version stays
+        # 0 and `try` climbs forever (e.g. candidate_5_0_5 with no accept ever).
+        if frontier_path.exists():
+            frontier_path.unlink()
+        shutil.rmtree(run_dir / "best", ignore_errors=True)
         start = 0 if not args.skip_baseline else 1
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
-              "actions": actions_for(start, do_propose, do_train), "job_id": None,
+              "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
               "scaffold_dir": None,        # the candidate currently being trained/evaled
               "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
               "version": 0,                # # of ACCEPTED (improving) candidates so far
-              "try": 1}                    # attempts at the current version; resets on acceptance
+              "try": 1,                    # attempts at the current version; resets on acceptance
+              "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
+              # model-harness batching: which kind is being proposed this phase + index within it.
+              # e.g. harness phase (M_harness proposals), then model phase (M_model), cycling.
+              "propose_kind": "harness" if "harness" in args.mode else "model",
+              "phase_proposed": 0}         # proposals emitted so far in the current phase
         _save_state(state_path, st)
-        print(f"{datetime.now():%H:%M:%S} MHO optimize  run={run_id}  mode={args.mode}  task={args.task}  "
+        print(f"{datetime.now():%H:%M:%S} MHO optimize  run={run_id}  mode={args.mode}  "
               f"trainer={args.trainer}  scheduler={sched.kind}  iters={args.iterations}")
     else:
         print(f"{datetime.now():%H:%M:%S} MHO optimize  RESUME run={run_id}  iter={st['iteration']}  "
               f"action={st['actions'][st['action_index']]}  job={st['job_id']}  scheduler={sched.kind}")
+        # Backward-compat: older state.json has no propose-substep cursor. Default it so the
+        # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
+        st.setdefault("substep", "none")
 
     def cur_tag() -> str:
         # candidate_{iteration}_{version}_{try}: iteration=total attempts, version=accepted
@@ -399,18 +533,44 @@ def optimize(args: argparse.Namespace) -> None:
         # only; model-only has no candidates -> iter{n}. Iteration 0 is the base-harness baseline.
         if st["iteration"] == 0:
             return "baseline"
-        if do_propose:
+        # All proposal modes (harness-only, model-only, model-harness) use the candidate
+        # convention (iteration/version/try); a pure no-propose run would fall back to iter{n}.
+        if do_propose or do_train:
             return f"candidate_{st['iteration']}_{st['version']}_{st['try']}"
         return f"iter{st['iteration']}"
 
+    def tag_dir(tag: str) -> Path:
+        """Candidate-first layout under `candidates/`:
+        ```<run_dir>/candidates/<tag>/harness   (installable scaffold + CANDIDATE.md)
+        <run_dir>/candidates/<tag>/diff         (diff_from_base.patch + diff_from_parent.patch)
+        <run_dir>/candidates/<tag>/eval         (the ONE optimizer-visible eval: train-sample)
+        <run_dir>/candidates/<tag>/logs         (phase job logs)
+        <run_dir>/evaluation/<tag>/             (val-split eval -- accept/reject gate, hidden)```
+        The candidate unit (harness + eval + diff + logs) is mountable as one dir; the
+        validation eval is kept OUTSIDE it so the optimizer never sees it.
+        """
+        return run_dir / "candidates" / tag
+
     def advance(skip_rest: bool = False) -> None:
-        """Move to the next stage, or (past the last, or on skip_rest) the next iteration."""
+        """Move to the next stage, or (past the last, or on skip_rest) the next iteration.
+        In model-harness batching, a completed proposal cycle bumps phase_proposed; when it
+        reaches the phase's M it flips the phase kind (harness <-> model) and resets the counter,
+        so the loop alternately emits M_harness harness proposals then M_model model proposals.
+        """
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
             st["iteration"] += 1
-            st["actions"] = actions_for(st["iteration"], do_propose, do_train)
+            if do_model_harness:
+                st["phase_proposed"] += 1
+                M_cur = M_harness if st["propose_kind"] == "harness" else M_model
+                if st["phase_proposed"] >= M_cur:
+                    st["propose_kind"] = "model" if st["propose_kind"] == "harness" else "harness"
+                    st["phase_proposed"] = 0
+                    print(f"  [batch] phase switch -> {st['propose_kind']} proposals")
+            st["actions"] = actions_for(st["iteration"], do_propose, do_train, dual=args.val_data)
             st["action_index"] = 0
         else:
             st["action_index"] += 1
+        st["substep"] = "none"   # a new stage begins fresh; propose re-arms it when it submits
 
     def submit_current() -> str | None:
         # The loop initiates each stage; the model + harness + data are threaded in
@@ -422,38 +582,81 @@ def optimize(args: argparse.Namespace) -> None:
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
         if action == "propose":
-            return submit_propose(sched, st["parent_scaffold"], candidate_dir=run_dir / "candidates" / tag,
-                                  frontier_path=frontier_path, summary_path=summary_path,
-                                  diff_dir=run_dir / "diffs" / tag, trials_dir=st["last_eval_dir"],
-                                  logs=logs_dir, tag=tag)
+            return submit_propose(sched, run_root=run_dir, logs=tag_dir(tag) / "logs", tag=tag,
+                                  kind=st["propose_kind"])
         if action == "train":
+            # In model-harness batching, train only runs during the MODEL phase (realize the
+            # sigma-reward over the train cohort + train the model). Harness phase skips it.
+            if do_model_harness and st["propose_kind"] != "model":
+                print(f"  [batch] harness phase ({st['phase_proposed']}/{M_harness}) -> skip train")
+                advance()
+                return None
+            # Model-phase train: realize the candidate's sigma-reward (model/sigma_rewards/*.json)
+            # over the train cohort and train on it. Harness phase has no sigma config.
+            sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
+            sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
             return submit_train(sched, args.trainer, model=model, harness=harness,
-                                out_dir=run_dir / "train" / tag, logs=logs_dir, tag=tag)
-        # out_dir is the harbor jobs-dir; EVAL_JOB_NAME=tag makes the per-iteration subdir,
-        # so trials land at run_dir/eval/<tag>/.
-        return submit_eval(sched, args.task, model=model, harness=harness, data=args.data,
+                                out_dir=tag_dir(tag) / "train", logs=tag_dir(tag) / "logs", tag=tag,
+                                sigma_reward=str(sigma_cfg) if sigma_cfg else None,
+                                train_data=args.train_data)
+        # Trials destination per stage:
+        #   eval_train_sample -> candidates/<tag>/eval/   (the ONE optimizer-visible eval)
+        #   eval_val / eval   -> evaluation/<tag>/         (val accept/reject gate, hidden)
+        data = args.train_data
+        if action == "eval_train_sample":
+            # The train-sample eval is THE one eval the optimizer sees: candidates/<tag>/eval/.
+            # MHO_OUT=candidates/<tag>, EVAL_JOB_NAME=eval -> trials at candidates/<tag>/eval/.
+            eval_out = tag_dir(tag)
+            job_name = "eval"
+            # BOUNDED, fresh-random subset of the full train task dir for the proposer's
+            # improvement signal -- never the whole (often 1000s-problem) train set.
+            seed = int(time.time()) % (2**31)
+            # JIT: the candidate's single sigma config (model/sigma_rewards/<check>.json) applies
+            # to ALL its staged train tasks. Use the first sigma config found there, if any.
+            sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
+            sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
+            data = str(_sample_subset(args.train_data, args.propose_sample,
+                                      run_dir / "samples" / f"{tag}-train_sample", seed,
+                                      sigma_reward=sigma_cfg))
+        else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
+            # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
+            # The accept gate uses the HELD-OUT VAL split (args.val_data), never the train split.
+            data = args.val_data or args.train_data
+            eval_out = run_dir / "evaluation"
+            job_name = tag
+        return submit_eval(sched, "", model=model, harness=harness, data=data,
                            n_trials=args.trials, n_concurrent=args.concurrent,
-                           out_dir=run_dir / "eval", logs=logs_dir, tag=tag)
+                           out_dir=eval_out, logs=tag_dir(tag) / "logs", job_name=job_name)
 
     def on_done(rc: int) -> None:
         """Handle the finished stage's result and advance the cursor."""
         action, tag, it = st["actions"][st["action_index"]], cur_tag(), st["iteration"]
         if action == "propose":
-            cand_dir = run_dir / "candidates" / tag
-            if rc == 0 and (cand_dir / "pyproject.toml").exists():
-                st["scaffold_dir"] = str(cand_dir)
+            kind_now = st["propose_kind"]
+            if kind_now == "model":
+                # Realize model_specs/*.md -> model/sigma_rewards/*.json (idempotent helper;
+                # a crash between "specs written" and "realized" is recovered on resume).
+                st["substep"] = "realize"
+                ok = rc == 0 and realize_model_specs(tag_dir(tag), args.train_data)[0]
+                if ok:
+                    st["substep"] = "done"
+            else:
+                cand_dir = tag_dir(tag) / "harness"
+                ok = rc == 0 and (cand_dir / "pyproject.toml").exists()
+            if ok:
+                st["scaffold_dir"] = str(tag_dir(tag) / "harness") if kind_now != "model" else st["scaffold_dir"]
                 advance()
             else:
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "propose",
-                                              "status": "no_candidate", "rc": rc})
-                print(f"  propose failed (rc={rc}); skipping to next iteration")
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": f"{kind_now}_propose",
+                                              "status": "no_proposal", "rc": rc})
+                print(f"  {kind_now} propose failed (rc={rc}); skipping to next iteration")
                 advance(skip_rest=True)
         elif action == "train":
             if rc == 0:
                 # the freshly-trained checkpoint becomes the model for this iteration's eval.
                 # miles saves HF checkpoints as <out>/checkpoints/hf/step_N (--save-hf); pick the
                 # latest step. If HF export is off/absent, keep the prior model.
-                ckpt = _latest_hf_ckpt(run_dir / "train" / tag / "checkpoints" / "hf")
+                ckpt = _latest_hf_ckpt(tag_dir(tag) / "train" / "checkpoints" / "hf")
                 if ckpt is not None:
                     st["model_dir"] = str(ckpt)
                 advance()
@@ -462,19 +665,37 @@ def optimize(args: argparse.Namespace) -> None:
                                               "status": f"rc={rc}"})
                 print(f"  train failed (rc={rc}); skipping to next iteration")
                 advance(skip_rest=True)
-        else:  # eval (last stage of the iteration)
-            # eval.sh wrote trials to the deterministic MHO_OUT/<tag> = run_dir/eval/<tag>
-            # (job name = tag). Score that dir directly -- not the Ray-session glob.
-            trials_dir = run_dir / "eval" / tag
+        else:  # eval stage (single `eval`, or dual eval_train_sample / eval_val)
+            # eval.sh wrote trials to the deterministic MHO_OUT/<EVAL_JOB_NAME>. For the
+            # single-set `eval` that is run_dir/eval/<tag>; for a dual stage it is
+            # run_dir/eval/<tag>-<stage>. Either way score/record that dir directly.
+            if action == "eval_train_sample":
+                trials_dir = tag_dir(tag) / "eval"
+            else:  # eval_val (dual) or `eval` (single-set): the val accept gate.
+                trials_dir = run_dir / "evaluation" / tag
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
             if rc != 0 or not has_trials:
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "eval",
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "status": f"rc={rc}" if rc else "no_trials",
                                               "trials_dir": str(trials_dir)})
-                print(f"  eval produced no score (rc={rc}, trials={trials_dir})")
+                print(f"  {action} produced no score (rc={rc}, trials={trials_dir})")
+            elif action == "eval_train_sample":
+                # Proposer-signal eval (fresh random subset of the train task): hand its trials
+                # to the next propose for the harness-improvement signal. NO frontier/accept
+                # decision here -- the val-split eval holds that. Record it for the summary.
+                st["last_eval_dir"] = str(trials_dir)
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
+                                              "trials_dir": str(trials_dir)})
+                print(f"  proposer-signal eval recorded trials for next propose: {trials_dir}")
             else:
+                # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)
-                st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
+                # Only the single-set `eval` doubles as the proposer signal (there is no
+                # separate train-sample eval). In dual mode, eval_val is the accept gate and
+                # MUST NOT feed last_eval_dir -- the train-sample eval already did, and the
+                # proposer must never see val trials.
+                if action == "eval":
+                    st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
                 improved = update_frontier(frontier_path, tag, score)
                 if improved and st["scaffold_dir"]:
                     # ACCEPTED: accumulate (next propose builds ON this new best), bump the
@@ -482,6 +703,10 @@ def optimize(args: argparse.Namespace) -> None:
                     st["parent_scaffold"] = st["scaffold_dir"]
                     st["version"] += 1
                     st["try"] = 1
+                    # Persist the best harness so far to <run>/best/harness (overwrite), so the
+                    # accepted scaffold is easy to grab after the optimization run.
+                    shutil.rmtree(run_dir / "best", ignore_errors=True)
+                    shutil.copytree(st["scaffold_dir"], run_dir / "best" / "harness")
                 elif do_propose and st["scaffold_dir"]:
                     # rejected harness attempt (a real candidate) -> another try at same version.
                     # Guard on scaffold_dir so the baseline eval (scaffold_dir=None, improved=True
@@ -490,13 +715,16 @@ def optimize(args: argparse.Namespace) -> None:
                     st["try"] += 1
                 # record WHAT this candidate changed (its CANDIDATE.md), so the next proposer
                 # can learn from the outcome (build on winners, avoid repeating regressions).
-                hypothesis = _candidate_hypothesis(run_dir / "candidates" / tag)
-                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "eval",
+                hypothesis = _candidate_hypothesis(tag_dir(tag) / "harness")
+                append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
                                               "hypothesis": hypothesis})
-                print(f"  {'NEW BEST' if improved else 'no improvement'}  "
-                      f"pass@1={score.get('solved_pass@1')} mean_reward={score.get('mean_reward')}")
+                _cur = json.loads(frontier_path.read_text()).get("_best", {}) if frontier_path.exists() else {}
+                _inc = f"{_cur.get('candidate', 'none')} @ {_cur.get('metric')}"
+                print(f"  {'NEW BEST' if improved else 'no improvement'} {tag}: "
+                      f"pass@1={score.get('solved_pass@1')} mean_reward={score.get('mean_reward')} "
+                      f"| frontier best: {_inc}")
             advance()
 
     # ── The loop: wait on the in-flight job, else submit the current stage. ──
@@ -512,7 +740,19 @@ def optimize(args: argparse.Namespace) -> None:
             on_done(rc if rc is not None else 0)
             _save_state(state_path, st)
             continue
-        # nothing in flight -> submit the current stage (or skip it if unconfigured)
+        if action == "propose" and st["propose_kind"] == "model" and st["substep"] == "realize":
+            # RESUME gate: the propose job already ran and wrote model_specs/*.md, but the
+            # realization (-> model/sigma_rewards/*.json) crashed or never ran. Re-run ONLY
+            # the realization -- do NOT re-submit the whole (expensive) propose job. This is
+            # exactly the case a crash inside propose's on_done left behind.
+            print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} propose realize-substep"
+                  f" pending -> running realization in-line")
+            st["substep"] = "done" if realize_model_specs(tag_dir(cur_tag()), args.train_data)[0] else "realize"
+            if st["substep"] == "done":
+                st["scaffold_dir"] = st["scaffold_dir"] or str(tag_dir(cur_tag()))   # keep marker
+                advance()
+            _save_state(state_path, st)
+            continue
         print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} stage={action} -> submit")
         jid = submit_current()
         if jid is None:  # e.g. propose with MHO_PROPOSE_JOB unset
@@ -530,14 +770,30 @@ def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mode", choices=["model-only", "harness-only", "model-harness"],
                    default="model-harness")
-    p.add_argument("--task", choices=["math", "aime", "tb2"], default="math")
+
     p.add_argument("--trainer", choices=["skyrl", "miles"], default="miles")
     p.add_argument("--model", default=os.environ.get("MHO_MODEL", ""),
                    help="starting model: HF name/local dir (self-served) or a litellm id (API). "
                         "In model modes, each iteration's eval uses the freshly-trained checkpoint instead.")
-    p.add_argument("--data", default=os.environ.get("MHO_DATA", "aime/aime"),
-                   help="eval data: a registry name (e.g. aime/aime -> -d) or a local task/dataset dir (-> -p).")
+    p.add_argument("--train-data", default=os.environ.get("MHO_TRAIN_DATA", "aime/aime"),
+                   help="eval data: a registry name (e.g. aime/aime -> -d) or a local task/dataset dir (-> -p). "
+                        "In dual mode this is the FULL train task dir the proposer's signal samples from.")
+    p.add_argument("--val-data", default=os.environ.get("MHO_VAL_DATA", ""),
+                   help="dual-mode held-out eval set (a local task/dataset dir, e.g. the --val-size "
+                        "val-split). Enables the dual-data harness loop: each iteration evals a fresh "
+                        "random-K subset of --train-data (full train task, for the proposer's improvement "
+                        "signal) AND --val-data (whose score drives accept/frontier). Unset -> the "
+                        "original single-set loop.")
+    p.add_argument("--propose-sample", type=int,
+                   default=int(os.environ.get("MHO_PROPOSE_SAMPLE", 64)),
+                   help="dual-mode only: how many problems to draw (random, fresh each iteration) "
+                        "from the FULL train task dir (--train-data) for the proposer's improvement signal. "
+                        "Keeps a 1000s-problem train set from being eval'd in full. Env: MHO_PROPOSE_SAMPLE.")
     p.add_argument("--iterations", type=int, default=5)
+    p.add_argument("--harness-proposals", type=int, default=int(os.environ.get("MHO_HARNESS_PROPOSALS", 10)),
+                   help="model-harness: # harness proposals in a harness phase before switching to model (M_harness)")
+    p.add_argument("--model-proposals", type=int, default=int(os.environ.get("MHO_MODEL_PROPOSALS", 2)),
+                   help="model-harness: # model proposals in a model phase before switching to harness")
     p.add_argument("--trials", type=int, default=int(os.environ.get("EVAL_N_ATTEMPTS", 5)),
                    help="attempts per problem (harbor --n-attempts): each eval task is sampled "
                         "this many times and pass@1 is the mean solve rate. NOT concurrency. "
@@ -555,6 +811,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "harness-only" and not args.model:
         p.error("harness-only mode needs a fixed model to evaluate the harness against; pass "
                 "--model <HF name/dir or litellm id> (or set MHO_MODEL), e.g. --model Qwen/Qwen3.5-4B")
+    if args.val_data:  # dual mode: the proposer's signal samples come from a LOCAL train dir
+        if not Path(args.train_data).is_dir():
+            p.error("--val-data (dual mode) requires --train-data to be a LOCAL train task dir (a path), "
+                    "because the proposer's signal is a random subset of it; got: " + args.train_data)
+        if args.propose_sample <= 0:
+            p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
     optimize(args)
 
 

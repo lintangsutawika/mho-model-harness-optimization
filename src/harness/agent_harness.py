@@ -135,7 +135,9 @@ class AgentHarness(MiniSweAgent):
                 'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; fi && '
                 'export PATH="$HOME/.local/bin:$PATH" && '
                 f"uv tool install {scaffold_dir} "
-                "--with litellm --with orjson --with fastapi && "
+                # mcp: litellm's response handler imports mcp.types; without it every agent
+                # trial crashes with ModuleNotFoundError. Pin alongside litellm.
+                "--with litellm --with mcp --with orjson --with fastapi && "
                 "mini-swe-agent --help"
             ),
         )
