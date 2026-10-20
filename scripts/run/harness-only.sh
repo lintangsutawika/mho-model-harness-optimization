@@ -7,4 +7,4 @@ cd "$REPO_DIR"
 [ -f .env ] && { set -a; . .env; set +a; }
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 export MHO_PROPOSE_JOB="${MHO_PROPOSE_JOB:-${REPO_DIR}/scripts/optimize/propose.sh}"
-exec python3 "${REPO_DIR}/src/optimize_loop.py" --mode harness-only "$@"
+exec "${REPO_DIR}/.venv/bin/python" "${REPO_DIR}/src/optimize_loop.py" --mode harness-only "$@"

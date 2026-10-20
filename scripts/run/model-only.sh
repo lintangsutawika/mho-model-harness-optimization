@@ -5,5 +5,7 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_DIR"
 [ -f .env ] && { set -a; . .env; set +a; }
-export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
-exec python3 "${REPO_DIR}/src/optimize_loop.py" --mode model-only "$@"
+# model-only proposes a MODEL improvement (sigma), so it needs the proposer job wired (same as
+# the harness modes). Without this the propose step is skipped and no sigma is produced.
+export MHO_PROPOSE_JOB="${MHO_PROPOSE_JOB:-${REPO_DIR}/scripts/optimize/propose.sh}"
+exec "${REPO_DIR}/.venv/bin/python" "${REPO_DIR}/src/optimize_loop.py" --mode model-only "$@"
