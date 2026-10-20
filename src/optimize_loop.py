@@ -495,6 +495,14 @@ def optimize(args: argparse.Namespace) -> None:
 
     st = None if args.fresh else _load_state(state_path)
     if st is None:
+        # Fresh start: reset the acceptance bar + any leftover accepted scaffold so this run
+        # seeds its OWN frontier from its baseline eval. Without this, a `--fresh` restart
+        # inherits a stale frontier _best (acceptance threshold) from a PREVIOUS run instance,
+        # so every candidate is rejected against a bar this run never earned -> version stays
+        # 0 and `try` climbs forever (e.g. candidate_5_0_5 with no accept ever).
+        if frontier_path.exists():
+            frontier_path.unlink()
+        shutil.rmtree(run_dir / "best", ignore_errors=True)
         start = 0 if not args.skip_baseline else 1
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
               "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
