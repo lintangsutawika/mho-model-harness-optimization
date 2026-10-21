@@ -130,6 +130,11 @@ class AgentHarness(MiniSweAgent):
             environment,
             command=(
                 "set -euo pipefail; "
+                # Images that set XDG_DATA_HOME (e.g. swerebenchv2/*: /workspace/.local/share)
+                # make the uv installer and `uv tool install` put binaries in
+                # $XDG_DATA_HOME/../bin, which run() never puts on PATH. Pin them to
+                # $HOME/.local/bin, uv's default when no XDG variable is set.
+                'export XDG_BIN_HOME="$HOME/.local/bin"; '
                 "if ! command -v uv >/dev/null 2>&1; then "
                 "  curl -LsSf https://astral.sh/uv/install.sh | sh; fi && "
                 'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; fi && '
