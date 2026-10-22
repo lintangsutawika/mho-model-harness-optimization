@@ -11,6 +11,7 @@ generation) with a 1-line `__main__.py` for `-m`; `prepare.py` and
 |------|---------|----------|
 | `dapo_math_17k` | `BytedTsinghua-SIA/DAPO-Math-17k` | self-grade: `tests/test.sh` → `reward.txt` (parse `Answer: $A`, normalized) |
 | `hmmt_feb_2025` | `MathArena/hmmt_feb_2025` | self-grade: `tests/test.sh` → `reward.txt` (`math_verify` → sympy → string) |
+| `swe_rebench` | `nebius/SWE-rebench-V2` | self-grade: `tests/test.sh` → `reward.txt` (apply the reference test patch, run the instance's `test_cmd`, resolve only if every `FAIL_TO_PASS` and `PASS_TO_PASS` passes) |
 
 ## Isolation
 
