@@ -1,0 +1,20 @@
+schema_version = "1.4"
+[task]
+name = "{name}"
+[environment]
+docker_image = "{docker_image}"
+network_mode = "public"
+[agent]
+override_timeout_sec = 3600.0
+[verifier]
+environment_mode = "shared"
+[metadata]
+task_family = "SWE-rebench-V2"
+ability = "SWE"
+instance_id = "{instance_id}"
+repo = "{repo}"
+base_commit = "{base_commit}"
+language = "{language}"
+license = {license}
+workdir = "{workdir}"
+log_parser = "{log_parser}"
