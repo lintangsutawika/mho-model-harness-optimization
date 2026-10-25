@@ -1,8 +1,3 @@
-
-# Max times the harness gate re-proposes WITHIN one iteration before giving up
-# and burning the iteration (bounded safety valve).
-MAX_HARNESS_GATE_SKIPS = 5
-
 """MHO optimization loop: a PBS job manager that co-optimizes model (RL) + harness.
 
 This is the long-running *driver*. It does no heavy work itself: each phase --
@@ -39,6 +34,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Max times the harness gate re-proposes WITHIN one iteration before giving up
+# and burning the iteration (bounded safety valve).
+MAX_HARNESS_GATE_SKIPS = 5
+
+# Max times the harness gate re-proposes WITHIN one iteration before giving up
+# and burning the iteration (bounded safety valve).
+MAX_HARNESS_GATE_SKIPS = 5
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = Path(os.environ.get("MHO_RUNS_DIR", REPO_DIR / "runs_output" / "optimize"))
@@ -480,6 +483,55 @@ def _save_state(path: Path, st: dict) -> None:
     path.write_text(json.dumps(st, indent=2))
 
 
+def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict | None:
+    """Return a state override {rebuilt iteration/version/try/action} to resume at the
+    earliest candidate whose artifacts are incomplete, or None if the disk is consistent
+    (no incomplete candidate) and state.json should be trusted.
+
+    Completeness (mirrors the loop): a candidate is COMPLETE once its train-sample eval
+    (candidates/<tag>/eval) AND the held-out val eval (evaluation/<tag>) both produced
+    results. Anything with a harness but missing either is INCOMPLETE (crashed/skipped/
+    killed) and the run should pick back up there.
+    """
+    cands = sorted(
+        (d for d in candidates_dir.glob("candidate_*") if d.is_dir()),
+        key=lambda d: d.name,
+    )
+    for d in cands:
+        tag = d.name
+        # no harness -> still proposing this candidate, nothing to resume into yet
+        if not (d / "harness").is_dir():
+            continue
+        # INCOMPLETE = has a harness but no scored held-out/accept eval. The val/accept
+        # eval (evaluation/<tag>) is the definitive 'verified' marker. The train-sample
+        # `eval` dir is dual-mode-only and legitimately absent for older candidates.
+        has_val = (evaluation_dir / tag).is_dir() and any((evaluation_dir / tag).glob("*/result.json"))
+        if not has_val:
+            parts = tag.split("_")  # candidate_<iter>_<version>_<try>
+            try:
+                iteration = int(parts[1])
+                version = int(parts[2])
+                try_n = int(parts[3])
+            except (ValueError, IndexError):
+                iteration = version = 0
+                try_n = 1
+            # Train-sample eval (candidates/<tag>/eval) may or may not have run; if it has
+            # results we are mid eval_val, else resume with eval_train_sample first.
+            has_ts = (d / "eval").is_dir() and any((d / "eval").glob("*/result.json"))
+            action = "eval_val" if has_ts else "eval_train_sample"
+            return {
+                "iteration": iteration,
+                "version": version,
+                "try": try_n,
+                "actions": ["eval_val", "eval_train_sample"] if action == "eval_val"
+                            else ["eval_train_sample", "eval_val"],
+                "action_index": 0,
+                "resumed_tag": tag,
+                "resume_action": action,
+            }
+    return None
+
+
 def optimize(args: argparse.Namespace) -> None:
     run_id = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / run_id
@@ -530,6 +582,21 @@ def optimize(args: argparse.Namespace) -> None:
     else:
         print(f"{datetime.now():%H:%M:%S} MHO optimize  RESUME run={run_id}  iter={st['iteration']}  "
               f"action={st['actions'][st['action_index']]}  job={st['job_id']}  scheduler={sched.kind}")
+
+        # Disk-scan reconciliation: if state.json's pointer is ahead of the first
+        # INCOMPLETE candidate on disk (crashed/skipped/killed val eval), resume THERE
+        # instead of trusting the (possibly drift-shifted) iteration counter.
+        cand_dir = run_dir / "candidates"
+        if cand_dir.is_dir():
+            over = _resume_from_incomplete(cand_dir, run_dir / "evaluation")
+            if over is not None:
+                old_iter = st["iteration"]
+                st.update(over)
+                if st["iteration"] < old_iter:
+                    print(f"  resume reconcile: state was at iter {old_iter} but "
+                          f"{st['resumed_tag']} is incomplete ({st['resume_action']} missing) -> "
+                          f"resume at iter {st['iteration']}, action {st['actions'][0]}")
+                    _save_state(state_path, st)
         # Backward-compat: older state.json has no propose-substep cursor. Default it so the
         # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
         st.setdefault("substep", "none")
