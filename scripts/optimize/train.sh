@@ -130,6 +130,7 @@ if [ -d "${HF_MODEL}" ]; then
   HF_DIR="$(dirname "${HF_MODEL}")"
 else
   echo "[miles] ensuring full HF snapshot for ${HF_MODEL}"
+  echo [train-env] HARBOR_ENV_TYPE="${HARBOR_ENV_TYPE:-(unset)}" MODAL_CONFIG_PATH="${MODAL_CONFIG_PATH:-(unset)}"
   singularity exec \
     --bind "${HF_DIR}:/root/.cache/huggingface" \
     --env HF_HOME=/root/.cache/huggingface \
@@ -150,13 +151,15 @@ singularity exec --nv \
   --bind "${HARBOR_TASKS_DIR}:${HARBOR_TASKS_DIR}" \
   --bind "${SAVE_DIR}:${SAVE_DIR}" \
   --bind "${REPO_DIR}/src/run_training.py:/root/miles/examples/experimental/harbor/run.py" \
+  --bind "${REPO_DIR}/src/launch_common.py:/root/miles/examples/experimental/harbor/launch_common.py" \
   --env TMPDIR=/tmp_work \
   --env HF_HOME=/root/.cache/huggingface \
-  --env PYTHONPATH="${REPO_DIR}/src" \
+  --env PYTHONPATH="${REPO_DIR}/src:/home/aci18914wh/executor_env/.venv/lib/python3.12/site-packages:${REPO_DIR}/.venv/lib/python3.12/site-packages" \
   --env MICRO_SCAFFOLD_DIR="${MICRO_SCAFFOLD_DIR:-}" \
   --env MINI_FORK_LOCAL="${MINI_FORK_LOCAL:-}" \
   --env MILES_SAVE_HF="${SAVE_HF}" \
   --env HARBOR_ENV_TYPE="${HARBOR_ENV_TYPE:-singularity}" \
+  --env MODAL_CONFIG_PATH="${MODAL_CONFIG_PATH:-/home/aci18914wh/.modal.toml}" \
   --env HARBOR_TASKS_DIR="${HARBOR_TASKS_DIR}" \
   --env HARBOR_TRIALS_DIR="${RUN_DIR}/harbor_trials" \
   --env EXECUTOR_URL="${EXECUTOR_URL}" \

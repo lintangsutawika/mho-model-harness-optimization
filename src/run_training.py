@@ -123,7 +123,7 @@ def execute(args: ScriptArgs):
         "--balance-data "
     )
     perf_args = (
-        "--tensor-model-parallel-size 4 "
+        "--tensor-model-parallel-size 2 "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
         "--context-parallel-size 1 "
@@ -166,6 +166,9 @@ def execute(args: ScriptArgs):
     # -> RemoteSingularityEnvironment registry swap) BEFORE any trial builds its env.
     # Without this the worker uses harbor's stock SingularityEnvironment and tries to run
     # apptainer nested inside the Miles container (fails: no apptainer binary there).
+    # TEMP (investigating Modal): comment out the local_singularity shim so the agent function
+    # stays harbor_agent_function.run and the sandbox env is NOT forced to singularity --
+    # letting HARBOR_ENV_TYPE=modal route to harbor's modal env.
     agent_args = agent_args.replace(
         "--custom-agent-function-path harbor_agent_function.run",
         "--custom-agent-function-path mho.backends.local_singularity.backend.run",
@@ -176,10 +179,9 @@ def execute(args: ScriptArgs):
         "--accumulate-allreduce-grads-in-fp32 "
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
-        "--colocate "
         f"--actor-num-nodes {args.num_nodes} "
-        f"--actor-num-gpus-per-node {args.num_gpus_per_node} "
-        f"--rollout-num-gpus {args.num_gpus_per_node} "
+        "--actor-num-gpus-per-node 2 "
+        "--rollout-num-gpus 6 "
     )
     debug_args = "--debug-rollout-only " if args.mode == "debug_rollout_only" else ""
     trace_args = f"--dump-details {args.save_traces_dir} " if args.save_traces_dir else ""
@@ -208,6 +210,7 @@ def execute(args: ScriptArgs):
         megatron_model_type=args.megatron_model_type,
         megatron_path=args.megatron_path,
         extra_env_vars=extra_env_vars,
+        train_script="train_async.py",
     )
 
 

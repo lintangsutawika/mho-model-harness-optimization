@@ -119,6 +119,7 @@ class RemoteSingularityEnvironment(SingularityEnvironment):
                 "singularity_image_cache_dir": str(self._image_cache_dir),
                 "singularity_no_mount": self._singularity_no_mount,
                 "singularity_force_pull": self._force_pull,
+                "singularity_writable_sandbox": True,
             },
         }
 
@@ -182,6 +183,9 @@ def _install_registry_swap() -> None:
 
 
 _install_registry_swap()
+# Arm the AgentFactory swap (mini-swe-agent -> our MicroSweAgent, whose install adds
+# --with mcp so litellm's mcp.types import resolves). Importing runs the idempotent swap.
+import harness.micro_swe_agent  # noqa: E402,F401
 
 # --------------------------------------------------------------------------- #
 # Miles connector hook: re-export the agent function and be the --custom-agent-function-path.

@@ -110,9 +110,15 @@ def _dockerfile_to_def(dockerfile: Path) -> str:
         if not line or line.startswith("#") or line.upper().startswith("FROM ") or line.upper().startswith("WORKDIR"):
             flush(); continue
         if line.upper().startswith("RUN "):
-            flush(); current = [line[4:].strip()]
-            while lines and lines[i-1].rstrip().endswith("\\") and i < len(lines):
-                current.append(lines[i].strip()); i += 1
+            flush()
+            # Fold backslash continuations, dropping each trailing `\` so the %post line is one
+            # clean command (no literal backslashes that apt/bash mis-parse).
+            parts = [line[4:].strip()]
+            while parts[-1].endswith("\\") and i < len(lines):
+                parts[-1] = parts[-1][:-1].rstrip()
+                parts.append(lines[i].strip()); i += 1
+            if parts and not parts[-1].endswith("\\"):
+                posts.append(" ".join(p for p in parts if p))
             flush()
         elif line.upper().startswith("ENV "):
             envs.append(line[4:].strip())
@@ -134,7 +140,11 @@ def prebuild_sif(dockerfile: Path, out_sif: Path, *,
         print(f"[prebuild] {out_sif.name} exists; skipping (--prebuild-force to rebuild)")
         return out_sif
     out_sif.parent.mkdir(parents=True, exist_ok=True)
-    base_image = "python:3.11-slim"
+    # The Singularity base is taken SOLELY from the Dockerfile's FROM (no hardcoded default).
+    # A Dockerfile that says `FROM scratch` builds an empty image with no python3, which breaks
+    # harbor's sandbox bootstrap ([ ! -x /usr/bin/python3 ] -> cannot install). The task recipe
+    # must specify a real python base (e.g. FROM python:3.11-slim), and that is honored verbatim.
+    base_image = ""
     try:
         for raw in dockerfile.read_text().splitlines():
             line = raw.strip()
@@ -144,14 +154,25 @@ def prebuild_sif(dockerfile: Path, out_sif: Path, *,
                 break
     except OSError:
         pass
+    if not base_image:
+        raise ValueError(
+            f"prebuild_sif: {dockerfile} has no FROM line. The sif base must come from the "
+            f"Dockerfile (e.g. FROM python:3.11-slim), not a hardcoded default.")
     fragment = _dockerfile_to_def(dockerfile)
     def_path = out_sif.with_name(out_sif.name + ".def")
+    # The sif is defined ENTIRELY by the task's Dockerfile (its FROM base + the translated
+    # RUN/COPY/ENV layers as %post). No hardcoded %post here: the Dockerfile is the single
+    # source of truth for the sandbox runtime (python base, uvicorn/fastapi, agent tools), so
+    # any task built from its own Dockerfile yields a self-contained, offline-capable image.
     def_lines = ["Bootstrap: docker", f"From: {base_image}", ""]
     if fragment:
         def_lines.append(fragment)
     def_path.write_text("\n".join(def_lines))
-    subprocess.run([container_bin, "build", "--fakeroot", str(out_sif), str(def_path)],
-                   check=True, cwd=str(dockerfile.parent))
+    singular_cmd = [container_bin, "build", "--fakeroot"]
+    if force:
+        singular_cmd.append("--force")   # singularity build refuses to overwrite an existing .sif
+    singular_cmd += [str(out_sif), str(def_path)]
+    subprocess.run(singular_cmd, check=True, cwd=str(dockerfile.parent))
     print(f"[prebuild] built {out_sif}")
     return out_sif
 

@@ -17,7 +17,7 @@ config/mini.yaml, tools/, agents/default.py), which the meta-loop mutates. This 
 pure plumbing and is identical for every candidate.
 
 Run it:
-    harbor run --agent src.harness.agent_harness:AgentHarness \
+    harbor run --agent src.harness.micro_swe_agent:MicroSweAgent \
         --ak mini_fork_local=runs/run_<id>/candidate_<id>/micro-swe-agent -d terminal-bench@2.0 ...
     # or set MICRO_SCAFFOLD_DIR in the env instead of --ak mini_fork_local=...
 """
@@ -38,12 +38,12 @@ from harbor.models.agent.context import AgentContext
 # Where the snapshot is uploaded inside the sandbox.
 _SCAFFOLD_SANDBOX_DIR = "/tmp/micro-scaffold"
 # Repo root, used to resolve a relative snapshot path (e.g. "runs/run_x/candidate_y/...").
-# agent_harness.py is at <repo>/src/harness/ (3 levels); parents[2] = repo root, so a
+# micro_swe_agent.py is at <repo>/src/harness/ (3 levels); parents[2] = repo root, so a
 # relative mini_fork_local resolves against the repo, not <repo>/src.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class AgentHarness(MiniSweAgent):
+class MicroSweAgent(MiniSweAgent):
     """mini-swe-agent whose install step ships a local micro snapshot into the sandbox."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -203,3 +203,28 @@ class AgentHarness(MiniSweAgent):
             }
         ]
         context.metadata = {**(context.metadata or {}), "n_episodes": n_turns}
+# --------------------------------------------------------------------------- #
+# Register our MicroSweAgent as the "mini-swe-agent" agent (custom-agent path).
+#
+# harbor's AgentFactory maps AgentName -> an import path; we repoint the
+# MINI_SWE_AGENT entry at OUR MicroSweAgent subclass, whose install() adds
+# `--with mcp` (litellm imports mcp.types; the stock install lacks it and every
+# agent crashes with ModuleNotFoundError: mcp) plus the local micro snapshot.
+# Importing this module arms the swap once, mirroring the local_singularity env
+# registry-swap pattern. Runs idempotently.
+# --------------------------------------------------------------------------- #
+def _install_agent_swap() -> None:
+    from harbor.agents.factory import AgentFactory
+    from harbor.models.agent.name import AgentName
+    try:
+        if AgentFactory._AGENT_MAP[AgentName.MINI_SWE_AGENT].endswith("MicroSweAgent"):
+            return  # already swapped
+    except (KeyError, AttributeError):
+        pass
+    AgentFactory._AGENT_MAP[AgentName.MINI_SWE_AGENT] = (
+        "harness.micro_swe_agent:MicroSweAgent"
+    )
+
+_install_agent_swap()
+
+__all__ = ["MicroSweAgent", "_install_agent_swap"]

@@ -47,7 +47,7 @@ TRAIN_SCRIPT = Path(os.environ.get("MHO_TRAIN_SCRIPT", REPO_DIR / "scripts" / "o
 # it at scripts/optimize/propose.sh). Absent -> the harness phase is skipped (model-only runs).
 PROPOSE_JOB = os.environ.get("MHO_PROPOSE_JOB", "")
 
-AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.agent_harness:AgentHarness")
+AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.micro_swe_agent:MicroSweAgent")
 POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
 
 
@@ -511,6 +511,7 @@ def optimize(args: argparse.Namespace) -> None:
               "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
+              "last_ts_score": None,     # prior eval_train_sample mean_reward (harness gate)
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -685,9 +686,29 @@ def optimize(args: argparse.Namespace) -> None:
                 # to the next propose for the harness-improvement signal. NO frontier/accept
                 # decision here -- the val-split eval holds that. Record it for the summary.
                 st["last_eval_dir"] = str(trials_dir)
+                ts_score = score_trials(trials_dir).get("mean_reward") or 0.0
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
-                                              "trials_dir": str(trials_dir)})
-                print(f"  proposer-signal eval recorded trials for next propose: {trials_dir}")
+                                              "trials_dir": str(trials_dir),
+                                              "mean_reward": ts_score})
+                # HARNESS-ONLY gate: if this harness candidate did not beat the prior
+                # train-sample score, skip the expensive eval_val and re-propose directly.
+                # NEVER gate model candidates (trained checkpoints must be val-verified,
+                # and a trained model cannot be cheaply re-run).
+                if st["propose_kind"] == "harness":
+                    prior = st.get("last_ts_score") or 0.0
+                    improved = ts_score > prior
+                    st["last_ts_score"] = ts_score
+                    if not improved:
+                        print(f"  harness train-sample no improvement "
+                              f"({ts_score:.4f} <= prior {prior:.4f}); skipping eval_val, re-propose")
+                        advance(skip_rest=True)
+                    else:
+                        print(f"  harness train-sample improved ({ts_score:.4f} > {prior:.4f}); "
+                              f"proceeding to eval_val")
+                        advance()
+                else:
+                    st["last_ts_score"] = ts_score
+                    advance()
             else:
                 # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)
