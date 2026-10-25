@@ -1,3 +1,8 @@
+
+# Max times the harness gate re-proposes WITHIN one iteration before giving up
+# and burning the iteration (bounded safety valve).
+MAX_HARNESS_GATE_SKIPS = 5
+
 """MHO optimization loop: a PBS job manager that co-optimizes model (RL) + harness.
 
 This is the long-running *driver*. It does no heavy work itself: each phase --
@@ -573,6 +578,22 @@ def optimize(args: argparse.Namespace) -> None:
         else:
             st["action_index"] += 1
         st["substep"] = "none"   # a new stage begins fresh; propose re-arms it when it submits
+    def _repropose_same_iter() -> None:
+        """Harness gate: re-propose within the SAME iteration (skip eval_val, do NOT
+        bump iteration so skipped candidates do not burn the --iterations budget).
+        Capped by MAX_HARNESS_GATE_SKIPS; past the cap fall back to advancing."""
+        st["try"] += 1
+        skips = st.get("gate_skips", 0) + 1
+        st["gate_skips"] = skips
+        if skips > MAX_HARNESS_GATE_SKIPS:
+            st["gate_skips"] = 0
+            print(f"  harness gate skip cap ({MAX_HARNESS_GATE_SKIPS}) hit; moving to next iteration")
+            advance(skip_rest=True)
+            return
+        st["actions"] = ["propose"]
+        st["action_index"] = 0
+        st["substep"] = "none"
+        print(f"  harness gate: re-propose within iteration {st['iteration']} (try {st['try']})")
 
     def submit_current() -> str | None:
         # The loop initiates each stage; the model + harness + data are threaded in
@@ -688,7 +709,7 @@ def optimize(args: argparse.Namespace) -> None:
                 if action == "eval_train_sample" and st["propose_kind"] == "harness":
                     print("  harness train-sample produced no score; skipping eval_val, re-propose")
                     st["last_ts_score"] = st.get("last_ts_score") or 0.0
-                    advance(skip_rest=True)
+                    _repropose_same_iter()
             elif action == "eval_train_sample":
                 # Proposer-signal eval (fresh random subset of the train task): hand its trials
                 # to the next propose for the harness-improvement signal. NO frontier/accept
@@ -709,7 +730,7 @@ def optimize(args: argparse.Namespace) -> None:
                     if not improved:
                         print(f"  harness train-sample no improvement "
                               f"({ts_score:.4f} <= prior {prior:.4f}); skipping eval_val, re-propose")
-                        advance(skip_rest=True)
+                        _repropose_same_iter()
                     else:
                         print(f"  harness train-sample improved ({ts_score:.4f} > {prior:.4f}); "
                               f"proceeding to eval_val")
