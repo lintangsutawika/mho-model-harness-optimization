@@ -681,6 +681,14 @@ def optimize(args: argparse.Namespace) -> None:
                                               "status": f"rc={rc}" if rc else "no_trials",
                                               "trials_dir": str(trials_dir)})
                 print(f"  {action} produced no score (rc={rc}, trials={trials_dir})")
+                # HARNESS-ONLY: a train-sample eval that produced no score is NOT a verified
+                # improvement -- skip the expensive eval_val and re-propose instead of
+                # wasting ~3h verifying a candidate that gave the proposer no signal.
+                # Never for model candidates (trained models must be val-verified).
+                if action == "eval_train_sample" and st["propose_kind"] == "harness":
+                    print("  harness train-sample produced no score; skipping eval_val, re-propose")
+                    st["last_ts_score"] = st.get("last_ts_score") or 0.0
+                    advance(skip_rest=True)
             elif action == "eval_train_sample":
                 # Proposer-signal eval (fresh random subset of the train task): hand its trials
                 # to the next propose for the harness-improvement signal. NO frontier/accept
