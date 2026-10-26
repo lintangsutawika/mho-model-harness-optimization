@@ -596,22 +596,22 @@ def optimize(args: argparse.Namespace) -> None:
         cand_dir = run_dir / "candidates"
         if cand_dir.is_dir():
             over = _resume_from_incomplete(cand_dir, run_dir / "evaluation")
-            if over is not None:
+            if over is not None and over["iteration"] < st["iteration"]:
+                # Only reconcile BACK: the found incomplete candidate is at a LOWER
+                # iteration than the current state, so resume there. NEVER force the
+                # iteration forward to a stale on-disk candidate (which is what broke the
+                # user's manual reset to e.g. iter 5 -> jumped to 9).
                 old_iter = st["iteration"]
                 st.update(over)
-                if st["iteration"] < old_iter:
-                    # Backing up to an unfinished candidate: the pending job_id (and any
-                    # job-scoped cursors) belong to the OLD ahead-candidate, not the one we
-                    # resume. Clear them so the loop submits a FRESH job for the resumed action
-                    # instead of attributing the stale job (which would wrongly score "no
-                    # result" and skip the missing eval).
-                    st["job_id"] = None
-                    st["last_eval_dir"] = None
-                    st["substep"] = "none"
-                    print(f"  resume reconcile: state was at iter {old_iter} but "
-                          f"{st['resumed_tag']} is incomplete ({st['resume_action']} missing) -> "
-                          f"resume at iter {st['iteration']}, action {st['actions'][0]}")
-                    _save_state(state_path, st)
+                # The pending job_id/cursors belong to the OLD ahead-candidate, not the one
+                # we resume; clear them so the loop submits a FRESH job.
+                st["job_id"] = None
+                st["last_eval_dir"] = None
+                st["substep"] = "none"
+                print(f"  resume reconcile: state was at iter {old_iter} but "
+                      f"{st['resumed_tag']} is incomplete ({st['resume_action']} missing) -> "
+                      f"resume at iter {st['iteration']}, action {st['actions'][0]}")
+                _save_state(state_path, st)
         # Backward-compat: older state.json has no propose-substep cursor. Default it so the
         # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
         st.setdefault("substep", "none")
