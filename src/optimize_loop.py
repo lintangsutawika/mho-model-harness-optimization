@@ -940,6 +940,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--concurrent", type=int, default=int(os.environ.get("EVAL_CONCURRENCY", 16)),
                    help="trials run in parallel (harbor -n). Pure throughput; does not affect the "
                         "score. Bounded by GPU serving capacity. Env override: EVAL_CONCURRENCY.")
+    p.add_argument("--ts-repropose-limit", type=int,
+                   default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 3)),
+                   help="Max consecutive train-sample failures (T_B < T_A on the same subset) "
+                        "before giving up on this harness/subset and moving to a fresh subset.",
+                   metavar="N")
     p.add_argument("--run-name", default=None, help="stable name so a killed run can resume its state.json")
     p.add_argument("--skip-baseline", action="store_true")
     p.add_argument("--fresh", action="store_true", help="ignore any existing state.json and restart the run")
