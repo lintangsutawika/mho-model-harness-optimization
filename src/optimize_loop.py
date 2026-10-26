@@ -576,6 +576,7 @@ def optimize(args: argparse.Namespace) -> None:
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
               "last_ts_score": None,     # prior eval_train_sample mean_reward (harness gate)
+"ts_baseline": None,      # first eval_train_sample mean_reward (harness gate baseline)
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -806,7 +807,12 @@ def optimize(args: argparse.Namespace) -> None:
                 # NEVER gate model candidates (trained checkpoints must be val-verified,
                 # and a trained model cannot be cheaply re-run).
                 if st["propose_kind"] == "harness":
-                    prior = st.get("last_ts_score") or 0.0
+                    # Baseline = the FIRST candidate's train-sample score, so the gate has a
+                    # real bar (not a trivially-true "improved > 0.0" on the first candidate).
+                    if st.get("ts_baseline") is None:
+                        st["ts_baseline"] = ts_score
+                    prior = st.get("last_ts_score") if st.get("last_ts_score") is not None else (
+                        st.get("ts_baseline") or 0.0)
                     improved = ts_score > prior
                     st["last_ts_score"] = ts_score
                     if not improved:
