@@ -593,6 +593,14 @@ def optimize(args: argparse.Namespace) -> None:
                 old_iter = st["iteration"]
                 st.update(over)
                 if st["iteration"] < old_iter:
+                    # Backing up to an unfinished candidate: the pending job_id (and any
+                    # job-scoped cursors) belong to the OLD ahead-candidate, not the one we
+                    # resume. Clear them so the loop submits a FRESH job for the resumed action
+                    # instead of attributing the stale job (which would wrongly score "no
+                    # result" and skip the missing eval).
+                    st["job_id"] = None
+                    st["last_eval_dir"] = None
+                    st["substep"] = "none"
                     print(f"  resume reconcile: state was at iter {old_iter} but "
                           f"{st['resumed_tag']} is incomplete ({st['resume_action']} missing) -> "
                           f"resume at iter {st['iteration']}, action {st['actions'][0]}")
