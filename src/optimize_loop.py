@@ -427,6 +427,10 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     acts: list[str] = []
     # Propose step: harness-modes propose a harness edit (do_propose). Model-only, which trains
     # the model, ALSO proposes -- a MODEL proposal (sigma), so model improvement produces sigma.
+    if dual and do_propose:
+        # Approved flow: eval current harness (A) on a fixed subset, propose B, eval B on the
+        # SAME subset, then (only if B beats A) the val accept gate.
+        return ["eval_train_sample", "propose", "eval_train_sample", "eval_val"]
     if do_propose or do_train:
         acts.append("propose")
     if do_train:
@@ -576,7 +580,11 @@ def optimize(args: argparse.Namespace) -> None:
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
               "last_ts_score": None,     # prior eval_train_sample mean_reward (harness gate)
-"ts_baseline": None,      # first eval_train_sample mean_reward (harness gate baseline)
+              "ts_baseline": None,      # first eval_train_sample mean_reward (harness gate baseline)
+              "train_subset": None,     # FIXED train subset dir for this iteration (A and B compare on it)
+              "eval_phase": None,       # None | "base" (eval harness A) | "cand" (eval proposed B)
+              "ts_A": None,             # harness A's train-sample score on the fixed subset (gate bar)
+              "ts_repropose_limit": max(1, int(getattr(args, "ts_repropose_limit", 3))),
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -649,6 +657,12 @@ def optimize(args: argparse.Namespace) -> None:
         """
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
             st["iteration"] += 1
+            # New iteration -> a FRESH train subset for the harness-gate compare (the previous
+            # iteration's fixed subset/phase/bar are per-iteration only).
+            st["train_subset"] = None
+            st["eval_phase"] = None
+            st["ts_A"] = None
+            st["ts_try"] = 0
             if do_model_harness:
                 st["phase_proposed"] += 1
                 M_cur = M_harness if st["propose_kind"] == "harness" else M_model
@@ -714,16 +728,23 @@ def optimize(args: argparse.Namespace) -> None:
             # MHO_OUT=candidates/<tag>, EVAL_JOB_NAME=eval -> trials at candidates/<tag>/eval/.
             eval_out = tag_dir(tag)
             job_name = "eval"
-            # BOUNDED, fresh-random subset of the full train task dir for the proposer's
-            # improvement signal -- never the whole (often 1000s-problem) train set.
-            seed = int(time.time()) % (2**31)
             # JIT: the candidate's single sigma config (model/sigma_rewards/<check>.json) applies
             # to ALL its staged train tasks. Use the first sigma config found there, if any.
             sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
             sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
-            data = str(_sample_subset(args.train_data, args.propose_sample,
-                                      run_dir / "samples" / f"{tag}-train_sample", seed,
-                                      sigma_reward=sigma_cfg))
+            # FIXED subset per iteration: the "base" eval (harness A) samples ONE subset and
+            # stores it; the "cand" eval (proposed B) REUSES the same subset so T_A and T_B
+            # are apples-to-apples. Fresh subset on the next iteration (cleared at advance).
+            if st.get("eval_phase") == "base" or st.get("train_subset") is None:
+                seed = int(time.time()) % (2**31)
+                st["train_subset"] = str(_sample_subset(
+                    args.train_data, args.propose_sample,
+                    run_dir / "samples" / f"{tag}-train_sample", seed,
+                    sigma_reward=sigma_cfg))
+                st["eval_phase"] = "base"
+            else:
+                st["eval_phase"] = "cand"
+            data = st["train_subset"]
         else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
             # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
             # The accept gate uses the HELD-OUT VAL split (args.val_data), never the train split.
@@ -794,37 +815,52 @@ def optimize(args: argparse.Namespace) -> None:
                     st["last_ts_score"] = st.get("last_ts_score") or 0.0
                     _repropose_same_iter()
             elif action == "eval_train_sample":
-                # Proposer-signal eval (fresh random subset of the train task): hand its trials
-                # to the next propose for the harness-improvement signal. NO frontier/accept
-                # decision here -- the val-split eval holds that. Record it for the summary.
                 st["last_eval_dir"] = str(trials_dir)
                 ts_score = score_trials(trials_dir).get("mean_reward") or 0.0
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir),
                                               "mean_reward": ts_score})
-                # HARNESS-ONLY gate: if this harness candidate did not beat the prior
-                # train-sample score, skip the expensive eval_val and re-propose directly.
-                # NEVER gate model candidates (trained checkpoints must be val-verified,
-                # and a trained model cannot be cheaply re-run).
                 if st["propose_kind"] == "harness":
-                    # Baseline = the FIRST candidate's train-sample score, so the gate has a
-                    # real bar (not a trivially-true "improved > 0.0" on the first candidate).
-                    if st.get("ts_baseline") is None:
-                        st["ts_baseline"] = ts_score
-                    prior = st.get("last_ts_score") if st.get("last_ts_score") is not None else (
-                        st.get("ts_baseline") or 0.0)
-                    improved = ts_score > prior
-                    st["last_ts_score"] = ts_score
-                    if not improved:
-                        print(f"  harness train-sample no improvement "
-                              f"({ts_score:.4f} <= prior {prior:.4f}); skipping eval_val, re-propose")
-                        _repropose_same_iter()
-                    else:
-                        print(f"  harness train-sample improved ({ts_score:.4f} > {prior:.4f}); "
-                              f"proceeding to eval_val")
+                    phase = st.get("eval_phase") or "base"
+                    if phase == "base":
+                        # Harness A on the fixed subset -> store the gate bar, go propose B.
+                        st["ts_A"] = ts_score
+                        st["eval_phase"] = "cand"
+                        st.setdefault("ts_try", 0)
+                        print(f"  harness base train-sample (A) = {ts_score:.4f}; propose B")
                         advance()
+                    else:
+                        # Proposed B on the SAME subset: improved over A -> verify on eval_val.
+                        tA = st.get("ts_A")
+                        if tA is None or ts_score > tA:
+                            print(f"  harness candidate train-sample improved "
+                                  f"({ts_score:.4f} > {tA if tA is not None else 0.0:.4f}); "
+                                  f"proceeding to eval_val")
+                            advance()          # eval_val (or end of actions)
+                        else:
+                            # B did not beat A on this subset -> re-propose from A (same subset)
+                            # up to ts_repropose_limit consecutive failures, then fresh subset.
+                            st["ts_try"] = st.get("ts_try", 0) + 1
+                            lim = st.get("ts_repropose_limit", 3)
+                            if st["ts_try"] < lim:
+                                print(f"  harness candidate train-sample no improvement "
+                                      f"({ts_score:.4f} <= {tA:.4f}); re-propose same subset "
+                                      f"(try {st['ts_try']}/{lim})")
+                                st["actions"] = ["propose"]
+                                st["action_index"] = 0
+                                st["substep"] = "none"
+                                st["eval_phase"] = "cand"
+                            else:
+                                # gave up on A/this subset -> fresh subset next iteration.
+                                print(f"  harness candidate failed {lim}x on this subset; "
+                                      f"fresh subset next iteration")
+                                st["ts_try"] = 0
+                                st["train_subset"] = None
+                                st["eval_phase"] = None
+                                st["ts_A"] = None
+                                advance(skip_rest=True)
                 else:
-                    st["last_ts_score"] = ts_score
+                    # model candidate: never gate, always continue.
                     advance()
             else:
                 # eval_val (dual) or the single-set `eval`: score + frontier + accept.
