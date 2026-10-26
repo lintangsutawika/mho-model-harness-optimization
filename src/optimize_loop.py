@@ -35,6 +35,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Max times the harness gate re-proposes WITHIN one iteration before giving up
+# and burning the iteration (bounded safety valve).
+MAX_HARNESS_GATE_SKIPS = 5
+
+# Max times the harness gate re-proposes WITHIN one iteration before giving up
+# and burning the iteration (bounded safety valve).
+MAX_HARNESS_GATE_SKIPS = 5
+
 REPO_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = Path(os.environ.get("MHO_RUNS_DIR", REPO_DIR / "runs_output" / "optimize"))
 AGGREGATE_PY = REPO_DIR / "scripts" / "optimize" / "aggregate_results.py"
@@ -47,7 +55,7 @@ TRAIN_SCRIPT = Path(os.environ.get("MHO_TRAIN_SCRIPT", REPO_DIR / "scripts" / "o
 # it at scripts/optimize/propose.sh). Absent -> the harness phase is skipped (model-only runs).
 PROPOSE_JOB = os.environ.get("MHO_PROPOSE_JOB", "")
 
-AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.agent_harness:AgentHarness")
+AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.micro_swe_agent:MicroSweAgent")
 POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
 
 
@@ -197,6 +205,7 @@ def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) 
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
     frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
     frontier_path.write_text(json.dumps(frontier, indent=2))
+    return improved
 
 def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
     """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
@@ -474,6 +483,62 @@ def _save_state(path: Path, st: dict) -> None:
     path.write_text(json.dumps(st, indent=2))
 
 
+def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict | None:
+    """Return a state override {rebuilt iteration/version/try/action} to resume at the
+    earliest candidate whose artifacts are incomplete, or None if the disk is consistent
+    (no incomplete candidate) and state.json should be trusted.
+
+    Completeness (mirrors the loop): a candidate is COMPLETE once its train-sample eval
+    (candidates/<tag>/eval) AND the held-out val eval (evaluation/<tag>) both produced
+    results. Anything with a harness but missing either is INCOMPLETE (crashed/skipped/
+    killed) and the run should pick back up there.
+    """
+    def _tag_iter(name: str) -> int:
+        # candidate_<iter>_<version>_<try> -> numeric iteration (candidate_10 > candidate_9)
+        try:
+            return int(name.split("_")[1])
+        except (ValueError, IndexError):
+            return 0
+
+    cands = sorted(
+        (d for d in candidates_dir.glob("candidate_*") if d.is_dir()),
+        key=lambda d: _tag_iter(d.name),
+    )
+    for d in cands:
+        tag = d.name
+        # no harness -> still proposing this candidate, nothing to resume into yet
+        if not (d / "harness").is_dir():
+            continue
+        # INCOMPLETE = has a harness but no scored held-out/accept eval. The val/accept
+        # eval (evaluation/<tag>) is the definitive 'verified' marker. The train-sample
+        # `eval` dir is dual-mode-only and legitimately absent for older candidates.
+        has_val = (evaluation_dir / tag).is_dir() and any((evaluation_dir / tag).glob("*/result.json"))
+        if not has_val:
+            parts = tag.split("_")  # candidate_<iter>_<version>_<try>
+            try:
+                iteration = int(parts[1])
+                version = int(parts[2])
+                try_n = int(parts[3])
+            except (ValueError, IndexError):
+                iteration = version = 0
+                try_n = 1
+            # Train-sample eval (candidates/<tag>/eval) may or may not have run; if it has
+            # results we are mid eval_val, else resume with eval_train_sample first.
+            has_ts = (d / "eval").is_dir() and any((d / "eval").glob("*/result.json"))
+            action = "eval_val" if has_ts else "eval_train_sample"
+            return {
+                "iteration": iteration,
+                "version": version,
+                "try": try_n,
+                "actions": ["eval_val", "eval_train_sample"] if action == "eval_val"
+                            else ["eval_train_sample", "eval_val"],
+                "action_index": 0,
+                "resumed_tag": tag,
+                "resume_action": action,
+            }
+    return None
+
+
 def optimize(args: argparse.Namespace) -> None:
     run_id = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / run_id
@@ -510,6 +575,7 @@ def optimize(args: argparse.Namespace) -> None:
               "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
               "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
+              "last_ts_score": None,     # prior eval_train_sample mean_reward (harness gate)
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -523,6 +589,29 @@ def optimize(args: argparse.Namespace) -> None:
     else:
         print(f"{datetime.now():%H:%M:%S} MHO optimize  RESUME run={run_id}  iter={st['iteration']}  "
               f"action={st['actions'][st['action_index']]}  job={st['job_id']}  scheduler={sched.kind}")
+
+        # Disk-scan reconciliation: if state.json's pointer is ahead of the first
+        # INCOMPLETE candidate on disk (crashed/skipped/killed val eval), resume THERE
+        # instead of trusting the (possibly drift-shifted) iteration counter.
+        cand_dir = run_dir / "candidates"
+        if cand_dir.is_dir():
+            over = _resume_from_incomplete(cand_dir, run_dir / "evaluation")
+            if over is not None and over["iteration"] < st["iteration"]:
+                # Only reconcile BACK: the found incomplete candidate is at a LOWER
+                # iteration than the current state, so resume there. NEVER force the
+                # iteration forward to a stale on-disk candidate (which is what broke the
+                # user's manual reset to e.g. iter 5 -> jumped to 9).
+                old_iter = st["iteration"]
+                st.update(over)
+                # The pending job_id/cursors belong to the OLD ahead-candidate, not the one
+                # we resume; clear them so the loop submits a FRESH job.
+                st["job_id"] = None
+                st["last_eval_dir"] = None
+                st["substep"] = "none"
+                print(f"  resume reconcile: state was at iter {old_iter} but "
+                      f"{st['resumed_tag']} is incomplete ({st['resume_action']} missing) -> "
+                      f"resume at iter {st['iteration']}, action {st['actions'][0]}")
+                _save_state(state_path, st)
         # Backward-compat: older state.json has no propose-substep cursor. Default it so the
         # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
         st.setdefault("substep", "none")
@@ -571,6 +660,22 @@ def optimize(args: argparse.Namespace) -> None:
         else:
             st["action_index"] += 1
         st["substep"] = "none"   # a new stage begins fresh; propose re-arms it when it submits
+    def _repropose_same_iter() -> None:
+        """Harness gate: re-propose within the SAME iteration (skip eval_val, do NOT
+        bump iteration so skipped candidates do not burn the --iterations budget).
+        Capped by MAX_HARNESS_GATE_SKIPS; past the cap fall back to advancing."""
+        st["try"] += 1
+        skips = st.get("gate_skips", 0) + 1
+        st["gate_skips"] = skips
+        if skips > MAX_HARNESS_GATE_SKIPS:
+            st["gate_skips"] = 0
+            print(f"  harness gate skip cap ({MAX_HARNESS_GATE_SKIPS}) hit; moving to next iteration")
+            advance(skip_rest=True)
+            return
+        st["actions"] = ["propose"]
+        st["action_index"] = 0
+        st["substep"] = "none"
+        print(f"  harness gate: re-propose within iteration {st['iteration']} (try {st['try']})")
 
     def submit_current() -> str | None:
         # The loop initiates each stage; the model + harness + data are threaded in
@@ -679,14 +784,42 @@ def optimize(args: argparse.Namespace) -> None:
                                               "status": f"rc={rc}" if rc else "no_trials",
                                               "trials_dir": str(trials_dir)})
                 print(f"  {action} produced no score (rc={rc}, trials={trials_dir})")
+                # HARNESS-ONLY: a train-sample eval that produced no score is NOT a verified
+                # improvement -- skip the expensive eval_val and re-propose instead of
+                # wasting ~3h verifying a candidate that gave the proposer no signal.
+                # Never for model candidates (trained models must be val-verified).
+                if action == "eval_train_sample" and st["propose_kind"] == "harness":
+                    print("  harness train-sample produced no score; skipping eval_val, re-propose")
+                    st["last_ts_score"] = st.get("last_ts_score") or 0.0
+                    _repropose_same_iter()
             elif action == "eval_train_sample":
                 # Proposer-signal eval (fresh random subset of the train task): hand its trials
                 # to the next propose for the harness-improvement signal. NO frontier/accept
                 # decision here -- the val-split eval holds that. Record it for the summary.
                 st["last_eval_dir"] = str(trials_dir)
+                ts_score = score_trials(trials_dir).get("mean_reward") or 0.0
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
-                                              "trials_dir": str(trials_dir)})
-                print(f"  proposer-signal eval recorded trials for next propose: {trials_dir}")
+                                              "trials_dir": str(trials_dir),
+                                              "mean_reward": ts_score})
+                # HARNESS-ONLY gate: if this harness candidate did not beat the prior
+                # train-sample score, skip the expensive eval_val and re-propose directly.
+                # NEVER gate model candidates (trained checkpoints must be val-verified,
+                # and a trained model cannot be cheaply re-run).
+                if st["propose_kind"] == "harness":
+                    prior = st.get("last_ts_score") or 0.0
+                    improved = ts_score > prior
+                    st["last_ts_score"] = ts_score
+                    if not improved:
+                        print(f"  harness train-sample no improvement "
+                              f"({ts_score:.4f} <= prior {prior:.4f}); skipping eval_val, re-propose")
+                        _repropose_same_iter()
+                    else:
+                        print(f"  harness train-sample improved ({ts_score:.4f} > {prior:.4f}); "
+                              f"proceeding to eval_val")
+                        advance()
+                else:
+                    st["last_ts_score"] = ts_score
+                    advance()
             else:
                 # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)

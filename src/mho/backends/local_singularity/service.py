@@ -24,7 +24,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-# harbor's Trial.create() / verifier import agent classes (harness.agent_harness:*, etc.)
+# harbor's Trial.create() / verifier import agent classes (harness.micro_swe_agent:*, etc.)
 # in THIS process at trial time. Force src/ to the FRONT of sys.path: `python -m` puts the
 # repo ROOT on sys.path[0] (cwd), and the repo root has its OWN `harness/` package that
 # would shadow src/harness/. So src must precede the root even if already present.
@@ -39,10 +39,10 @@ if _SRC.is_dir():
 # Startup self-check (to the service log): proves the agent class imports in THIS process.
 try:
     import importlib as _il
-    _il.import_module("harness.agent_harness")
-    print(f"[executor startup] OK: harness.agent_harness importable | repo={_REPO_ROOT}", flush=True)
+    _il.import_module("harness.micro_swe_agent")
+    print(f"[executor startup] OK: harness.micro_swe_agent importable | repo={_REPO_ROOT}", flush=True)
 except Exception as _e:  # pragma: no cover
-    print(f"[executor startup] FAIL: harness.agent_harness NOT importable: {_e!r}\n"
+    print(f"[executor startup] FAIL: harness.micro_swe_agent NOT importable: {_e!r}\n"
           f"  __file__={__file__}\n  repo={_REPO_ROOT}\n  sys.path={sys.path}", flush=True)
 
 from harbor.models.task.config import EnvironmentConfig  # noqa: E402

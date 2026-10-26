@@ -248,3 +248,5 @@ tasks/*/data/
 
 # Problem JSONL is rebuilt from HuggingFace by each task package on first use.
 tasks/*/data/
+runs_output/
+tasks/arxivmath_training/out/

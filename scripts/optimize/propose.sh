@@ -15,7 +15,7 @@ REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "
 [ -f .env ] && { set -a; . .env; set +a; }
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
-# would shadow src/harness/ (agent_harness lives only in src). src stays on
+# would shadow src/harness/ (micro_swe_agent lives only in src). src stays on
 # PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/backend.
 export PYTHONSAFEPATH=1
 [ -n "${MHO_RUN_DIR:-}" ] && [ -n "${MHO_TAG:-}" ] || { echo "MHO_RUN_DIR and MHO_TAG required" >&2; exit 2; }

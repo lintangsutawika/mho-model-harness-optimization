@@ -35,7 +35,7 @@ cd "$REPO_DIR"
 echo "[eval] repo: ${REPO_DIR}${MHO_REPO_DIR:+ (MHO_REPO_DIR)}"
 export PYTHONPATH="${REPO_DIR}/src:${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
-# would shadow src/harness/ (agent_harness lives only in src). src stays on
+# would shadow src/harness/ (micro_swe_agent lives only in src). src stays on
 # PYTHONPATH, so this makes src win. See also the sys.path fixes in service.py/backend.
 export PYTHONSAFEPATH=1
 # Use the prebuilt project .venv directly (harbor + deps already installed, shared home) rather
@@ -54,7 +54,7 @@ require_sif_dir() {
 }
 
 HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' for cloud
-AGENT_IMPORT="${AGENT_IMPORT:-harness.agent_harness:AgentHarness}"
+AGENT_IMPORT="${AGENT_IMPORT:-harness.micro_swe_agent:MicroSweAgent}"
 # Custom harbor-singularity-hpc env class, selected by --environment-import-path (harbor's
 # -e is a fixed enum and cannot name a custom class). Override to test a fork.
 HARBOR_SING_IMPORT="${HARBOR_SING_IMPORT:-harbor_singularity_hpc.environment:SingularityWritableEnvironment}"
