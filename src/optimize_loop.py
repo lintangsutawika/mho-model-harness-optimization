@@ -493,9 +493,16 @@ def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict 
     results. Anything with a harness but missing either is INCOMPLETE (crashed/skipped/
     killed) and the run should pick back up there.
     """
+    def _tag_iter(name: str) -> int:
+        # candidate_<iter>_<version>_<try> -> numeric iteration (candidate_10 > candidate_9)
+        try:
+            return int(name.split("_")[1])
+        except (ValueError, IndexError):
+            return 0
+
     cands = sorted(
         (d for d in candidates_dir.glob("candidate_*") if d.is_dir()),
-        key=lambda d: d.name,
+        key=lambda d: _tag_iter(d.name),
     )
     for d in cands:
         tag = d.name
