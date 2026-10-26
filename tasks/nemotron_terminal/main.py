@@ -18,10 +18,13 @@ CATEGORIES = ("data_processing", "data_science", "debugging",
 ARCHIVE_URL = f"https://huggingface.co/datasets/{DATASET_NAME}/resolve/main/{SPLIT}/{{category}}.tar.gz"
 DATA_DIR = PKG / "data"
 
-# Every upstream task.toml points docker_image at an NVIDIA-internal registry. With the line
-# set, harbor pulls that image instead of building environment/Dockerfile (a public
-# ubuntu-24-04 base), so the tasks fail on docker, singularity and modal alike.
-_DOCKER_IMAGE_RE = re.compile(r"^docker_image\s*=.*\n", re.MULTILINE)
+# Per task, only instruction.md, environment/ (the category's Dockerfile plus files/) and the
+# tests besides test.sh differ upstream; task.toml and tests/test.sh are the same for all 5,984
+# tasks and live in task-template/. The upstream task.toml is dropped because it points
+# docker_image at an NVIDIA-internal registry, which harbor would pull instead of building
+# environment/Dockerfile.
+FROM_ARCHIVE = ("environment/", "tests/")
+SHARED = ("tests/test.sh",)
 
 
 # ---------------------------------------------------------------- data loading
@@ -56,8 +59,18 @@ def select(category: str, pool: list[str], per_category: int, seed: int) -> list
 
 
 # ---------------------------------------------------------------- generation
+def _fill(path: Path, **kw: str) -> None:
+    """Substitute {placeholders} in one pass, so braces inside an instruction stay literal."""
+    pattern = re.compile(r"\{(" + "|".join(map(re.escape, kw)) + r")\}")
+    path.write_text(pattern.sub(lambda m: str(kw[m.group(1)]), path.read_text()))
+
+
 def extract(archive: Path, category: str, ids: list[str], output: Path) -> None:
+    """Render each task from task-template/ plus its own files from the archive."""
     wanted = set(ids)
+    instructions = {}
+    for task_id in ids:
+        shutil.copytree(PKG / "task-template", output / task_id, dirs_exist_ok=False)
     with tarfile.open(archive) as tar:
         for member in tar.getmembers():
             parts = Path(member.name).parts
@@ -65,19 +78,29 @@ def extract(archive: Path, category: str, ids: list[str], output: Path) -> None:
                 parts = parts[1:]
             if len(parts) < 3 or parts[0] != category or parts[1] not in wanted:
                 continue
-            if not (member.isfile() or member.isdir()):
+            if not member.isfile():
                 continue
-            dest = output.joinpath(*parts[1:])
-            if member.isdir():
-                dest.mkdir(parents=True, exist_ok=True)
+            task_id, rel = parts[1], "/".join(parts[2:])
+            with tar.extractfile(member) as src:
+                data = src.read()
+            if rel == "instruction.md":
+                instructions[task_id] = data.decode("utf-8")
                 continue
+            if rel in SHARED:
+                if data != (PKG / "task-template" / rel).read_bytes():
+                    raise ValueError(f"{task_id}: upstream {rel} differs from task-template/{rel}")
+                continue
+            if not rel.startswith(FROM_ARCHIVE):
+                continue
+            dest = output / task_id / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            with tar.extractfile(member) as src, dest.open("wb") as out:
-                shutil.copyfileobj(src, out)
+            dest.write_bytes(data)
             dest.chmod(member.mode & 0o777 | 0o600)
     for task_id in ids:
-        toml = output / task_id / "task.toml"
-        toml.write_text(_DOCKER_IMAGE_RE.sub("", toml.read_text()))
+        task = output / task_id
+        _fill(task / "task.toml", name=f"mho/nemotron-terminal-{task_id}",
+              category=category, task_id=task_id)
+        _fill(task / "instruction.md", instruction=instructions[task_id])
 
 
 def generate_all(output: Path | str, per_category: int = 50, seed: int = 1,
@@ -96,7 +119,7 @@ def generate_all(output: Path | str, per_category: int = 50, seed: int = 1,
             f".sample(pool, {per_category})."
         ),
         "tasks_per_category": per_category,
-        "docker_image": "removed from every task.toml; environment/Dockerfile is built instead",
+        "task_toml": "task-template/task.toml; the upstream one (with an internal docker_image) is dropped",
         "per_category": {},
         "tasks": [],
     }
