@@ -1,0 +1,18 @@
+schema_version = "1.4"
+[task]
+name = "{name}"
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory = "2G"
+network_mode = "public"
+[agent]
+timeout_sec = 900.0
+[verifier]
+timeout_sec = 900.0
+[metadata]
+task_family = "Nemotron-Terminal-Synthetic-Tasks"
+ability = "TERMINAL"
+category = "{category}"
+task_id = "{task_id}"
+tags = ["datagen-flash", "{category}"]
