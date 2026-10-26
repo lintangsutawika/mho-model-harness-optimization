@@ -697,6 +697,11 @@ def optimize(args: argparse.Namespace) -> None:
         # automatically from state. harness = the current candidate (st["scaffold_dir"], the
         # freshly-proposed one, else the frontier-best parent, else the base). model = the
         # latest trained checkpoint (st["model_dir"]) if any, else args.model / the HF default.
+        import os as _os
+        if _os.environ.get("MHO_LOOP_DEBUG"):
+            print("  [DBG submit_current] iter=%s action=%s idx=%s eval_phase=%s actions=%s job=%s" % (
+                  st["iteration"], st["actions"][st["action_index"]], st["action_index"],
+                  st.get("eval_phase"), st["actions"][:4], st.get("job_id")))
         action = st["actions"][st["action_index"]]
         tag = cur_tag()
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
@@ -724,10 +729,13 @@ def optimize(args: argparse.Namespace) -> None:
         #   eval_val / eval   -> evaluation/<tag>/         (val accept/reject gate, hidden)
         data = args.train_data
         if action == "eval_train_sample":
-            # The train-sample eval is THE one eval the optimizer sees: candidates/<tag>/eval/.
-            # MHO_OUT=candidates/<tag>, EVAL_JOB_NAME=eval -> trials at candidates/<tag>/eval/.
+            # Harness train-sample evals: the base (harness A) and cand (proposed B) outputs
+            # MUST go to separate dirs because cur_tag() is identical for both within one
+            # iteration -- writing both to candidates/<tag>/eval/ would collide and make the
+            # cand overwrite/read the base result (T_B == T_A always). base -> eval_base/,
+            # cand -> eval/.
             eval_out = tag_dir(tag)
-            job_name = "eval"
+            job_name = "eval_base" if st.get("eval_phase") == "base" else "eval"
             # JIT: the candidate's single sigma config (model/sigma_rewards/<check>.json) applies
             # to ALL its staged train tasks. Use the first sigma config found there, if any.
             sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
@@ -797,7 +805,7 @@ def optimize(args: argparse.Namespace) -> None:
             # single-set `eval` that is run_dir/eval/<tag>; for a dual stage it is
             # run_dir/eval/<tag>-<stage>. Either way score/record that dir directly.
             if action == "eval_train_sample":
-                trials_dir = tag_dir(tag) / "eval"
+                trials_dir = tag_dir(tag) / ("eval_base" if st.get("eval_phase") == "base" else "eval")
             else:  # eval_val (dual) or `eval` (single-set): the val accept gate.
                 trials_dir = run_dir / "evaluation" / tag
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
