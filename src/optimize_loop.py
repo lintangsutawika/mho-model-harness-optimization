@@ -938,7 +938,9 @@ def optimize(args: argparse.Namespace) -> None:
             continue
         print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} stage={action} -> submit")
         jid = submit_current()
-        if jid is None:  # e.g. propose with MHO_PROPOSE_JOB unset
+        if jid is None:  # e.g. propose with MHO_PROPOSE_JOB unset, or a submit failure
+            print(f"{datetime.now():%H:%M:%S} [WARN] {action} submit returned None at iter "
+                  f"{st['iteration']} (idx {st['action_index']}) -> advancing (skipping this stage)")
             advance()
         else:
             st["job_id"] = jid
