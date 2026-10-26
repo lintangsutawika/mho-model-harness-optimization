@@ -51,6 +51,10 @@ _OPT_DIR = Path(__file__).parent
 # across iterations (each proposer still emitting one output), not by a combined proposer.
 PROPOSE_KINDS = ("harness", "model")
 _MAX_TRIAL_DIRS = 20   # bounded: stage at most this many raw trial dirs into eval_prior/
+# Diff sections whose path hits one of these fragments are excluded from the candidate
+# patch (VCS/cache/venv noise only). Restored from commit 9503596 (dropped in refactor).
+_DIFF_EXCLUDE = ("/.git/", "/__pycache__/", "/.venv/", "/venv/", "/.pytest_cache/",
+                 "/.ruff_cache/", "/.mypy_cache/", ".egg-info/")
 
 
 def _skill_dir(kind: str) -> Path:
