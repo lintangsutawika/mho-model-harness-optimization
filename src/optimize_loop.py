@@ -38,6 +38,8 @@ from typing import Any
 # Max times the harness gate re-proposes WITHIN one iteration before giving up
 # and burning the iteration (bounded safety valve).
 MAX_HARNESS_GATE_SKIPS = 5
+# Retries before a failing action (no score / bad rc) is treated as failed.
+MAX_ACTION_RETRIES = 3
 
 # Max times the harness gate re-proposes WITHIN one iteration before giving up
 # and burning the iteration (bounded safety valve).
@@ -593,6 +595,7 @@ def optimize(args: argparse.Namespace) -> None:
               "eval_phase": None,       # None | "base" (eval harness A) | "cand" (eval proposed B)
               "ts_A": None,             # harness A's train-sample score on the fixed subset (gate bar)
               "ts_repropose_limit": max(1, int(getattr(args, "ts_repropose_limit", 3))),
+"action_retries": 0,        # consecutive failures for the current action (retry)
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -834,6 +837,18 @@ def optimize(args: argparse.Namespace) -> None:
                                               "status": f"rc={rc}" if rc else "no_trials",
                                               "trials_dir": str(trials_dir)})
                 print(f"  {action} produced no score (rc={rc}, trials={trials_dir})")
+                # --- RETRY the same action up to MAX_ACTION_RETRIES (transient failures:
+                # e.g. a propose job whose late inline step IndexError'd, or an eval sandbox
+                # hiccup that produced no trials). Re-submit the SAME action, not a re-propose.
+                st["action_retries"] = st.get("action_retries", 0) + 1
+                if st["action_retries"] < MAX_ACTION_RETRIES and not (rc != 0 and action == "train"):
+                    st["job_id"] = None
+                    st["substep"] = "none"
+                    st["failed_but_retrying"] = True
+                    print(f"  retrying {action} ({st['action_retries']}/{MAX_ACTION_RETRIES})")
+                    _save_state(state_path, st)
+                    return
+                st["action_retries"] = 0
                 # HARNESS-ONLY: a train-sample eval that produced no score is NOT a verified
                 # improvement -- skip the expensive eval_val and re-propose instead of
                 # wasting ~3h verifying a candidate that gave the proposer no signal.
