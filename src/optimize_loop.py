@@ -1007,7 +1007,20 @@ def main(argv: list[str] | None = None) -> None:
                     "because the proposer's signal is a random subset of it; got: " + args.train_data)
         if args.propose_sample <= 0:
             p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
-    optimize(args)
+    try:
+        optimize(args)
+    except Exception:
+        import traceback as _tb
+        _msg = _tb.format_exc()
+        _run_dir = Path(os.environ.get("MHO_RUNS_DIR", "")) if os.environ.get("MHO_RUNS_DIR") else None
+        # best-effort: write crash log next to the run dir + always to stderr
+        print("MHO LOOP CRASH:", file=sys.stderr)
+        print(_msg, file=sys.stderr)
+        try:
+            (Path(os.environ.get("MHO_OUT", "/tmp")) / "loop_crash.log").write_text(_msg)
+        except Exception:
+            pass
+        sys.exit(1)
 
 
 if __name__ == "__main__":
