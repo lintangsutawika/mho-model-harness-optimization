@@ -851,12 +851,29 @@ def optimize(args: argparse.Namespace) -> None:
                 if st["propose_kind"] == "harness":
                     phase = st.get("eval_phase") or "base"
                     if phase == "base":
-                        # Harness A on the fixed subset -> store the gate bar, go propose B.
+                        # Harness A on the fixed subset -> store the gate bar, then PROPOSE B.
+                        # Submit propose DIRECTLY here (not via advance()/submit_current(), which
+                        # double-advanced and skipped propose). Set action_index to the propose
+                        # slot (1) and job_id so the loop waits for the propose job deterministically.
                         st["ts_A"] = ts_score
                         st["eval_phase"] = "cand"
                         st.setdefault("ts_try", 0)
                         print(f"  harness base train-sample (A) = {ts_score:.4f}; propose B")
-                        advance()  # callsite:858
+                        # find the propose slot index in the current actions
+                        try:
+                            _pp = next(i for i, _a in enumerate(st["actions"]) if _a == "propose")
+                        except StopIteration:
+                            _pp = 1
+                        st["action_index"] = _pp
+                        st["substep"] = "none"
+                        _jid = submit_propose(sched, run_root=run_dir, logs=tag_dir(cur_tag()) / "logs",
+                                              tag=cur_tag(), kind=st["propose_kind"])
+                        if _jid is None:
+                            raise RuntimeError(
+                                f"submit_propose returned None at iter {st['iteration']} "
+                                f"(PROPOSE_JOB={PROPOSE_JOB!r}); cannot continue without propose")
+                        st["job_id"] = _jid
+                        _save_state(state_path, st)
                     else:
                         # Proposed B on the SAME subset: improved over A -> verify on eval_val.
                         tA = st.get("ts_A")
