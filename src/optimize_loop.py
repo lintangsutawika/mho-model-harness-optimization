@@ -596,6 +596,7 @@ def optimize(args: argparse.Namespace) -> None:
               "ts_A": None,             # harness A's train-sample score on the fixed subset (gate bar)
               "ts_repropose_limit": max(1, int(getattr(args, "ts_repropose_limit", 3))),
 "action_retries": 0,        # consecutive failures for the current action (retry)
+"advanced": False,          # True when on_done already advanced (kill double-advance)
               "version": 0,                # # of ACCEPTED (improving) candidates so far
               "try": 1,                    # attempts at the current version; resets on acceptance
               "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
@@ -668,6 +669,8 @@ def optimize(args: argparse.Namespace) -> None:
         reaches the phase's M it flips the phase kind (harness <-> model) and resets the counter,
         so the loop alternately emits M_harness harness proposals then M_model model proposals.
         """
+        st["advanced"] = True   # on_done/loop advanced this stage; loop tick must not advance again
+        st["action_retries"] = 0  # new stage -> fresh retry budget
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
             import os as _os
             if _os.environ.get("MHO_LOOP_DEBUG"):
@@ -858,6 +861,8 @@ def optimize(args: argparse.Namespace) -> None:
                     st["last_ts_score"] = st.get("last_ts_score") or 0.0
                     _repropose_same_iter()
             elif action == "eval_train_sample":
+                st["action_retries"] = 0  # this action finally succeeded
+                st["advanced"] = False
                 st["last_eval_dir"] = str(trials_dir)
                 ts_score = score_trials(trials_dir).get("mean_reward") or 0.0
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
@@ -999,7 +1004,9 @@ def optimize(args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"propose returned None (PROPOSE_JOB={PROPOSE_JOB!r}) at iter {st['iteration']} "
                     f"idx {st['action_index']}; refusing to skip the propose step.")
-            advance()  # callsite:963
+            if not st.get("advanced"):
+                advance()
+            st["advanced"] = False  # callsite:963
         else:
             st["job_id"] = jid
         _save_state(state_path, st)
