@@ -363,10 +363,14 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
 
 def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
                    kind: str = "harness") -> str | None:
+    import os as _os
+    if _os.environ.get("MHO_LOOP_DEBUG"):
+        print(f"  [DBG submit_propose] tag={tag} kind={kind} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
     """Submit the HARNNES-mutation or MODEL-proposal job (MHO_PROPOSE_JOB). The proposer derives
     the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
     writes either a harness edit (candidates/<tag>/harness) or a model sigma-reward config
     (candidates/<tag>/model/sigma_rewards/<sigma>.json). None if unconfigured."""
+    print(f"  [TRACE submit_propose] tag={tag} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
     if not PROPOSE_JOB:
         print("  MHO_PROPOSE_JOB unset -> skipping proposal this iteration")
         return None
@@ -654,12 +658,18 @@ def optimize(args: argparse.Namespace) -> None:
         return run_dir / "candidates" / tag
 
     def advance(skip_rest: bool = False) -> None:
+        print(f"  [TRACE advance] iter={st['iteration']} idx={st['action_index']} "
+              f"actions={st['actions'][:4]} skip={skip_rest}", flush=True)
         """Move to the next stage, or (past the last, or on skip_rest) the next iteration.
         In model-harness batching, a completed proposal cycle bumps phase_proposed; when it
         reaches the phase's M it flips the phase kind (harness <-> model) and resets the counter,
         so the loop alternately emits M_harness harness proposals then M_model model proposals.
         """
         if skip_rest or st["action_index"] + 1 >= len(st["actions"]):
+            import os as _os
+            if _os.environ.get("MHO_LOOP_DEBUG"):
+                print(f"  [DBG advance] iter={st['iteration']} idx={st['action_index']} "
+                      f"actions={st['actions'][:4]} skip_rest={skip_rest}", flush=True)
             st["iteration"] += 1
             # New iteration -> a FRESH train subset for the harness-gate compare (the previous
             # iteration's fixed subset/phase/bar are per-iteration only).
@@ -707,6 +717,8 @@ def optimize(args: argparse.Namespace) -> None:
                   st["iteration"], st["actions"][st["action_index"]], st["action_index"],
                   st.get("eval_phase"), st["actions"][:4], st.get("job_id")))
         action = st["actions"][st["action_index"]]
+        print(f"  [TRACE submit_current] idx={st['action_index']} action={action!r} "
+              f"phase={st.get('eval_phase')} train_subset={'yes' if st.get('train_subset') else 'no'}", flush=True)
         tag = cur_tag()
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
@@ -718,7 +730,7 @@ def optimize(args: argparse.Namespace) -> None:
             # sigma-reward over the train cohort + train the model). Harness phase skips it.
             if do_model_harness and st["propose_kind"] != "model":
                 print(f"  [batch] harness phase ({st['phase_proposed']}/{M_harness}) -> skip train")
-                advance()
+                advance()  # callsite:732
                 return None
             # Model-phase train: realize the candidate's sigma-reward (model/sigma_rewards/*.json)
             # over the train cohort and train on it. Harness phase has no sigma config.
@@ -788,7 +800,7 @@ def optimize(args: argparse.Namespace) -> None:
                 ok = rc == 0 and (cand_dir / "pyproject.toml").exists()
             if ok:
                 st["scaffold_dir"] = str(tag_dir(tag) / "harness") if kind_now != "model" else st["scaffold_dir"]
-                advance()
+                advance()  # callsite:802
             else:
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": f"{kind_now}_propose",
                                               "status": "no_proposal", "rc": rc})
@@ -802,7 +814,7 @@ def optimize(args: argparse.Namespace) -> None:
                 ckpt = _latest_hf_ckpt(tag_dir(tag) / "train" / "checkpoints" / "hf")
                 if ckpt is not None:
                     st["model_dir"] = str(ckpt)
-                advance()
+                advance()  # callsite:816
             else:
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": "train",
                                               "status": f"rc={rc}"})
@@ -844,7 +856,7 @@ def optimize(args: argparse.Namespace) -> None:
                         st["eval_phase"] = "cand"
                         st.setdefault("ts_try", 0)
                         print(f"  harness base train-sample (A) = {ts_score:.4f}; propose B")
-                        advance()
+                        advance()  # callsite:858
                     else:
                         # Proposed B on the SAME subset: improved over A -> verify on eval_val.
                         tA = st.get("ts_A")
@@ -877,7 +889,7 @@ def optimize(args: argparse.Namespace) -> None:
                                 advance(skip_rest=True)
                 else:
                     # model candidate: never gate, always continue.
-                    advance()
+                    advance()  # callsite:891
             else:
                 # eval_val (dual) or the single-set `eval`: score + frontier + accept.
                 score = score_trials(trials_dir)
@@ -916,7 +928,7 @@ def optimize(args: argparse.Namespace) -> None:
                 print(f"  {'NEW BEST' if improved else 'no improvement'} {tag}: "
                       f"pass@1={score.get('solved_pass@1')} mean_reward={score.get('mean_reward')} "
                       f"| frontier best: {_inc}")
-            advance()
+            advance()  # callsite:930
 
     # ── The loop: wait on the in-flight job, else submit the current stage. ──
     while st["iteration"] <= args.iterations:
@@ -941,15 +953,21 @@ def optimize(args: argparse.Namespace) -> None:
             st["substep"] = "done" if realize_model_specs(tag_dir(cur_tag()), args.train_data)[0] else "realize"
             if st["substep"] == "done":
                 st["scaffold_dir"] = st["scaffold_dir"] or str(tag_dir(cur_tag()))   # keep marker
-                advance()
+                advance()  # callsite:955
             _save_state(state_path, st)
             continue
         print(f"{datetime.now():%H:%M:%S} iter {st['iteration']} stage={action} -> submit")
         jid = submit_current()
-        if jid is None:  # e.g. propose with MHO_PROPOSE_JOB unset, or a submit failure
+        if jid is None:
             print(f"{datetime.now():%H:%M:%S} [WARN] {action} submit returned None at iter "
-                  f"{st['iteration']} (idx {st['action_index']}) -> advancing (skipping this stage)")
-            advance()
+                  f"{st['iteration']} (idx {st['action_index']})")
+            if action == "propose":
+                # NEVER silently skip propose: it is the core of the harness loop. If it cannot
+                # run, fail loudly (loud log above + exit) so it is never bypassed.
+                raise RuntimeError(
+                    f"propose returned None (PROPOSE_JOB={PROPOSE_JOB!r}) at iter {st['iteration']} "
+                    f"idx {st['action_index']}; refusing to skip the propose step.")
+            advance()  # callsite:963
         else:
             st["job_id"] = jid
         _save_state(state_path, st)
