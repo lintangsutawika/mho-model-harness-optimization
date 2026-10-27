@@ -423,7 +423,11 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     the proposer's improvement signal) and `eval_val` (the held-out val-split, whose score
     drives accept/frontier). Proposer samples from the full task; val-split accepts."""
     if iteration == 0:
-        return ["eval_val", "eval_train_sample"] if dual else ["eval"]
+        # Baseline only measures the starting harness on the val accept gate. The
+        # eval_train_sample (base phase) exists from iter 1 onward; an extra one here
+        # wrote to the wrong dir and produced no score (eval_base mismatch), which
+        # triggered a spurious no-score re-propose.
+        return ["eval_val"] if dual else ["eval"]
     acts: list[str] = []
     # Propose step: harness-modes propose a harness edit (do_propose). Model-only, which trains
     # the model, ALSO proposes -- a MODEL proposal (sigma), so model improvement produces sigma.
