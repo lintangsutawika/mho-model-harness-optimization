@@ -739,23 +739,27 @@ def optimize(args: argparse.Namespace) -> None:
             # cand overwrite/read the base result (T_B == T_A always). base -> eval_base/,
             # cand -> eval/.
             eval_out = tag_dir(tag)
-            job_name = "eval_base" if st.get("eval_phase") == "base" else "eval"
             # JIT: the candidate's single sigma config (model/sigma_rewards/<check>.json) applies
             # to ALL its staged train tasks. Use the first sigma config found there, if any.
             sr_dir = tag_dir(tag) / "model" / "sigma_rewards"
             sigma_cfg = next(iter(sr_dir.glob("*.json")), None) if sr_dir.is_dir() else None
-            # FIXED subset per iteration: the "base" eval (harness A) samples ONE subset and
-            # stores it; the "cand" eval (proposed B) REUSES the same subset so T_A and T_B
-            # are apples-to-apples. Fresh subset on the next iteration (cleared at advance).
-            if st.get("eval_phase") == "base" or st.get("train_subset") is None:
-                seed = int(time.time()) % (2**31)
-                st["train_subset"] = str(_sample_subset(
-                    args.train_data, args.propose_sample,
-                    run_dir / "samples" / f"{tag}-train_sample", seed,
-                    sigma_reward=sigma_cfg))
+            # Determine phase FIRST: the FIRST eval_train_sample of an iteration is the base
+            # (harness A) eval -> it samples+stores the fixed subset S; the SECOND (cand B)
+            # reuses S. job_name depends on this fresh phase, NOT a stale st.eval_phase.
+            is_base = (not st.get("train_subset")) or st.get("eval_phase") == "base"
+            if is_base:
+                if not st.get("train_subset"):
+                    seed = int(time.time()) % (2**31)
+                    st["train_subset"] = str(_sample_subset(
+                        args.train_data, args.propose_sample,
+                        run_dir / "samples" / f"{tag}-train_sample", seed,
+                        sigma_reward=sigma_cfg))
                 st["eval_phase"] = "base"
             else:
                 st["eval_phase"] = "cand"
+            # base -> eval_before/ (harness A), cand -> eval_after/ (proposed B). Separate so
+            # cur_tag() reuse within an iteration does not collide (T_A vs T_B apples-to-apples).
+            job_name = "eval_before" if st["eval_phase"] == "base" else "eval_after"
             data = st["train_subset"]
         else:  # eval_val (dual) or `eval` (single-set): the accept gate lives in evaluation/.
             # MHO_OUT=evaluation, EVAL_JOB_NAME=<tag> -> trials at evaluation/<tag>/.
@@ -809,7 +813,7 @@ def optimize(args: argparse.Namespace) -> None:
             # single-set `eval` that is run_dir/eval/<tag>; for a dual stage it is
             # run_dir/eval/<tag>-<stage>. Either way score/record that dir directly.
             if action == "eval_train_sample":
-                trials_dir = tag_dir(tag) / ("eval_base" if st.get("eval_phase") == "base" else "eval")
+                trials_dir = tag_dir(tag) / ("eval_before" if st.get("eval_phase") == "base" else "eval_after")
             else:  # eval_val (dual) or `eval` (single-set): the val accept gate.
                 trials_dir = run_dir / "evaluation" / tag
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
