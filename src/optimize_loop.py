@@ -65,6 +65,7 @@ PROPOSE_JOB = os.environ.get("MHO_PROPOSE_JOB", "")
 
 AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.micro_swe_agent:MicroSweAgent")
 POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
+LOG_VERBOSE = bool(os.environ.get("MHO_LOG_VERBOSE"))  # full job cmd in logs
 # --------------------------------------------------------------------------- #
 # Scheduler abstraction -- PBS (qsub/qstat) or SLURM (sbatch/squeue+sacct).
 # scripts/hpc/ holds the per-scheduler shell wrappers; this is the Python driver side,
@@ -111,14 +112,28 @@ class Scheduler:
             if walltime: cmd += ["-t", walltime]
             if out_dir: cmd += ["-o", str(out_dir / "%x-%j.out")]
             cmd.append(str(script))
-        print(f"  submit[{self.kind}]: {' '.join(cmd)}", flush=True)
+        if LOG_VERBOSE:
+            print(f"  submit[{self.kind}]: {' '.join(cmd)}", flush=True)
+            # The harness/model/data ride via -V (inherited env), not visible in the cmd;
+            # surface the selection vars so the log shows exactly what each job evaluated.
+            _sel = {k: v for k, v in job_env.items()
+                    if k in ("MHO_MODEL", "MHO_HARNESS", "MHO_DATA", "MHO_DATA_PATH",
+                             "MHO_REPO_DIR", "MHO_TRAINER", "MHO_TASK",
+                             "MHO_TRIALS_DIR", "MICRO_SCAFFOLD_DIR", "MINI_FORK_LOCAL",
+                             "AGENT_IMPORT") and v}
+            if _sel:
+                print("      " + "  ".join(f"{k}={v}" for k, v in sorted(_sel.items())),
+                      flush=True)
+        else:
+            _n = next((cmd[i+1] for i, c in enumerate(cmd) if c == "-N"), "job")
+            print(f"  submit[{self.kind}] {_n}", flush=True)
         r = subprocess.run(cmd, cwd=str(REPO_DIR), env=job_env, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(f"submit failed rc={r.returncode}: {r.stderr.strip() or r.stdout.strip()}")
         out = r.stdout.strip()
         # SLURM --parsable: "<id>[;cluster]"; PBS: "<id>.<server>".
         job_id = (out.split()[-1].split(";")[0]) if self.kind == "slurm" else out.split()[0]
-        print(f"  submitted job {job_id}", flush=True)
+        print(f"  -> {job_id}", flush=True)
         return job_id
 
     def state(self, job_id: str) -> tuple[str, int | None]:
@@ -279,7 +294,8 @@ def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
     the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
     writes either a harness edit (candidates/<tag>/harness) or a model sigma-reward config
     (candidates/<tag>/model/sigma_rewards/<sigma>.json). None if unconfigured."""
-    print(f"  [TRACE submit_propose] tag={tag} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
+    if LOG_VERBOSE:
+        print(f"  [TRACE submit_propose] tag={tag} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
     if not PROPOSE_JOB:
         print("  MHO_PROPOSE_JOB unset -> skipping proposal this iteration")
         return None
@@ -494,8 +510,9 @@ def optimize(args: argparse.Namespace) -> None:
         return run_dir / "candidates" / tag
 
     def advance(skip_rest: bool = False) -> None:
-        print(f"  [TRACE advance] iter={st['iteration']} idx={st['action_index']} "
-              f"actions={st['actions'][:4]} skip={skip_rest}", flush=True)
+        if LOG_VERBOSE:
+            print(f"  [TRACE advance] iter={st['iteration']} idx={st['action_index']} "
+                  f"actions={st['actions'][:4]} skip={skip_rest}", flush=True)
         """Move to the next stage, or (past the last, or on skip_rest) the next iteration.
         In model-harness batching, a completed proposal cycle bumps phase_proposed; when it
         reaches the phase's M it flips the phase kind (harness <-> model) and resets the counter,
@@ -555,8 +572,9 @@ def optimize(args: argparse.Namespace) -> None:
                   st["iteration"], st["actions"][st["action_index"]], st["action_index"],
                   st.get("eval_phase"), st["actions"][:4], st.get("job_id")))
         action = st["actions"][st["action_index"]]
-        print(f"  [TRACE submit_current] idx={st['action_index']} action={action!r} "
-              f"phase={st.get('eval_phase')} train_subset={'yes' if st.get('train_subset') else 'no'}", flush=True)
+        if LOG_VERBOSE:
+            print(f"  [TRACE submit_current] idx={st['action_index']} action={action!r} "
+                  f"phase={st.get('eval_phase')} train_subset={'yes' if st.get('train_subset') else 'no'}", flush=True)
         tag = cur_tag()
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
@@ -873,7 +891,11 @@ def optimize(args: argparse.Namespace) -> None:
                 raise RuntimeError(
                     f"propose returned None (PROPOSE_JOB={PROPOSE_JOB!r}) at iter {st['iteration']} "
                     f"idx {st['action_index']}; refusing to skip the propose step.")
-            advance()
+            # NOTE: do NOT advance() here -- transitions are owned by on_done. If a non-propose
+            # submit returns None (e.g. a harness-phase train skip), the tick loops back and
+            # on_done decides the next stage. Auto-advancing here caused the recurring
+            # double-advance that skipped the cand eval. (Model-harness train-skip calls
+            # advance() itself inside submit_current, so it still transitions correctly.)
         else:
             st["job_id"] = jid
             st["job_action"] = action
