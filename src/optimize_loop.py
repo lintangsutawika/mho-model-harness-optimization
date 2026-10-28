@@ -905,7 +905,19 @@ def optimize(args: argparse.Namespace) -> None:
                             print(f"  harness candidate train-sample improved "
                                   f"({ts_score:.4f} > {tA if tA is not None else 0.0:.4f}); "
                                   f"proceeding to eval_val")
-                            advance()          # eval_val (or end of actions)
+                            # Deterministic transition: point action_index at the eval_val slot
+                            # + clear job_id so the LOOP TICK submits eval_val and waits. Do NOT
+                            # advance() (on_done advance + tick's None-submit advance double-fired
+                            # -> idx 2->3->4, skipping eval_val entirely). Same pattern as the
+                            # deterministic propose fix in the base branch.
+                            _ev = next((i for i, _a in enumerate(st["actions"]) if _a == "eval_val"),
+                                       len(st["actions"]) - 1)
+                            st["action_index"] = _ev
+                            st["substep"] = "none"
+                            st["eval_phase"] = None
+                            st["job_id"] = None
+                            st["action_retries"] = 0
+                            st["advanced"] = False
                         else:
                             # B did not beat A on this subset -> re-propose from A (same subset)
                             # up to ts_repropose_limit consecutive failures, then fresh subset.
