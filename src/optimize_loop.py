@@ -621,9 +621,16 @@ def optimize(args: argparse.Namespace) -> None:
                            n_trials=args.trials, n_concurrent=args.concurrent,
                            out_dir=eval_out, logs=tag_dir(tag) / "logs", job_name=job_name)
 
-    def on_done(rc: int) -> None:
-        """Handle the finished stage's result and advance the cursor."""
-        action, tag, it = st["actions"][st["action_index"]], cur_tag(), st["iteration"]
+    def on_done(rc: int, _fin_action: str | None = None) -> None:
+        """Handle the finished stage's result and advance the cursor.
+
+        `_fin_action` = the action of the job that actually finished (from st['job_action']),
+        so dispatch is keyed to the finished job, not st['action_index'], which on_done may
+        have advanced -- that caused a finished propose job to be misrouted into the
+        eval_train_sample handler (spurious 'no score' on the empty eval_after + no summary).
+        """
+        action = _fin_action or st["actions"][st["action_index"]]
+        tag, it = cur_tag(), st["iteration"]
         if action == "propose":
             kind_now = st["propose_kind"]
             if kind_now == "model":
@@ -839,7 +846,7 @@ def optimize(args: argparse.Namespace) -> None:
             print(f"{datetime.now():%H:%M:%S} [{_done_action}] job {st['job_id']} done (rc={rc})")
             st["job_id"] = None
             st["job_action"] = None
-            on_done(rc if rc is not None else 0)
+            on_done(rc if rc is not None else 0, _done_action)
             _save_state(state_path, st)
             continue
         if action == "propose" and st["propose_kind"] == "model" and st["substep"] == "realize":
