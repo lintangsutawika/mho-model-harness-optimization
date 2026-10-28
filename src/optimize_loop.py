@@ -848,7 +848,11 @@ def optimize(args: argparse.Namespace) -> None:
                     st["job_id"] = None
                     st["substep"] = "none"
                     st["failed_but_retrying"] = True
-                    print(f"  retrying {action} ({st['action_retries']}/{MAX_ACTION_RETRIES})")
+                    # action_retries counts re-submits AFTER the first attempt; print as
+                    # "attempt N/TOTAL" so the first retry reads as attempt 2, not a first try.
+                    _at = st['action_retries'] + 1          # attempt number (1 = original submit)
+                    _tot = MAX_ACTION_RETRIES + 1           # total attempts = 1 initial + retries
+                    print(f"  {action} failed (no score); re-submitting (attempt {_at}/{_tot})")
                     _save_state(state_path, st)
                     return
                 st["action_retries"] = 0
