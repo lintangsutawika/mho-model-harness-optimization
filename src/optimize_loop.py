@@ -585,6 +585,7 @@ def optimize(args: argparse.Namespace) -> None:
         start = 0 if not args.skip_baseline else 1
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
               "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
+              "job_action": None,     # action label of the in-flight job (for done-echo)
               "scaffold_dir": None,        # the candidate currently being trained/evaled
               "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
               "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
@@ -910,6 +911,7 @@ def optimize(args: argparse.Namespace) -> None:
                                 f"submit_propose returned None at iter {st['iteration']} "
                                 f"(PROPOSE_JOB={PROPOSE_JOB!r}); cannot continue without propose")
                         st["job_id"] = _jid
+                        st["job_action"] = "propose"
                         _save_state(state_path, st)
                     else:
                         # Proposed B on the SAME subset: improved over A -> verify on eval_val.
@@ -1004,8 +1006,10 @@ def optimize(args: argparse.Namespace) -> None:
             if state != "DONE":
                 time.sleep(POLL_SECONDS)
                 continue
-            print(f"{datetime.now():%H:%M:%S} [{action}] job {st['job_id']} done (rc={rc})")
+            _done_action = st.get("job_action") or action
+            print(f"{datetime.now():%H:%M:%S} [{_done_action}] job {st['job_id']} done (rc={rc})")
             st["job_id"] = None
+            st["job_action"] = None
             on_done(rc if rc is not None else 0)
             _save_state(state_path, st)
             continue
@@ -1038,6 +1042,7 @@ def optimize(args: argparse.Namespace) -> None:
             st["advanced"] = False  # callsite:963
         else:
             st["job_id"] = jid
+            st["job_action"] = action
         _save_state(state_path, st)
 
     best = (json.loads(frontier_path.read_text()) if frontier_path.exists() else {}).get("_best", {})
