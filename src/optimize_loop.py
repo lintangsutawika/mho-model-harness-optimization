@@ -806,7 +806,20 @@ def optimize(args: argparse.Namespace) -> None:
                 ok = rc == 0 and (cand_dir / "pyproject.toml").exists()
             if ok:
                 st["scaffold_dir"] = str(tag_dir(tag) / "harness") if kind_now != "model" else st["scaffold_dir"]
+                # Surface what the proposer actually changed: read the candidate's own
+                # CANDIDATE.md (hypothesis + change summary) if it wrote one.
+                _hyp = _candidate_hypothesis(tag_dir(tag)) if kind_now != "model" else None
+                if _hyp:
+                    _title = _hyp.splitlines()[0].lstrip("# ").strip() if _hyp.splitlines() else ""
+                    _first = " ".join((_hyp.splitlines()[1:2] or [""]))[:160]
+                    print(f"  [+] proposal for {tag}: {_title}")
+                    if _first:
+                        print(f"      {_first}")
                 advance()  # callsite:802
+                append_summary(summary_path, {"iteration": it, "candidate": tag,
+                                              "phase": f"{kind_now}_propose",
+                                              "status": "ok",
+                                              "candidate_hypothesis": _hyp or ""})
             else:
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": f"{kind_now}_propose",
                                               "status": "no_proposal", "rc": rc})
