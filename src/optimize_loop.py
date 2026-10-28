@@ -417,21 +417,21 @@ def optimize(args: argparse.Namespace) -> None:
         start = 0 if not args.skip_baseline else 1
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
               "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
-              "job_action": None,     # action label of the in-flight job (for done-echo)
-              "scaffold_dir": None,        # the candidate currently being trained/evaled
-              "parent_scaffold": None,     # frontier-best so far; next propose accumulates on it
-              "model_dir": None,           # latest trained checkpoint (HF dir); None -> args.model
-              "last_eval_dir": None,       # most-recent eval's trials dir, for the next propose
-              "last_ts_score": None,     # prior eval_train_sample mean_reward (harness gate)
+              "job_action": None,       # action label of the in-flight job (for done-echo)
+              "scaffold_dir": None,     # the candidate currently being trained/evaled
+              "parent_scaffold": None,  # frontier-best so far; next propose accumulates on it
+              "model_dir": None,        # latest trained checkpoint (HF dir); None -> args.model
+              "last_eval_dir": None,    # most-recent eval's trials dir, for the next propose
+              "last_ts_score": None,    # prior eval_train_sample mean_reward (harness gate)
               "ts_baseline": None,      # first eval_train_sample mean_reward (harness gate baseline)
               "train_subset": None,     # FIXED train subset dir for this iteration (A and B compare on it)
               "eval_phase": None,       # None | "base" (eval harness A) | "cand" (eval proposed B)
               "ts_A": None,             # harness A's train-sample score on the fixed subset (gate bar)
               "ts_repropose_limit": max(1, int(getattr(args, "ts_repropose_limit", 3))),
-"action_retries": 0,        # consecutive failures for the current action (retry)
-              "version": 0,                # # of ACCEPTED (improving) candidates so far
-              "try": 1,                    # attempts at the current version; resets on acceptance
-              "substep": "none",           # propose cursor: none|propose_job|realize|done (resume)
+              "action_retries": 0,      # consecutive failures for the current action (retry)
+              "version": 0,             # version of ACCEPTED (improving) candidates so far
+              "try": 1,                 # attempts at the current version; resets on acceptance
+              "substep": "none",        # propose cursor: none|propose_job|realize|done (resume)
               # model-harness batching: which kind is being proposed this phase + index within it.
               # e.g. harness phase (M_harness proposals), then model phase (M_model), cycling.
               "propose_kind": "harness" if "harness" in args.mode else "model",
@@ -526,6 +526,7 @@ def optimize(args: argparse.Namespace) -> None:
         else:
             st["action_index"] += 1
         st["substep"] = "none"   # a new stage begins fresh; propose re-arms it when it submits
+
     def _repropose_same_iter() -> None:
         """Harness gate: re-propose within the SAME iteration (skip eval_val, do NOT
         bump iteration so skipped candidates do not burn the --iterations budget).
