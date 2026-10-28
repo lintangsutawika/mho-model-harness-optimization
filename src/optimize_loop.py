@@ -672,7 +672,17 @@ def optimize(args: argparse.Namespace) -> None:
                     print(f"  [+] proposal for {tag}: {_title}")
                     if _first:
                         print(f"      {_first}")
-                advance()  # callsite:802
+                # Deterministic handoff to the CAND eval (proposed B): point action_index at
+                # the NEXT eval_train_sample slot + clear job_id so the LOOP TICK submits the
+                # cand eval (eval_after) and waits. Do NOT advance() -- advance left action_index
+                # on the eval_val slot in the live run, skipping the cand eval.
+                _cs = next((i for i, _a in enumerate(st["actions"])
+                            if _a == "eval_train_sample" and i > st["action_index"]),
+                           st["action_index"] + 1)
+                st["action_index"] = _cs
+                st["eval_phase"] = "cand"
+                st["substep"] = "none"
+                st["job_id"] = None
                 append_summary(summary_path, {"iteration": it, "candidate": tag,
                                               "phase": f"{kind_now}_propose",
                                               "status": "ok",
