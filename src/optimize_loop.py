@@ -35,6 +35,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from utils.env import _ACCOUNT, _data_env, _phase_env, _phase_res
+from utils.scores import (append_summary, latest_trials_dir, score_trials,
+                              update_frontier)
+from utils.state import (_candidate_hypothesis, _latest_hf_ckpt, _load_state,
+                              _sample_subset, _save_state, detect_scheduler)
+
 # Max times the harness gate re-proposes WITHIN one iteration before giving up
 # and burning the iteration (bounded safety valve).
 MAX_HARNESS_GATE_SKIPS = 5
@@ -59,44 +65,10 @@ PROPOSE_JOB = os.environ.get("MHO_PROPOSE_JOB", "")
 
 AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.micro_swe_agent:MicroSweAgent")
 POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
-
-
-# --------------------------------------------------------------------------- #
-# Scoring -- reuse scripts/optimize/aggregate_results.py (no duplication).
-# --------------------------------------------------------------------------- #
-_AGG = None
-
-
-def _agg():
-    global _AGG
-    if _AGG is None:
-        spec = importlib.util.spec_from_file_location("aggregate_results", AGGREGATE_PY)
-        _AGG = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(_AGG)  # type: ignore[union-attr]
-    return _AGG
-
-
-def score_trials(trials_dir: str | Path) -> dict[str, Any]:
-    trials_dir = Path(trials_dir)
-    return _agg().aggregate(str(trials_dir), str(trials_dir / "aggregated.jsonl"))
-
-
 # --------------------------------------------------------------------------- #
 # Scheduler abstraction -- PBS (qsub/qstat) or SLURM (sbatch/squeue+sacct).
 # scripts/hpc/ holds the per-scheduler shell wrappers; this is the Python driver side,
 # so the loop is scheduler-agnostic. Force one with MHO_SCHEDULER=pbs|slurm.
-# --------------------------------------------------------------------------- #
-def detect_scheduler() -> str:
-    kind = os.environ.get("MHO_SCHEDULER", "").lower()
-    if kind in ("pbs", "slurm"):
-        return kind
-    if shutil.which("sbatch"):
-        return "slurm"
-    if shutil.which("qsub"):
-        return "pbs"
-    raise RuntimeError("no batch scheduler found (need sbatch or qsub); set MHO_SCHEDULER")
-
-
 class Scheduler:
     """Submit/poll batch jobs on PBS or SLURM behind one interface.
 
@@ -198,17 +170,6 @@ class Scheduler:
 
 # --------------------------------------------------------------------------- #
 # Frontier + summary (JSONL) -- the fitting bits from the reference.
-# --------------------------------------------------------------------------- #
-def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) -> bool:
-    frontier = json.loads(frontier_path.read_text()) if frontier_path.exists() else {}
-    metric = score.get("mean_reward") or score.get("solved_pass@1") or 0.0
-    improved = metric > frontier.get("_best", {}).get("metric", -1)
-    if improved:
-        frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
-    frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
-    frontier_path.write_text(json.dumps(frontier, indent=2))
-    return improved
-
 def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
     """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
     Idempotent + re-runnable: on resume we call this again for any spec file that has no
@@ -264,62 +225,8 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
                         f"## Evidence\n{ev or '- (none)'}\n")
             (cand_dir / "CANDIDATE.md").write_text(_cand_md)
     return True, sr_dir
-
-
-def append_summary(summary_path: Path, row: dict[str, Any]) -> None:
-    with summary_path.open("a") as fh:
-        fh.write(json.dumps(row) + "\n")
-
-
 # --------------------------------------------------------------------------- #
 # Phase submitters -- each returns a job id (or None if the phase is skipped).
-# --------------------------------------------------------------------------- #
-def _phase_env(extra: dict[str, str], scaffold_dir: Path | None) -> dict[str, str]:
-    env = dict(extra)
-    # PBS spools the job script to /var/spool/pbs/..., so the phase scripts' BASH_SOURCE-based
-    # repo-dir resolution is wrong in the job. Pass the real repo dir explicitly.
-    env["MHO_REPO_DIR"] = str(REPO_DIR)
-    env["PYTHONPATH"] = f"{REPO_DIR / 'src'}:{os.environ.get('PYTHONPATH', '')}".rstrip(":")
-    if scaffold_dir is not None:
-        env["MICRO_SCAFFOLD_DIR"] = str(scaffold_dir)
-        env["MINI_FORK_LOCAL"] = str(scaffold_dir)
-    return env
-
-
-_ACCOUNT = os.environ.get("MHO_ACCOUNT", "")  # PBS -P / SLURM -A
-
-
-def _phase_res(phase: str) -> dict[str, str]:
-    """Resolve one phase's resource vars with per-phase override -> shared base -> default.
-
-    Scheduler-agnostic: NGPUS/CPUS are the PORTABLE primary signal -- the Scheduler builds
-    PBS ``-l select=1:ngpus=N:ncpus=C`` and SLURM ``--gres=gpu:N --cpus-per-task=C`` from
-    them, so the same MHO_<PHASE>_NGPUS/CPUS works on either backend. QUEUE/ACCOUNT/WALLTIME
-    are already neutral (PBS -q/-P/-l walltime vs SLURM -p/-A/-t). SELECT (raw PBS
-    ``-l select=`` for full-node/reservation shapes) and RTYPE (PBS ``-v RTYPE=``, ABCI RESERVE
-    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. Per-phase
-    MHO_<PHASE>_<VAR> overrides the shared base MHO_<VAR>; unset falls back to phase defaults.
-    """
-    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
-    get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
-    return {
-        "queue": get("QUEUE") or "",
-        "select": get("SELECT") or "",
-        "resource_type": get("RTYPE") or "",
-        "walltime": get("WALLTIME") or ("08:00:00" if phase == "EVAL" else "24:00:00" if phase == "TRAIN" else "02:00:00"),
-        "ngpus": int(get("NGPUS") or (1 if phase == "EVAL" else 8 if phase == "TRAIN" else 0)),
-        "cpus": int(os.environ.get(f"MHO_{phase}_CPUS", 0) or 0),
-    }
-
-
-def _data_env(data: str) -> dict[str, str]:
-    """Map a data spec to the phase script's -p/-d env: a path on disk -> MHO_DATA_PATH (-p),
-    else a registry name -> MHO_DATA (-d)."""
-    if data and Path(data).exists():
-        return {"MHO_DATA_PATH": data}
-    return {"MHO_DATA": data} if data else {}
-
-
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
                 job_name: str) -> str:
@@ -383,35 +290,6 @@ def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
-
-
-def latest_trials_dir() -> str | None:
-    return os.environ.get("MHO_TRIALS_DIR") or _agg()._newest_trials_dir()
-
-
-def _candidate_hypothesis(candidate_dir: Path) -> str | None:
-    """The candidate's own description of what it changed (CANDIDATE.md), for the summary so the
-    next proposer sees what was tried. None if the agent didn't write one.
-    Harness candidates write <cand>/harness/CANDIDATE.md; model candidates write <cand>/CANDIDATE.md
-    (synthesized from the model_spec). Check both so the record is uniform across kinds."""
-    for md in (candidate_dir / "CANDIDATE.md", candidate_dir.parent / "CANDIDATE.md"):
-        if md.exists():
-            return md.read_text()[:1000].strip()
-    return None
-
-
-def _latest_hf_ckpt(hf_dir: Path) -> Path | None:
-    """Newest loadable HF checkpoint under a miles --save-hf dir (step_N subdirs), or the dir
-    itself if it's already a checkpoint, else None."""
-    if not hf_dir.is_dir():
-        return None
-    steps = sorted((d for d in hf_dir.glob("step_*") if (d / "config.json").exists()),
-                   key=lambda d: int(d.name.split("_")[-1]) if d.name.split("_")[-1].isdigit() else -1)
-    if steps:
-        return steps[-1]
-    return hf_dir if (hf_dir / "config.json").exists() else None
-
-
 # --------------------------------------------------------------------------- #
 # Main loop.
 # --------------------------------------------------------------------------- #
@@ -451,52 +329,6 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     else:
         acts.append("eval")
     return acts
-
-
-def _sample_subset(task_dir: str | Path, k: int, out_dir: Path, seed: int,
-                   sigma_reward: Path | None = None) -> Path:
-    """Copy `k` random problem dirs from a local harbor task dir (`task_dir`) into a fresh
-    `out_dir` (a valid `harbor run -p` target). Each problem = a subdir (e.g. `<id>-python/`)
-    holding instruction.md + task.toml + tests/. Gives the proposer a BOUNDED,
-    fresh-random subset of the full training task instead of eval'ing the whole train set.
-    The sample is deterministic for a given (k, seed); fresh per iteration via a new seed.
-
-    `sigma_reward` (e.g. <RUN>/candidates/<tag>/model/sigma_rewards/<check>.json) is the ONE
-    sigma config for this candidate, applied to ALL of its train tasks: when given, it is copied
-    into every staged task as sigma_reward.json JUST-IN-TIME, so the sigma-aware test.sh applies
-    the sigma reward for this rollout batch without mutating the base train cohort.
-    """
-    task_dir, out_dir = Path(task_dir), Path(out_dir)
-    if k <= 0:
-        raise ValueError(f"propose-sample k must be > 0 (got {k})")
-    problems = sorted(p for p in task_dir.iterdir() if p.is_dir())
-    if not problems:
-        raise ValueError(f"no problem dirs under train task dir: {task_dir}")
-    sample = problems  # if k covers them all, no need to randomize beyond order
-    if k < len(problems):
-        rng = random.Random(seed)
-        sample = rng.sample(problems, k)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    sigma_path = Path(sigma_reward) if sigma_reward else None
-    for p in sample:
-        dst = out_dir / p.name
-        shutil.copytree(p, dst, dirs_exist_ok=True)
-        if sigma_path and sigma_path.is_file():
-            shutil.copy2(sigma_path, dst / "sigma_reward.json")   # JIT: same sigma to all tasks
-    return out_dir
-
-
-def _load_state(path: Path) -> dict | None:
-    try:
-        return json.loads(path.read_text()) if path.exists() else None
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
-def _save_state(path: Path, st: dict) -> None:
-    path.write_text(json.dumps(st, indent=2))
-
-
 def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict | None:
     """Return a state override {rebuilt iteration/version/try/action} to resume at the
     earliest candidate whose artifacts are incomplete, or None if the disk is consistent
