@@ -345,7 +345,8 @@ def actions_for(iteration: int, do_propose: bool, do_train: bool, dual: bool = F
     else:
         acts.append("eval")
     return acts
-def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict | None:
+def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path, *,
+                              do_propose: bool = False, dual: bool = False) -> dict | None:
     """Return a state override {rebuilt iteration/version/try/action} to resume at the
     earliest candidate whose artifacts are incomplete, or None if the disk is consistent
     (no incomplete candidate) and state.json should be trusted.
@@ -388,13 +389,17 @@ def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path) -> dict 
             # results we are mid eval_val, else resume with eval_train_sample first.
             has_ts = (d / "eval").is_dir() and any((d / "eval").glob("*/result.json"))
             action = "eval_val" if has_ts else "eval_train_sample"
+            # Build the FULL mode-appropriate action list (same source of truth as the main
+            # loop, actions_for) so `propose` is present. Hardcoding a 2-list dropped
+            # `propose`, which broke the propose->cand->eval_val handoff on resumed runs
+            # (the _pp fallback + _cs landed on the wrong slot and skipped the cand eval B).
+            _actions = actions_for(iteration, do_propose, do_train=False, dual=dual)
             return {
                 "iteration": iteration,
                 "version": version,
                 "try": try_n,
-                "actions": ["eval_val", "eval_train_sample"] if action == "eval_val"
-                            else ["eval_train_sample", "eval_val"],
-                "action_index": 0,
+                "actions": _actions,
+                "action_index": _actions.index(action) if action in _actions else 0,
                 "resumed_tag": tag,
                 "resume_action": action,
             }
@@ -464,7 +469,8 @@ def optimize(args: argparse.Namespace) -> None:
         # instead of trusting the (possibly drift-shifted) iteration counter.
         cand_dir = run_dir / "candidates"
         if cand_dir.is_dir():
-            over = _resume_from_incomplete(cand_dir, run_dir / "evaluation")
+            over = _resume_from_incomplete(cand_dir, run_dir / "evaluation",
+                                          do_propose=do_propose, dual=bool(args.val_data))
             if over is not None and over["iteration"] < st["iteration"]:
                 # Only reconcile BACK: the found incomplete candidate is at a LOWER
                 # iteration than the current state, so resume there. NEVER force the
