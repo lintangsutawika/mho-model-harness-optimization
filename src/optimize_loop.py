@@ -789,6 +789,7 @@ def optimize(args: argparse.Namespace) -> None:
                         st["job_id"] = _jid
                         st["job_action"] = "propose"
                         _save_state(state_path, st)
+                        return  # do NOT fall through to the trailing advance(); propose is in flight
                     else:
                         # Proposed B on the SAME subset: improved over A -> verify on eval_val.
                         tA = st.get("ts_A")
@@ -808,6 +809,7 @@ def optimize(args: argparse.Namespace) -> None:
                             st["eval_phase"] = None
                             st["job_id"] = None
                             st["action_retries"] = 0
+                            return  # do NOT fall through to the trailing advance(); eval_val is next
                         else:
                             # B did not beat A on this subset -> re-propose from A (same subset)
                             # up to ts_repropose_limit consecutive failures, then fresh subset.
@@ -821,6 +823,7 @@ def optimize(args: argparse.Namespace) -> None:
                                 st["action_index"] = 0
                                 st["substep"] = "none"
                                 st["eval_phase"] = "cand"
+                                return  # re-propose within this iteration; do NOT hit trailing advance
                             else:
                                 # gave up on A/this subset -> fresh subset next iteration.
                                 print(f"  harness candidate failed {lim}x on this subset; "
