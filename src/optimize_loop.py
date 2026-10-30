@@ -30,6 +30,7 @@ import os
 import random
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -819,8 +820,15 @@ def optimize(args: argparse.Namespace) -> None:
                                 print(f"  harness candidate train-sample no improvement "
                                       f"({ts_score:.4f} <= {tA:.4f}); re-propose same subset "
                                       f"(try {st['ts_try']}/{lim})")
-                                st["actions"] = ["propose"]
-                                st["action_index"] = 0
+                                # Re-propose B from A on the SAME subset: keep the FULL action
+                                # list and point action_index at the PROPOSE slot, so the propose
+                                # on_done's anchored handoff schedules the cand eval (B) after it.
+                                # NOT: actions=["propose"] (a 1-list makes the propose on_done's _cs
+                                # compute an out-of-range index -> IndexError).
+                                st["actions"] = actions_for(st["iteration"], do_propose,
+                                                             do_train, dual=bool(args.val_data))
+                                _rpp = next(i for i, _a in enumerate(st["actions"]) if _a == "propose")
+                                st["action_index"] = _rpp
                                 st["substep"] = "none"
                                 st["eval_phase"] = "cand"
                                 return  # re-propose within this iteration; do NOT hit trailing advance
