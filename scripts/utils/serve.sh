@@ -89,7 +89,6 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 vllm_argv=(
     "${APPTAINER_BIN}" exec --nv --writable-tmpfs
     --workdir "${BASE_DIR}"
-    --env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
     --bind "${HF_DIR:-$HOME/.cache/huggingface}:/root/.cache/huggingface"
     "${BASE_SIF}"
     vllm serve "${MODEL}"
