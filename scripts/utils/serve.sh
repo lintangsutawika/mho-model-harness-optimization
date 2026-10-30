@@ -80,9 +80,16 @@ BASE_DIR="${BASE_DIR:-${PBS_LOCALDIR:-${TMPDIR:-/tmp}}}"
 CACHE_DIR="${CACHE_DIR:-${XDG_CACHE_HOME:-${BASE_DIR}}/.cache}"
 mkdir -p "${CACHE_DIR}"
 export APPTAINER_TMPDIR="${BASE_DIR}" SINGULARITY_TMPDIR="${BASE_DIR}"
+# Serve strictly offline from the local HF cache: the model is assumed cached (serve.sh binds
+# HF_DIR). vLLM otherwise issues a hub repo-list call that needs DNS, which intermittently fails
+# on HPC compute nodes (httpx.ConnectError: Temporary failure in name resolution) -> a healthy
+# server never comes up -> the eval produces no score. Offline mode removes the network/name
+# resolution dependency entirely.
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 vllm_argv=(
     "${APPTAINER_BIN}" exec --nv --writable-tmpfs
     --workdir "${BASE_DIR}"
+    --env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
     --bind "${HF_DIR:-$HOME/.cache/huggingface}:/root/.cache/huggingface"
     "${BASE_SIF}"
     vllm serve "${MODEL}"
