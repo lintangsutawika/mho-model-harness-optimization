@@ -682,9 +682,16 @@ def optimize(args: argparse.Namespace) -> None:
                 # the NEXT eval_train_sample slot + clear job_id so the LOOP TICK submits the
                 # cand eval (eval_after) and waits. Do NOT advance() -- advance left action_index
                 # on the eval_val slot in the live run, skipping the cand eval.
+                print(f"      [DBG-PROPOSE idx={st['action_index']} actions={st['actions']} "
+                      f"fin={_fin_action} job={st.get('job_id')}", flush=True)
+                # Anchor to the PROPOSE slot (not the possibly-drifted action_index): the base
+                # on_done set action_index=1, but it was observed to drift to 2 by propose-done,
+                # which made _cs fall to the eval_val slot and skip the cand eval (B).
+                _pp_i = next((i for i, _a in enumerate(st["actions"]) if _a == "propose"),
+                             st["action_index"])
                 _cs = next((i for i, _a in enumerate(st["actions"])
-                            if _a == "eval_train_sample" and i > st["action_index"]),
-                           st["action_index"] + 1)
+                            if _a == "eval_train_sample" and i > _pp_i),
+                           _pp_i + 1)
                 st["action_index"] = _cs
                 st["eval_phase"] = "cand"
                 st["substep"] = "none"
@@ -775,6 +782,8 @@ def optimize(args: argparse.Namespace) -> None:
                             _pp = 1
                         st["action_index"] = _pp
                         st["substep"] = "none"
+                        print(f"      [DBG-BASE pp={_pp} -> action_index={st['action_index']} "
+                              f"eval_phase={st.get('eval_phase')}", flush=True)
                         _jid = submit_propose(sched, run_root=run_dir, logs=tag_dir(cur_tag()) / "logs",
                                               tag=cur_tag(), kind=st["propose_kind"])
                         if _jid is None:
