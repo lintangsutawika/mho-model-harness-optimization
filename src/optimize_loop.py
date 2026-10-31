@@ -440,6 +440,7 @@ def optimize(args: argparse.Namespace) -> None:
         st = {"run_id": run_id, "mode": args.mode, "iteration": start, "action_index": 0,
               "actions": actions_for(start, do_propose, do_train, dual=args.val_data), "job_id": None,
               "job_action": None,       # action label of the in-flight job (for done-echo)
+"propose_count": 0,     # total propose attempts (propose+re-propose); --iterations budget
               "scaffold_dir": None,     # the candidate currently being trained/evaled
               "parent_scaffold": None,  # frontier-best so far; next propose accumulates on it
               "model_dir": None,        # latest trained checkpoint (HF dir); None -> args.model
@@ -586,6 +587,8 @@ def optimize(args: argparse.Namespace) -> None:
         harness = st["scaffold_dir"] or st["parent_scaffold"]           # latest_harness
         model = st["model_dir"] or args.model                          # latest_model (or default)
         if action == "propose":
+            st["propose_count"] = st.get("propose_count", 0) + 1
+            print(f"  [attempt {st['propose_count']}/{args.iterations}] propose {tag}", flush=True)
             return submit_propose(sched, run_root=run_dir, logs=tag_dir(tag) / "logs", tag=tag,
                                   kind=st["propose_kind"])
         if action == "train":
@@ -781,6 +784,9 @@ def optimize(args: argparse.Namespace) -> None:
                             _pp = 1
                         st["action_index"] = _pp
                         st["substep"] = "none"
+                        st["propose_count"] = st.get("propose_count", 0) + 1
+                        print(f"  [attempt {st['propose_count']}/{args.iterations}] propose "
+                              f"{cur_tag()}", flush=True)
                         _jid = submit_propose(sched, run_root=run_dir, logs=tag_dir(cur_tag()) / "logs",
                                               tag=cur_tag(), kind=st["propose_kind"])
                         if _jid is None:
@@ -885,7 +891,7 @@ def optimize(args: argparse.Namespace) -> None:
             advance()  # callsite:930
 
     # ── The loop: wait on the in-flight job, else submit the current stage. ──
-    while st["iteration"] <= args.iterations:
+    while st.get("propose_count", 0) < args.iterations:
         action = st["actions"][st["action_index"]]
         if st["job_id"]:  # a job is in flight -> check and wait
             state, rc = sched.state(st["job_id"])
