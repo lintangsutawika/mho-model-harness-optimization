@@ -134,7 +134,10 @@ class MicroSweAgent(MiniSweAgent):
                 "  curl -LsSf https://astral.sh/uv/install.sh | sh; fi && "
                 'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; fi && '
                 'export PATH="$HOME/.local/bin:$PATH" && '
-                f"uv tool install {scaffold_dir} "
+                # Pin the interpreter: with no python >=3.11 in the image, uv downloads the newest
+                # CPython, and on a release too new for wheels (3.15) fastuuid/orjson build from
+                # Rust source and fail.
+                f"uv tool install --python 3.12 {scaffold_dir} "
                 # mcp: litellm's response handler imports mcp.types; without it every agent
                 # trial crashes with ModuleNotFoundError. Pin alongside litellm.
                 "--with litellm --with mcp --with orjson --with fastapi && "
