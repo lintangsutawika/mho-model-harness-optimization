@@ -677,7 +677,18 @@ def optimize(args: argparse.Namespace) -> None:
                 # CANDIDATE.md (hypothesis + change summary) if it wrote one.
                 _hyp = _candidate_hypothesis(tag_dir(tag)) if kind_now != "model" else None
                 if _hyp:
-                    _title = _hyp.splitlines()[0].lstrip("# ").strip() if _hyp.splitlines() else ""
+                    # Title: skip a generic leading header (# CANDIDATE.md / # Candidate / # Hypothesis)
+                    # and use the first substantive line, so the log shows WHAT changed rather
+                    # than echoing "CANDIDATE.md".
+                    _title = ""
+                    for _ln in _hyp.splitlines():
+                        _t = _ln.lstrip("# ").strip()
+                        if not _t:
+                            continue
+                        if _t.lower().rstrip(":") in ("candidate.md", "candidate", "candidate:", "hypothesis"):
+                            continue
+                        _title = _t[:120]
+                        break
                     _first = " ".join((_hyp.splitlines()[1:2] or [""]))[:160]
                     print(f"  [+] proposal for {tag}: {_title}")
                     if _first:
