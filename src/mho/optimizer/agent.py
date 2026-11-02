@@ -124,6 +124,14 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
         _src = _c / "eval_after" if (_c / "eval_after").is_dir() else _c / "eval_before"
         if _src.is_dir() and any(_src.glob("*/result.json")):
             cand_trials.append(_src)
+        # also pull ARCHIVED prior attempts (<run>/attempts/<tag>/attempt_N/eval_after) --
+        # these preserve traces that were overwritten by later re-proposes on the same tag.
+        _att = run / "attempts" / _c.name
+        for _a in sorted(_att.glob("attempt_*/eval_after"), reverse=True):
+            if len(cand_trials) >= _MAX_TRIAL_DIRS:
+                break
+            if _a.is_dir() and any(_a.glob("*/result.json")):
+                cand_trials.append(_a)
     trials = cand_trials if cand_trials else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
@@ -149,16 +157,10 @@ def _stage_prior_results(dst: Path, paths: dict[str, Path]) -> None:
                 "refusing to stage val-split trials into the proposer workspace: "
                 f"{_t} (validation set must stay hidden from the optimizer)"
             )
-    srcs = {
-        "frontier.json": paths["frontier"],
-        "evolution_summary.jsonl": paths["summary"],
-    }
-    if not any(v.exists() for v in srcs.values()) and not trial_srcs:
-        return
+    # NOTE: frontier.json + evolution_summary.jsonl are intentionally NOT staged into
+    # eval_prior/ -- they live at the run root (<RUN>/frontier.json, <RUN>/evolution_summary.jsonl)
+    # and the proposer workspace is a subdir of the run, so the agent reads them at ../../.
     prior.mkdir(parents=True, exist_ok=True)
-    for name, path in srcs.items():
-        if path and path.is_file():
-            shutil.copy2(path, prior / name)
     if trial_srcs:
         traj = prior / "trials"
         _n = 0
