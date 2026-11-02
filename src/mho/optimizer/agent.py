@@ -98,8 +98,9 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     run = Path(os.environ.get("MHO_RUN_DIR") or "").expanduser()
     if not run.is_dir():
         sys.exit(f"[propose] MHO_RUN_DIR not set or missing: {run}")
-    frontier = run / "frontier.json"
-    summary = run / "evolution_summary.jsonl"
+    # Relocated into candidates/ (the optimizer's single accessible root).
+    frontier = run / "candidates" / "frontier.json"
+    summary = run / "candidates" / "summary.json"
     diff_dir = candidate_dir.parent / "diff"
     best_tag = ""
     if frontier.is_file():
@@ -308,20 +309,24 @@ def main() -> int:
     if kind not in PROPOSE_KINDS:
         sys.exit(f"[propose] unknown MHO_PROPOSE_KIND {kind!r} (choose from {PROPOSE_KINDS})")
 
-    cand_unit = run / "candidates" / tag          # one dir per candidate: harness/ + model_specs/ + eval_prior/
+    cand_root = run / "candidates"                # optimizer's single accessible root
+    cand_unit = cand_root / tag                   # one dir per candidate: harness/ + model_specs/
     harness_dst = cand_unit / "harness"           # installable scaffold (kind == harness)
     spec_dst = cand_unit / "model_specs"          # what-the-model-should-learn specs (kind == model)
     paths = _derive_paths(harness_dst)
     parent = paths["parent"]
 
-    # Workspace = the candidate unit dir. The archive (parent harness + train-sample eval +
-    # frontier/summary) is mounted under eval_prior/ for the agent to analyze. The agent then
-    # edits harness/ (harness) OR writes model_specs/ (model) -- exactly one output kind.
+    # Workspace = candidates/ (the whole candidate archive). The optimizer thus sees EVERYTHING:
+    # frontier.json, summary.json, every candidate's harness/, status.json (accepted/rejected),
+    # eval_before/ + eval_after/ train-sample traces -- no eval_prior/ staging needed. The agent
+    # edits <tag>/harness (harness) OR writes <tag>/model_specs (model) -- the only writable
+    # output; it should treat other candidates + summary/frontier as read-only reference
+    # (enforced soft by instructions; the proposal diff only counts harness/ or model_specs/).
+    cand_root.mkdir(parents=True, exist_ok=True)
     cand_unit.mkdir(parents=True, exist_ok=True)
     if kind == "harness":
         _materialize_from(parent, harness_dst)    # accumulate: build on the frontier-best
-    _stage_prior_results(cand_unit, paths)        # mount prior eval results -> eval_prior/
-    _run_openhands(cand_unit, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
+    _run_openhands(cand_root, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
 
     if kind == "model":
         from mho.optimizer import model_spec

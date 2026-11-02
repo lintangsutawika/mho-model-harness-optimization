@@ -3,10 +3,20 @@ scaffold-evolution workflow: analyze, state ONE falsifiable hypothesis, implemen
 minimal additive change, validate the package, and write CANDIDATE.md.
 
 ## Your workspace
-The micro-swe-agent scaffold snapshot is your working directory -- it already contains
-the accumulated changes from the best iteration so far (you are building ON TOP of it,
-not from scratch). Edit files here in place to add ONE more improvement; keep it an
-installable package (pyproject.toml + src/).
+Your working directory is the run's `candidates/` archive -- it gives you access to ALL
+optimization information in one place:
+- `frontier.json` -- the current best candidate and its val score (the accept bar).
+- `summary.json` -- the history of every proposal and its outcome.
+- `<tag>/harness/` -- each candidate's harness code.
+- `<tag>/status.json` -- whether that harness was ACCEPTED or REJECTED (with outcome + score).
+- `<tag>/eval_before/` and `<tag>/eval_after/` -- the real train-sample execution traces
+  (result.json + agent transcripts) for each candidate's base (A) and proposed (B) harness.
+
+You build ON the frontier-best harness. Your task: add ONE improvement to the CURRENT
+candidate, editing ONLY `./<tag>/harness/` (the installable scaffold with pyproject.toml +
+src/). Treat all OTHER candidates' dirs + `frontier.json` + `summary.json` + `status.json`
+as READ-ONLY reference -- never edit them. Your proposal's diff must be confined to
+`./<tag>/harness/` (or `./<tag>/model_specs/` for a model proposal).
 
 ## HARD CONSTRAINTS (a candidate that violates these will be REJECTED)
 - Make MINIMAL, mostly-ADDITIVE edits for your ONE mechanism. Change only the files that
@@ -16,37 +26,24 @@ installable package (pyproject.toml + src/).
 - Keep it an installable package that still imports. Do not run destructive shell commands
   (rm -rf, git clean, moving the whole tree, etc.).
 
-## Prior results
-Prior eval results are mounted under `eval_prior/` in your workspace -- read them directly
-with the file editor for full detail:
-- `eval_prior/frontier.json`
-- `eval_prior/evolution_summary.jsonl`
-- `eval_prior/aggregated.jsonl`
-- `eval_prior/trials/` (one dir per trial, named `<candidate>__<trial>` so you can tell
-  which prior proposal it came from; each holds `result.json` + `agent/mini-swe-agent.txt` +
-  `agent/mini-swe-agent.trajectory.json`). These are REAL execution traces staged from PRIOR
-  candidates (their train-sample eval_after trials) -- study them to understand exactly how
-  prior harness edits behaved, not just their aggregate scores.
+## Prior results (read these, then propose something novel)
+Start by reading `./frontier.json`, `./summary.json`, and the recent candidates'
+`<tag>/harness/` + `<tag>/status.json` + `<tag>/eval_before/` + `<tag>/eval_after/`
+traces to identify the single most promising failure mode. Especially read `./summary.json`
+-- it is the history of every proposal so far, each row labeled with its `outcome`
+(`train_fail`, `train_pass_val_fail`, `train_pass_val_pass` = accepted, or `failed_both`),
+plus the hypothesis, ts_A/ts_B scores, and (via `<tag>/status.json`) whether each harness
+was ACCEPTED or REJECTED on the held-out val gate.
 
-Start by reading these **especially `eval_prior/evolution_summary.jsonl`** to identify the
-single most promising failure mode.
+**AVOID REPEATING PRIOR ATTEMPTS.** Your proposed mechanism MUST be **novel** -- it must
+not re-propose the same underlying fix that already appears in `./summary.json` or in a
+prior candidate's harness. If an idea is already there and failed (REJECTED), or is a
+re-wording of one that was tried, pick a different failure mode. Build on ACCEPTED winners,
+avoid repeating rejected regressions.
 
-**AVOID REPEATING PRIOR ATTEMPTS.** `evolution_summary.jsonl` is the history of every
-proposal so far: each row's `outcome` tells you whether the attempt `train_fail`ed,
-`train_pass_val_fail`ed (improved on the train sample but not on the held-out val set),
-`train_pass_val_pass`ed (improved on both, accepted), or `failed_both`, plus its
-`hypothesis` (what was actually changed) and the `ts_A`/`ts_B` train-sample scores.
-
-Your proposed mechanism MUST be **novel** -- it must not re-propose the same underlying
-fix that already appears in `evolution_summary.jsonl`. If an idea is already there and
-failed, or is a re-wording of one that was tried, pick a different failure mode. Study the
-`outcome` column to learn what worked vs. what regressed, build on winners, and avoid
-repeating regressions.
-
-NOTE: you see only the training-sample eval (eval_prior/trials). The validation set is
-deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT attempt to
-reconstruct or infer val results.
-Do NOT edit anything under `eval_prior/` -- it is read-only reference material.
+NOTE: you see only the training-sample evals (eval_before/eval_after). The held-out
+validation set is deliberately NOT shown to you -- it is the accept/reject gate. Do NOT
+attempt to reconstruct or infer val results.
 
 Now: analyze the above, state ONE falsifiable hypothesis, make the single targeted
 general-purpose change (minimal + additive), verify the package still imports, and write

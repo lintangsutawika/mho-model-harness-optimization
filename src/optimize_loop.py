@@ -436,8 +436,13 @@ def optimize(args: argparse.Namespace) -> None:
     run_dir = RUNS_DIR / run_id
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
-    frontier_path = run_dir / "frontier.json"
-    summary_path = run_dir / "evolution_summary.jsonl"
+    # The optimizer's single accessible root: candidates/ holds frontier.json + summary.json
+    # plus every candidate's harness + train-sample eval traces. Move the run-level frontier
+    # and evolution summary here so the proposer sees ALL information under candidates/.
+    cand_root = run_dir / "candidates"
+    cand_root.mkdir(parents=True, exist_ok=True)
+    frontier_path = cand_root / "frontier.json"
+    summary_path = cand_root / "summary.json"
     state_path = run_dir / "state.json"
 
     do_train = "model" in args.mode
@@ -932,6 +937,21 @@ def optimize(args: argparse.Namespace) -> None:
                 _outcome = ("train_pass_val_pass" if improved else
                             "train_pass_val_fail" if _tgr == "train_pass" else
                             "failed_both")
+                # Per-candidate accept/reject status, written into the candidate dir so the
+                # optimizer (workspace = candidates/) sees whether this harness was accepted.
+                _acc = bool(improved and st["scaffold_dir"])
+                _cstat = tag_dir(tag) / "status.json"
+                try:
+                    _cstat.write_text(json.dumps({
+                        "candidate": tag, "iteration": it, "accepted": _acc,
+                        "outcome": _outcome, "train_gate": _tgr,
+                        "val_improved": bool(improved),
+                        "score": score.get("mean_reward"),
+                        "pass_at_1": score.get("solved_pass@1"),
+                        "hypothesis": hypothesis,
+                    }, indent=2))
+                except OSError:
+                    pass
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
