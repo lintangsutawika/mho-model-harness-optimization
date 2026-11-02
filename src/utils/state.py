@@ -66,8 +66,12 @@ def _candidate_hypothesis(candidate_dir: Path) -> str | None:
     """The candidate's own description of what it changed (CANDIDATE.md), for the summary so the
     next proposer sees what was tried. None if the agent didn't write one.
     Harness candidates write <cand>/harness/CANDIDATE.md; model candidates write <cand>/CANDIDATE.md
-    (synthesized from the model_spec). Check both so the record is uniform across kinds."""
-    for md in (candidate_dir / "CANDIDATE.md", candidate_dir.parent / "CANDIDATE.md"):
+    (synthesized from the model_spec). Check both so the record is uniform across kinds.
+    Called with the candidate ROOT (<RUN>/candidates/<tag>) in the loop, so look under
+    <tag>/harness/CANDIDATE.md too (the harness proposer's output location)."""
+    for md in (candidate_dir / "CANDIDATE.md",
+               candidate_dir.parent / "CANDIDATE.md",
+               candidate_dir / "harness" / "CANDIDATE.md"):
         if md.exists():
             return md.read_text()[:1000].strip()
     return None
