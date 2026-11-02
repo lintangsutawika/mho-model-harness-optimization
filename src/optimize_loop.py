@@ -690,7 +690,9 @@ def optimize(args: argparse.Namespace) -> None:
                         _t = _ln.lstrip("# ").strip()
                         if not _t:
                             continue
-                        if _t.lower().rstrip(":") in ("candidate.md", "candidate", "candidate:", "hypothesis"):
+                        if _t.lower().rstrip(":") in ("candidate.md", "candidate", "candidate:", "hypothesis",
+                                                       "candidate proposal", "candidate proposal:",
+                                                       "proposal", "proposal:", "candidate overview"):
                             continue
                         _title = _t[:120]
                         break
