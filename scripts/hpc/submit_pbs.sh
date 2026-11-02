@@ -19,6 +19,9 @@ TARGET="$1"; shift
 QSUB=(qsub -V -j oe -N "${JOB_NAME:-mho-$(basename "$TARGET" .sh)}")
 [ -n "${PBS_QUEUE:-}" ] && QSUB+=(-q "$PBS_QUEUE")
 [ -n "${PBS_GROUP:-}" ] && QSUB+=(-P "$PBS_GROUP")
+# ABCI RESERVE queues require -v RTYPE=<type> (e.g. rt_HF = 8-GPU node, rt_HC = CPU).
+# Mirrors the loop's MHO_RTYPE handling. Override with PBS_RTYPE.
+[ -n "${PBS_RTYPE:-}${MHO_RTYPE:-}" ] && QSUB+=(-v "RTYPE=${PBS_RTYPE:-$MHO_RTYPE}")
 SEL="${PBS_SELECT-select=1:ngpus=8}"; [ -n "$SEL" ] && QSUB+=(-l "$SEL")
 QSUB+=(-l "walltime=${PBS_WALLTIME:-24:00:00}")
 [ -n "${PBS_OUT:-}" ] && QSUB+=(-o "$PBS_OUT")
