@@ -113,7 +113,18 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     parent = (run / "candidates" / best_tag / "harness") if best_tag else Path("")
     if not parent or not (parent / "pyproject.toml").exists():
         parent = _original_base()
-    trials = (run / "candidates" / best_tag / "eval") if best_tag else Path("")
+    cand_trials: list[Path] = []
+    _tags = sorted((d for d in (run / "candidates").glob("candidate_*") if d.is_dir()),
+                   key=lambda d: d.name, reverse=True)
+    _ordered = [run / "candidates" / best_tag] if best_tag else []
+    _ordered += [t for t in _tags if t.name != best_tag]
+    for _c in _ordered:
+        if len(cand_trials) >= _MAX_TRIAL_DIRS:
+            break
+        _src = _c / "eval_after" if (_c / "eval_after").is_dir() else _c / "eval_before"
+        if _src.is_dir() and any(_src.glob("*/result.json")):
+            cand_trials.append(_src)
+    trials = cand_trials if cand_trials else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
 
@@ -131,37 +142,42 @@ def _stage_prior_results(dst: Path, paths: dict[str, Path]) -> None:
     # so staging from it is safe; refuse any path that looks like a val eval just in case.
     prior = dst / "eval_prior"
     trials = paths["trials"]
-    if "evaluation" in trials.parts or "eval-val" in trials.parts:
-        raise RuntimeError(
-            "refusing to stage val-split trials into the proposer workspace: "
-            f"{trials} (validation set must stay hidden from the optimizer)"
-        )
+    trial_srcs = trials if isinstance(trials, list) else ([trials] if trials and Path(trials).is_dir() else [])
+    for _t in trial_srcs:
+        if "evaluation" in _t.parts or "eval-val" in _t.parts:
+            raise RuntimeError(
+                "refusing to stage val-split trials into the proposer workspace: "
+                f"{_t} (validation set must stay hidden from the optimizer)"
+            )
     srcs = {
         "frontier.json": paths["frontier"],
         "evolution_summary.jsonl": paths["summary"],
-        "aggregated.jsonl": trials / "aggregated.jsonl",
     }
-    if not any(v.exists() for v in srcs.values()) and not trials.is_dir():
+    if not any(v.exists() for v in srcs.values()) and not trial_srcs:
         return
     prior.mkdir(parents=True, exist_ok=True)
     for name, path in srcs.items():
         if path and path.is_file():
             shutil.copy2(path, prior / name)
-    if trials and trials.is_dir():
+    if trial_srcs:
         traj = prior / "trials"
-        for i, trial_dir in enumerate(sorted(trials.glob("*"))):
-            if i >= _MAX_TRIAL_DIRS:
-                break
-            if not trial_dir.is_dir():
-                continue
-            tgt = traj / trial_dir.name
-            tgt.mkdir(parents=True, exist_ok=True)
-            for rel in ("result.json", "agent/mini-swe-agent.txt", "agent/mini-swe-agent.trajectory.json"):
-                f = trial_dir / rel
-                if f.is_file():
-                    tf = tgt / rel
-                    tf.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(f, tf)
+        _n = 0
+        for _src in trial_srcs:
+            _cand = _src.parent.name
+            for trial_dir in sorted(_src.glob("*")):
+                if _n >= _MAX_TRIAL_DIRS:
+                    break
+                if not trial_dir.is_dir():
+                    continue
+                tgt = traj / f"{_cand}__{trial_dir.name}"
+                tgt.mkdir(parents=True, exist_ok=True)
+                for rel in ("result.json", "agent/mini-swe-agent.txt", "agent/mini-swe-agent.trajectory.json"):
+                    f = trial_dir / rel
+                    if f.is_file():
+                        tf = tgt / rel
+                        tf.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, tf)
+                _n += 1
     print(f"[propose] staged prior eval results in {prior}")
 
 

@@ -22,8 +22,11 @@ with the file editor for full detail:
 - `eval_prior/frontier.json`
 - `eval_prior/evolution_summary.jsonl`
 - `eval_prior/aggregated.jsonl`
-- `eval_prior/trials/` (one dir per trial, with `result.json` + `agent/mini-swe-agent.txt` +
-  `agent/mini-swe-agent.trajectory.json`)
+- `eval_prior/trials/` (one dir per trial, named `<candidate>__<trial>` so you can tell
+  which prior proposal it came from; each holds `result.json` + `agent/mini-swe-agent.txt` +
+  `agent/mini-swe-agent.trajectory.json`). These are REAL execution traces staged from PRIOR
+  candidates (their train-sample eval_after trials) -- study them to understand exactly how
+  prior harness edits behaved, not just their aggregate scores.
 
 Start by reading these **especially `eval_prior/evolution_summary.jsonl`** to identify the
 single most promising failure mode.
