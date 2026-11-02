@@ -407,30 +407,6 @@ def _resume_from_incomplete(candidates_dir: Path, evaluation_dir: Path, *,
     return None
 
 
-def _archive_attempt(run_dir: Path, tag: str) -> None:
-    """Copy a candidate's eval results + harness into <run>/attempts/<tag>/<N>/ before a
-    re-propose overwrites them, so every attempt (proposal + its eval_before/after traces) is
-    preserved for the optimizer to reference later. No-op if nothing to archive."""
-    cand = run_dir / "candidates" / tag
-    if not cand.is_dir():
-        return
-    n = len(list((run_dir / "attempts" / tag).glob("attempt_*"))) if (run_dir / "attempts" / tag).is_dir() else 0
-    dst = run_dir / "attempts" / tag / f"attempt_{n}"
-    dst.mkdir(parents=True, exist_ok=True)
-    moved = False
-    for sub in ("eval_before", "eval_after"):
-        src = cand / sub
-        if src.is_dir():
-            shutil.copytree(src, dst / sub, dirs_exist_ok=True)
-            moved = True
-    md = cand / "CANDIDATE.md"
-    if md.is_file():
-        shutil.copy2(md, dst / "CANDIDATE.md")
-        moved = True
-    if moved:
-        print(f"  [archive] {tag} attempt_{n} saved -> {dst}")
-
-
 def optimize(args: argparse.Namespace) -> None:
     run_id = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / run_id
@@ -870,7 +846,12 @@ def optimize(args: argparse.Namespace) -> None:
                             st["ts_try"] = st.get("ts_try", 0) + 1
                             lim = st.get("ts_repropose_limit", 3)
                             if st["ts_try"] < lim:
-                                _archive_attempt(run_dir, tag)
+                                # Each re-propose attempt becomes its OWN candidate dir
+                                # (candidate_<it>_<ver>_<try>): bump `try` so the next propose uses
+                                # a NEW tag instead of overwriting this candidate's eval_after.
+                                # No archive step needed -- every attempt is preserved as its
+                                # own candidate under candidates/ and is visible to the optimizer.
+                                st["try"] = st.get("try", 1) + 1
                                 append_summary(summary_path, {"iteration": it, "candidate": tag,
                                                                       "phase": "train_gate", "ts_A": tA,
                                                                       "ts_B": ts_score,

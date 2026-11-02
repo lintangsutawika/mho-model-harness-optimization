@@ -125,14 +125,6 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
         _src = _c / "eval_after" if (_c / "eval_after").is_dir() else _c / "eval_before"
         if _src.is_dir() and any(_src.glob("*/result.json")):
             cand_trials.append(_src)
-        # also pull ARCHIVED prior attempts (<run>/attempts/<tag>/attempt_N/eval_after) --
-        # these preserve traces that were overwritten by later re-proposes on the same tag.
-        _att = run / "attempts" / _c.name
-        for _a in sorted(_att.glob("attempt_*/eval_after"), reverse=True):
-            if len(cand_trials) >= _MAX_TRIAL_DIRS:
-                break
-            if _a.is_dir() and any(_a.glob("*/result.json")):
-                cand_trials.append(_a)
     trials = cand_trials if cand_trials else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
