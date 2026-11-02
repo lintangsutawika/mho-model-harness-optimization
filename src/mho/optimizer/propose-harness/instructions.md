@@ -25,7 +25,20 @@ with the file editor for full detail:
 - `eval_prior/trials/` (one dir per trial, with `result.json` + `agent/mini-swe-agent.txt` +
   `agent/mini-swe-agent.trajectory.json`)
 
-Start by reading these to identify the single most promising failure mode.
+Start by reading these **especially `eval_prior/evolution_summary.jsonl`** to identify the
+single most promising failure mode.
+
+**AVOID REPEATING PRIOR ATTEMPTS.** `evolution_summary.jsonl` is the history of every
+proposal so far: each row's `outcome` tells you whether the attempt `train_fail`ed,
+`train_pass_val_fail`ed (improved on the train sample but not on the held-out val set),
+`train_pass_val_pass`ed (improved on both, accepted), or `failed_both`, plus its
+`hypothesis` (what was actually changed) and the `ts_A`/`ts_B` train-sample scores.
+
+Your proposed mechanism MUST be **novel** -- it must not re-propose the same underlying
+fix that already appears in `evolution_summary.jsonl`. If an idea is already there and
+failed, or is a re-wording of one that was tried, pick a different failure mode. Study the
+`outcome` column to learn what worked vs. what regressed, build on winners, and avoid
+repeating regressions.
 
 NOTE: you see only the training-sample eval (eval_prior/trials). The validation set is
 deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT attempt to

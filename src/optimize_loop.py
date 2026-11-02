@@ -827,6 +827,13 @@ def optimize(args: argparse.Namespace) -> None:
                             st["eval_phase"] = None
                             st["job_id"] = None
                             st["action_retries"] = 0
+                            append_summary(summary_path, {"iteration": it, "candidate": tag,
+                                                          "phase": "train_gate", "ts_A": tA,
+                                                          "ts_B": ts_score,
+                                                          "train_gate": "improved",
+                                                          "outcome": "train_pass",
+                                                          "hypothesis": _candidate_hypothesis(tag_dir(tag) / "harness")})
+                            st["train_gate_result"] = "train_pass"
                             return  # do NOT fall through to the trailing advance(); eval_val is next
                         else:
                             # B did not beat A on this subset -> re-propose from A (same subset)
@@ -834,6 +841,12 @@ def optimize(args: argparse.Namespace) -> None:
                             st["ts_try"] = st.get("ts_try", 0) + 1
                             lim = st.get("ts_repropose_limit", 3)
                             if st["ts_try"] < lim:
+                                append_summary(summary_path, {"iteration": it, "candidate": tag,
+                                                                      "phase": "train_gate", "ts_A": tA,
+                                                                      "ts_B": ts_score,
+                                                                      "train_gate": "no_improvement",
+                                                                      "outcome": "train_fail",
+                                                                      "hypothesis": _candidate_hypothesis(tag_dir(tag) / "harness")})
                                 print(f"  harness candidate train-sample no improvement "
                                       f"({ts_score:.4f} <= {tA:.4f}); re-propose same subset "
                                       f"(try {st['ts_try']}/{lim})")
@@ -890,9 +903,14 @@ def optimize(args: argparse.Namespace) -> None:
                 # record WHAT this candidate changed (its CANDIDATE.md), so the next proposer
                 # can learn from the outcome (build on winners, avoid repeating regressions).
                 hypothesis = _candidate_hypothesis(tag_dir(tag) / "harness")
+                _tgr = st.pop("train_gate_result", "train_pass")
+                _outcome = ("train_pass_val_pass" if improved else
+                            "train_pass_val_fail" if _tgr == "train_pass" else
+                            "failed_both")
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
+                                              "train_gate": _tgr, "outcome": _outcome,
                                               "hypothesis": hypothesis})
                 _cur = json.loads(frontier_path.read_text()).get("_best", {}) if frontier_path.exists() else {}
                 _inc = f"{_cur.get('candidate', 'none')} @ {_cur.get('metric')}"
