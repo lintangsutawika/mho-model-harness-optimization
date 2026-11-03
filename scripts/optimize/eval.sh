@@ -42,7 +42,7 @@ export PYTHONSAFEPATH=1
 # than `uv run`, which re-syncs the git harbor dep per job on a fresh node-local uv cache and
 # left harbor missing in the batch eval. Override with MHO_VENV_BIN.
 VENV_BIN="${MHO_VENV_BIN:-${REPO_DIR}/.venv/bin}"
-if [ -f "${REPO_DIR}/.env" ]; then set -a; . "${REPO_DIR}/.env"; set +a; fi
+. "${REPO_DIR}/scripts/utils/load_env.sh" && load_env "${REPO_DIR}/.env"
 # Every sif this script needs sits next to BASE_SIF. Resolve the dir now (empty if BASE_SIF is
 # unset) and demand it only on the paths that use one -- a modal run needs no image at all.
 SIF_DIR="${BASE_SIF:+$(dirname "${BASE_SIF}")}"
@@ -136,6 +136,11 @@ if [ -n "${MHO_MODEL:-}" ]; then
   # vLLM serving runs from BASE_SIF itself (it ships vllm serve); no separate vllm-cuda.sif.
   [ -f "${BASE_SIF}" ] || { echo "ERROR: MHO_MODEL set but BASE_SIF missing: ${BASE_SIF}" >&2; exit 1; }
   mkdir -p "${MHO_OUT:-/tmp}"
+  # Preflight: fail in 1s (not after a 10-min health poll) if this node has no GPU.
+  if ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "[eval] ERROR: no GPU visible on $(hostname) (RTYPE=${RTYPE:-unset}, PBS_JOBID=${PBS_JOBID:-?}); cannot serve ${MHO_MODEL}" >&2
+    exit 1
+  fi
   # Delegate serving to the reusable scripts/utils/serve.sh (loads the per-model serve
   # config, sets DP/TP/MAX_MODEL_LEN, and starts vLLM from BASE_SIF). Use_RELAY=1 exposes it
   # via the Modal gateway. serve.sh runs vLLM in the foreground; we background it and poll.
@@ -151,7 +156,11 @@ if [ -n "${MHO_MODEL:-}" ]; then
   bash "${REPO_DIR}/scripts/utils/serve.sh" > "${MHO_OUT:-/tmp}/vllm_serve.log" 2>&1 &
 
   VLLM_PID=$!
-  for _ in $(seq 1 120); do curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 && break; sleep 5; done
+  for _ in $(seq 1 120); do
+    curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 && break
+    kill -0 "${VLLM_PID}" 2>/dev/null || { echo "[eval] vLLM process exited during startup" >&2; break; }
+    sleep 5
+  done
   curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
     || { echo "[eval] vLLM not healthy; see ${MHO_OUT:-/tmp}/vllm_serve.log" >&2; exit 1; }
   MODEL="litellm_proxy/${SERVED_NAME}"; VLLM_LOCAL_URL="http://localhost:${VLLM_PORT}"
