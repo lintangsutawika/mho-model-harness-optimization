@@ -47,6 +47,9 @@ from utils.state import (_candidate_hypothesis, _latest_hf_ckpt, _load_state,
 MAX_HARNESS_GATE_SKIPS = 5
 # Retries before a failing action (no score / bad rc) is treated as failed.
 MAX_ACTION_RETRIES = 3
+# Abort the loop after this many CONSECUTIVE evals that still produced no score after all
+# retries (infra failure: no GPU, vLLM down, ...) instead of burning the iteration budget.
+MAX_EVAL_INFRA_FAILS = int(os.environ.get("MHO_MAX_EVAL_INFRA_FAILS", "3"))
 
 # Max times the harness gate re-proposes WITHIN one iteration before giving up
 # and burning the iteration (bounded safety valve).
@@ -90,6 +93,13 @@ class Scheduler:
         # the exact string. `resource_type` -> PBS `-v RTYPE=...`, required by ABCI reservation
         # (RESERVE) queues (e.g. rt_HF / rt_HC). On SLURM both are ignored (use gres/cpus).
         job_env = {**os.environ, **{k: str(v) for k, v in env.items()}}
+        # qsub -V exports the SUBMITTER's env. When the driver itself runs in a PBS job
+        # (e.g. rt_HC via submit_pbs.sh), its RTYPE=rt_HC leaks into every child and ABCI's
+        # reservation hook honors it over `-v RTYPE=...` -> evals land on CPU-only nodes
+        # (ngpus=0). Drop the inherited value; set it only from this phase's resource_type.
+        job_env.pop("RTYPE", None)
+        if resource_type:
+            job_env["RTYPE"] = resource_type
         if out_dir:
             out_dir.mkdir(parents=True, exist_ok=True)
         if self.kind == "pbs":
@@ -748,6 +758,8 @@ def optimize(args: argparse.Namespace) -> None:
             else:  # eval_val (dual) or `eval` (single-set): the val accept gate.
                 trials_dir = run_dir / "evaluation" / tag
             has_trials = trials_dir.is_dir() and any(trials_dir.glob("*/result.json"))
+            if rc == 0 and has_trials:
+                st["eval_infra_fails"] = 0
             if rc != 0 or not has_trials:
                 append_summary(summary_path, {"iteration": it, "candidate": tag, "phase": action,
                                               "status": f"rc={rc}" if rc else "no_trials",
@@ -769,6 +781,21 @@ def optimize(args: argparse.Namespace) -> None:
                     _save_state(state_path, st)
                     return
                 st["action_retries"] = 0
+                # All retries exhausted with no score -> infra failure, not a bad candidate.
+                # Abort on a failed baseline (nothing to compare against) or after
+                # MAX_EVAL_INFRA_FAILS consecutive such evals. State is saved with the counter
+                # reset so a restart after fixing the infra retries this same eval.
+                st["eval_infra_fails"] = st.get("eval_infra_fails", 0) + 1
+                if it == 0 or st["eval_infra_fails"] >= MAX_EVAL_INFRA_FAILS:
+                    _why = ("baseline eval" if it == 0 else
+                            f"{st['eval_infra_fails']} consecutive evals")
+                    st["eval_infra_fails"] = 0
+                    st["job_id"] = None
+                    _save_state(state_path, st)
+                    raise RuntimeError(
+                        f"ABORT: {_why} produced no score after {MAX_ACTION_RETRIES} attempts each "
+                        f"(last: {action} {tag}, rc={rc}, trials={trials_dir}). Likely infra "
+                        f"(no GPU / vLLM failed) -- check {tag_dir(tag)}/logs and vllm_serve.log.")
                 # HARNESS-ONLY: a train-sample eval that produced no score is NOT a verified
                 # improvement -- skip the expensive eval_val and re-propose instead of
                 # wasting ~3h verifying a candidate that gave the proposer no signal.
