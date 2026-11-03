@@ -12,7 +12,7 @@
 #   OPENHANDS_PKGS      uv --with packages (default: openhands-sdk openhands-tools litellm)
 set -euo pipefail
 REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}}"; cd "$REPO_DIR"
-[ -f .env ] && { set -a; . .env; set +a; }
+. scripts/utils/load_env.sh && load_env .env
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
 # would shadow src/harness/ (micro_swe_agent lives only in src). src stays on
