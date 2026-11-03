@@ -10,6 +10,8 @@
 #
 # Resources (env, overridable): PBS_SELECT (default select=1:ngpus=8 -- set to select=1 for a
 #   CPU-only eval), PBS_WALLTIME (24:00:00), PBS_QUEUE, PBS_GROUP, JOB_NAME, PBS_OUT.
+#   PBS_OUT may contain %j: PBS does not expand it (unlike SLURM) and the job id is unknown
+#   until qsub returns, so %j is replaced here with <YYYYmmdd-HHMMSS>-<pid> -> unique per submit.
 set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "$#" -ge 1 ] || { echo "usage: bash $0 <target-script relative to repo> [args...]" >&2; exit 2; }
@@ -24,7 +26,11 @@ QSUB=(qsub -V -j oe -N "${JOB_NAME:-mho-$(basename "$TARGET" .sh)}")
 [ -n "${PBS_RTYPE:-}${MHO_RTYPE:-}" ] && QSUB+=(-v "RTYPE=${PBS_RTYPE:-$MHO_RTYPE}")
 SEL="${PBS_SELECT-select=1:ngpus=8}"; [ -n "$SEL" ] && QSUB+=(-l "$SEL")
 QSUB+=(-l "walltime=${PBS_WALLTIME:-24:00:00}")
-[ -n "${PBS_OUT:-}" ] && QSUB+=(-o "$PBS_OUT")
+if [ -n "${PBS_OUT:-}" ]; then
+  PBS_OUT="${PBS_OUT//%j/$(date +%Y%m%d-%H%M%S)-$$}"
+  mkdir -p "$(dirname "$PBS_OUT")"
+  QSUB+=(-o "$PBS_OUT")
+fi
 
 echo "[submit_pbs] ${QSUB[*]}  <job: cd repo && bash $TARGET $*>"
 "${QSUB[@]}" <<PBSJOB
