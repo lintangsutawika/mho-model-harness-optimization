@@ -36,7 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from utils.env import _ACCOUNT, _data_env, _phase_env, _phase_res
+from utils.env import _ACCOUNT, _data_env, _phase_env, _phase_res, child_job_env
 from utils.scores import (append_summary, latest_trials_dir, score_trials,
                               update_frontier)
 from utils.state import (_candidate_hypothesis, _latest_hf_ckpt, _load_state,
@@ -50,10 +50,6 @@ MAX_ACTION_RETRIES = 3
 # Abort the loop after this many CONSECUTIVE evals that still produced no score after all
 # retries (infra failure: no GPU, vLLM down, ...) instead of burning the iteration budget.
 MAX_EVAL_INFRA_FAILS = int(os.environ.get("MHO_MAX_EVAL_INFRA_FAILS", "3"))
-
-# Max times the harness gate re-proposes WITHIN one iteration before giving up
-# and burning the iteration (bounded safety valve).
-MAX_HARNESS_GATE_SKIPS = 5
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 RUNS_DIR = Path(os.environ.get("MHO_RUNS_DIR", REPO_DIR / "runs_output" / "optimize"))
@@ -92,14 +88,12 @@ class Scheduler:
         # over the auto-built ngpus/cpus select -- clusters with full-node/reservation shapes need
         # the exact string. `resource_type` -> PBS `-v RTYPE=...`, required by ABCI reservation
         # (RESERVE) queues (e.g. rt_HF / rt_HC). On SLURM both are ignored (use gres/cpus).
-        job_env = {**os.environ, **{k: str(v) for k, v in env.items()}}
-        # qsub -V exports the SUBMITTER's env. When the driver itself runs in a PBS job
-        # (e.g. rt_HC via submit_pbs.sh), its RTYPE=rt_HC leaks into every child and ABCI's
-        # reservation hook honors it over `-v RTYPE=...` -> evals land on CPU-only nodes
-        # (ngpus=0). Drop the inherited value; set it only from this phase's resource_type.
-        job_env.pop("RTYPE", None)
-        if resource_type:
-            job_env["RTYPE"] = resource_type
+        # qsub -V / --export=ALL export the SUBMITTER's env. Strip the driver job's own
+        # PBS_*/RTYPE/CUDA_VISIBLE_DEVICES/TMPDIR/... first: e.g. an rt_HC driver's RTYPE made
+        # ABCI's reservation hook put GPU evals on CPU-only nodes (ngpus=0).
+        job_env, _dropped = child_job_env(dict(os.environ), env, resource_type)
+        if LOG_VERBOSE and _dropped:
+            print(f"  submit: not inheriting job-local env: {' '.join(_dropped)}", flush=True)
         if out_dir:
             out_dir.mkdir(parents=True, exist_ok=True)
         if self.kind == "pbs":
@@ -1084,8 +1078,18 @@ def main(argv: list[str] | None = None) -> None:
                     "because the proposer's signal is a random subset of it; got: " + args.train_data)
         if args.propose_sample <= 0:
             p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
+    args.ts_repropose_limit = max(1, args.ts_repropose_limit)
     try:
-        optimize(args)
+        if args.mode == "harness-only" and args.val_data and not os.environ.get("MHO_LEGACY_LOOP"):
+            # Dual-mode harness-only runs on the explicit state machine (src/harness_loop.py).
+            # MHO_LEGACY_LOOP=1 keeps the old optimize() path (e.g. to resume a run whose
+            # state.json the old loop wrote). Model modes always use optimize().
+            from harness_loop import HarnessLoop
+            run_dir = RUNS_DIR / (args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S"))
+            HarnessLoop(args, run_dir, Scheduler(), submit_eval=submit_eval,
+                        submit_propose=submit_propose, poll_seconds=POLL_SECONDS).run()
+        else:
+            optimize(args)
     except Exception:
         import traceback as _tb
         _msg = _tb.format_exc()

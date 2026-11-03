@@ -30,10 +30,16 @@ as READ-ONLY reference -- never edit them. Your proposal's diff must be confined
 Start by reading `./frontier.json`, `./summary.json`, and the recent candidates'
 `<tag>/harness/` + `<tag>/status.json` + `<tag>/eval_before/` + `<tag>/eval_after/`
 traces to identify the single most promising failure mode. Especially read `./summary.json`
--- it is the history of every proposal so far, each row labeled with its `outcome`
-(`train_fail`, `train_pass_val_fail`, `train_pass_val_pass` = accepted, or `failed_both`),
-plus the hypothesis, ts_A/ts_B scores, and (via `<tag>/status.json`) whether each harness
-was ACCEPTED or REJECTED on the held-out val gate.
+-- it is the history of every proposal so far, ONE row per candidate (the same record as
+that candidate's `<tag>/status.json`), labeled with its `outcome`:
+- `accepted`    -- beat its parent on the train sample (ts_B > ts_A) AND the best val score.
+- `val_fail`    -- beat its parent on the train sample but not the best val score.
+- `train_fail`  -- did not beat its parent on the train sample (ts_B <= ts_A).
+- `no_proposal` -- the proposer produced no valid harness.
+- `no_score`    -- an evaluation failed for infrastructure reasons (not a verdict on the idea).
+- `baseline`    -- the starting harness.
+Each row also has the hypothesis and the ts_A/ts_B train-sample scores. ts_A is the parent
+harness and ts_B the candidate, on the SAME sampled tasks (`subset_seed`).
 
 **AVOID REPEATING PRIOR ATTEMPTS.** Your proposed mechanism MUST be **novel** -- it must
 not re-propose the same underlying fix that already appears in `./summary.json` or in a

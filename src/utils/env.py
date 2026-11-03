@@ -6,6 +6,32 @@ from pathlib import Path
 
 from . import REPO_DIR
 
+# Variables that describe the SUBMITTING job/node/terminal, not the config a child job needs.
+# Submits export the driver's env (qsub -V / sbatch --export=ALL); when the driver itself runs
+# inside a batch job these would leak into every child (e.g. RTYPE=rt_HC put GPU evals on
+# CPU nodes). The scheduler sets the child's own values for these at job start.
+_JOB_LOCAL_PREFIXES = ("PBS_", "SLURM_", "TMUX")
+_JOB_LOCAL_VARS = frozenset({
+    "RTYPE", "JOB_NAME",                                     # submit_pbs.sh knobs
+    "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
+    "NCPUS", "OMP_NUM_THREADS", "TMPDIR", "ENVIRONMENT", "HOSTNAME",
+    "SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT", "OLDPWD",
+})
+
+
+def child_job_env(environ: dict[str, str], extra: dict[str, str],
+                  resource_type: str = "") -> tuple[dict[str, str], list[str]]:
+    """The env a submitted job inherits: the driver's env minus job-local variables, plus
+    `extra` (this job's config), plus RTYPE only from this job's own resource type.
+    Returns (env, dropped_names)."""
+    dropped = sorted(k for k in environ
+                     if k in _JOB_LOCAL_VARS or k.startswith(_JOB_LOCAL_PREFIXES))
+    env = {k: v for k, v in environ.items() if k not in dropped}
+    env.update({k: str(v) for k, v in extra.items()})
+    if resource_type:
+        env["RTYPE"] = resource_type
+    return env, dropped
+
 
 def _phase_env(extra: dict[str, str], scaffold_dir: Path | None) -> dict[str, str]:
     env = dict(extra)

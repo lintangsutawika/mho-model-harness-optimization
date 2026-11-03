@@ -38,9 +38,18 @@ def latest_trials_dir() -> str | None:
     return os.environ.get("MHO_TRIALS_DIR") or _agg()._newest_trials_dir()
 
 
+def metric_of(score: dict[str, Any]) -> float:
+    """The scalar a score dict is ranked by: mean_reward, else solved_pass@1, else 0.0.
+    Uses `is None` (not `or`) so a real 0.0 mean_reward is kept, not replaced by pass@1."""
+    for key in ("mean_reward", "solved_pass@1"):
+        if score.get(key) is not None:
+            return float(score[key])
+    return 0.0
+
+
 def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) -> bool:
     frontier = json.loads(frontier_path.read_text()) if frontier_path.exists() else {}
-    metric = score.get("mean_reward") or score.get("solved_pass@1") or 0.0
+    metric = metric_of(score)
     improved = metric > frontier.get("_best", {}).get("metric", -1)
     if improved:
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
