@@ -94,8 +94,10 @@ class Scheduler:
         job_env, _dropped = child_job_env(dict(os.environ), env, resource_type)
         if LOG_VERBOSE and _dropped:
             print(f"  submit: not inheriting job-local env: {' '.join(_dropped)}", flush=True)
+        # out_dir: a "*.out" path = this job's log file; otherwise a directory (legacy loop).
+        log_file = bool(out_dir) and out_dir.suffix == ".out"
         if out_dir:
-            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir.parent if log_file else out_dir).mkdir(parents=True, exist_ok=True)
         if self.kind == "pbs":
             cmd = ["qsub", "-V"]
             if resource_type: cmd += ["-v", f"RTYPE={resource_type}"]
@@ -115,7 +117,7 @@ class Scheduler:
             if ngpus: cmd += [f"--gres=gpu:{ngpus}"]
             if cpus: cmd += [f"--cpus-per-task={cpus}"]
             if walltime: cmd += ["-t", walltime]
-            if out_dir: cmd += ["-o", str(out_dir / "%x-%j.out")]
+            if out_dir: cmd += ["-o", str(out_dir if log_file else out_dir / "%x-%j.out")]
             cmd.append(str(script))
         if LOG_VERBOSE:
             print(f"  submit[{self.kind}]: {' '.join(cmd)}", flush=True)
@@ -144,7 +146,8 @@ class Scheduler:
     def state(self, job_id: str) -> tuple[str, int | None]:
         """Return (normalized_state, exit_status); normalized in PENDING/RUNNING/DONE."""
         if self.kind == "pbs":
-            r = subprocess.run(["qstat", "-f", job_id], capture_output=True, text=True)
+            # -x: include finished jobs, so Exit_status is read instead of guessed
+            r = subprocess.run(["qstat", "-x", "-f", job_id], capture_output=True, text=True)
             if r.returncode != 0:
                 return "DONE", None  # purged from the queue => finished
             st, exit_status = "?", None
@@ -266,6 +269,8 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
         extra["MHO_MODEL"] = model
     if harness:
         extra["MHO_HARNESS"] = harness
+    if logs.suffix == ".out":       # <activity>.out -> <activity>-vllm.out
+        extra["MHO_VLLM_LOG"] = str(logs.with_name(logs.stem + "-vllm.out"))
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B
     # fits on one H200); set MHO_EVAL_NGPUS=0 for an API/litellm model (no self-serve).
     return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{job_name}",
@@ -1022,6 +1027,39 @@ def optimize(args: argparse.Namespace) -> None:
           f"@ {best.get('metric')}  run_dir={run_dir}")
 
 
+class _Tee:
+    """Write to the original stream and to a log file (line-flushed, so `tail -f` works)."""
+
+    def __init__(self, stream, log):
+        self._stream, self._log = stream, log
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log.write(data)
+        self._log.flush()
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _tee_driver_log(path: Path) -> None:
+    """Mirror the driver's stdout/stderr into <run_dir>/logs/run.out (appended across
+    restarts), so the log lives with the run and is readable while the job is running --
+    PBS only copies its -o file back when the job ends."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(path, "a", buffering=1)
+    log.write(f"\n===== driver start {datetime.now():%Y-%m-%d %H:%M:%S} "
+              f"host={os.uname().nodename} job={os.environ.get('PBS_JOBID') or os.environ.get('SLURM_JOB_ID') or '-'} "
+              f"argv={' '.join(sys.argv[1:])}\n")
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--mode", choices=["model-only", "harness-only", "model-harness"],
@@ -1079,13 +1117,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.propose_sample <= 0:
             p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
     args.ts_repropose_limit = max(1, args.ts_repropose_limit)
+    # Fix the run name once so the driver log and the loop agree on the run dir.
+    args.run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / args.run_name
+    _tee_driver_log(run_dir / "logs" / "run.out")
     try:
         if args.mode == "harness-only" and args.val_data and not os.environ.get("MHO_LEGACY_LOOP"):
             # Dual-mode harness-only runs on the explicit state machine (src/harness_loop.py).
             # MHO_LEGACY_LOOP=1 keeps the old optimize() path (e.g. to resume a run whose
             # state.json the old loop wrote). Model modes always use optimize().
             from harness_loop import HarnessLoop
-            run_dir = RUNS_DIR / (args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S"))
             HarnessLoop(args, run_dir, Scheduler(), submit_eval=submit_eval,
                         submit_propose=submit_propose, poll_seconds=POLL_SECONDS).run()
         else:
@@ -1093,12 +1134,11 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         import traceback as _tb
         _msg = _tb.format_exc()
-        _run_dir = Path(os.environ.get("MHO_RUNS_DIR", "")) if os.environ.get("MHO_RUNS_DIR") else None
-        # best-effort: write crash log next to the run dir + always to stderr
+        # stderr is tee'd into logs/run.out; also keep a standalone crash file in the run dir
         print("MHO LOOP CRASH:", file=sys.stderr)
         print(_msg, file=sys.stderr)
         try:
-            (Path(os.environ.get("MHO_OUT", "/tmp")) / "loop_crash.log").write_text(_msg)
+            (run_dir / "logs" / "loop_crash.log").write_text(_msg)
         except Exception:
             pass
         sys.exit(1)

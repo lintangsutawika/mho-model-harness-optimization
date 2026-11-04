@@ -22,5 +22,12 @@ export PYTHONSAFEPATH=1
 OPENHANDS_PKGS="${OPENHANDS_PKGS:-openhands-sdk openhands-tools litellm}"
 WITH_ARGS=(); for _p in $OPENHANDS_PKGS; do WITH_ARGS+=(--with "$_p"); done
 echo "[propose] run=${MHO_RUN_DIR:-?} tag=${MHO_TAG:-?} model=${OPTIMIZER_MODEL:-<default>}"
+# Compute-node internet is flaky; resolve from the uv cache when it already holds the
+# packages (warm it once on a login node with the same uv run). Falls back to the index.
+UV_ARGS=(--no-project --python "${OPTIMIZER_PYTHON_VERSION:-3.12}" "${WITH_ARGS[@]}")
+if [ -z "${UV_OFFLINE:-}" ] && uv run --offline "${UV_ARGS[@]}" python -c "" >/dev/null 2>&1; then
+  export UV_OFFLINE=1
+fi
+echo "[propose] uv offline=${UV_OFFLINE:-0}"
 exec uv run --no-project --python "${OPTIMIZER_PYTHON_VERSION:-3.12}" "${WITH_ARGS[@]}" \
   python -m mho.optimizer.agent

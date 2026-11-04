@@ -48,7 +48,7 @@ class Fake:
         n = sum(c["stage"] == stage for c in self.calls)
         score = self.evals(stage, harness, n)
         self.calls.append({"stage": stage, "harness": harness, "data": data,
-                           "out": str(Path(out_dir) / job_name), "score": score})
+                           "out": str(Path(out_dir) / job_name), "score": score, "log": logs})
         if score is not None:
             t = Path(out_dir) / job_name / "t0"
             t.mkdir(parents=True, exist_ok=True)
@@ -58,7 +58,7 @@ class Fake:
 
     def submit_propose(self, sched, *, run_root, logs, tag, kind):
         ok = self.proposes(tag)
-        self.calls.append({"stage": "propose", "tag": tag, "ok": ok})
+        self.calls.append({"stage": "propose", "tag": tag, "ok": ok, "log": logs})
         if ok:
             h = run_root / "candidates" / tag / "harness"
             h.mkdir(parents=True, exist_ok=True)
@@ -154,13 +154,35 @@ def test_reproposes_on_same_subset_then_fresh_subset(tmp_path):
     assert link.is_symlink() and (link / "t0" / "result.json").exists()
 
 
-def test_failed_proposal_is_recorded_and_retried(tmp_path):
-    loop, _ = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[0.1]), iterations=2,
-                   proposes=lambda tag: tag != "candidate_1_0_1")
+def test_failed_proposal_is_recorded_and_not_charged(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[0.1, 0.1]), iterations=2,
+                      limit=2, proposes=lambda tag: tag != "candidate_1_0_1")
     loop.run()
     rows = summary(loop)
+    # the failed proposal neither uses the budget nor a slot on the subset
     assert [(r["candidate"], r["outcome"]) for r in rows[1:]] == [
-        ("candidate_1_0_1", "no_proposal"), ("candidate_1_0_2", "train_fail")]
+        ("candidate_1_0_1", "no_proposal"), ("candidate_1_0_2", "train_fail"),
+        ("candidate_1_0_3", "train_fail")]
+    assert rows[1]["subset_seed"] == rows[2]["subset_seed"] == rows[3]["subset_seed"]
+    assert loop.st["propose_count"] == 2
+
+
+def test_proposer_down_aborts_after_consecutive_failures(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[]), iterations=2,
+                      proposes=lambda tag: False)
+    with pytest.raises(LoopAbort, match="consecutive proposals"):
+        loop.run()
+    assert [r["outcome"] for r in summary(loop)[1:]] == ["no_proposal"] * 3
+    assert loop.st["propose_count"] == 0
+
+
+def test_one_log_file_per_job_under_run_logs(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[None, 0.5, 0.6], a=[0.3], b=[0.5]), iterations=1)
+    loop.run()
+    logs = [Path(c["log"]).relative_to(loop.run_dir).as_posix() for c in fake.calls]
+    assert logs == ["logs/baseline.out", "logs/baseline-attempt2.out",
+                    "logs/candidate_1_0_1-eval_before.out", "logs/candidate_1_0_1-propose.out",
+                    "logs/candidate_1_0_1-eval_after.out", "logs/candidate_1_0_1-val.out"]
 
 
 # --------------------------------------------------------------------------- budget

@@ -153,7 +153,8 @@ if [ -n "${MHO_MODEL:-}" ]; then
   SERVED_NAME="${SERVED_NAME}" \
   BASE_SIF="${BASE_SIF}" \
   USE_RELAY="${USE_RELAY:-0}" \
-  bash "${REPO_DIR}/scripts/utils/serve.sh" > "${MHO_OUT:-/tmp}/vllm_serve.log" 2>&1 &
+  VLLM_LOG="${MHO_VLLM_LOG:-${MHO_OUT:-/tmp}/vllm_serve.log}"; mkdir -p "$(dirname "$VLLM_LOG")"
+  bash "${REPO_DIR}/scripts/utils/serve.sh" > "${VLLM_LOG}" 2>&1 &
 
   VLLM_PID=$!
   for _ in $(seq 1 120); do
@@ -162,7 +163,7 @@ if [ -n "${MHO_MODEL:-}" ]; then
     sleep 5
   done
   curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
-    || { echo "[eval] vLLM not healthy; see ${MHO_OUT:-/tmp}/vllm_serve.log" >&2; exit 1; }
+    || { echo "[eval] vLLM not healthy; see ${VLLM_LOG}" >&2; exit 1; }
   MODEL="litellm_proxy/${SERVED_NAME}"; VLLM_LOCAL_URL="http://localhost:${VLLM_PORT}"
   if [ "${HARBOR_ENV}" = "modal" ]; then
     RELAY=1                                   # cloud sandboxes reach the vLLM via the relay

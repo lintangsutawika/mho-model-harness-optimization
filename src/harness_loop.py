@@ -22,6 +22,8 @@ Every finished candidate gets exactly ONE terminal record, written by `_finish`:
 candidates/<tag>/status.json and one candidates/summary.json row, with the same fields.
 Outcomes: baseline | no_proposal | no_score | train_fail | val_fail | accepted.
 Non-terminal events go to <run>/logs/events.jsonl (not visible to the proposer).
+Logs: <run>/logs/run.out (driver), <run>/logs/<activity>.out per job (+ <activity>-vllm.out
+for evals), e.g. baseline.out, candidate_1_0_1-eval_before.out, candidate_1_0_1-propose.out.
 
 Infra failures (a job that produced no score / no harness) are retried up to
 MAX_ATTEMPTS. After that the stage is treated as failed, and the loop ABORTS on a failed
@@ -117,7 +119,7 @@ class HarnessLoop:
             "iteration": 1 if skip else 0,
             "version": 0,              # accepted candidates so far
             "try": 1,                  # attempts at the current version (resets on accept)
-            "propose_count": 0,        # --iterations budget = total propose submits
+            "propose_count": 0,        # --iterations budget = proposals that produced a harness
             "parent": None,            # parent harness dir (frontier best); None = base scaffold
             "subset": None,            # {dir, seed, a_tag, ts_A, tries} for the current iteration
             "ts_B": None,              # current candidate's train-sample score
@@ -200,14 +202,27 @@ class HarnessLoop:
             self._save()
             raise LoopAbort(f"ABORT: {why} failed after {MAX_ATTEMPTS} attempts each "
                             f"(last: {what}). Likely infra (no GPU / vLLM / proposer API); "
-                            f"check {self.tag_dir()}/logs. Restart the driver to retry.")
+                            f"check {self.log_path()}. Restart the driver to retry.")
 
     # ------------------------------------------------------------- submit
     def _eval(self, *, harness: str | None, data: str, out_dir: Path, job_name: str) -> str:
         return self._submit_eval(self.sched, "", model=self.args.model, harness=harness,
                                  data=data, n_trials=self.args.trials,
                                  n_concurrent=self.args.concurrent, out_dir=out_dir,
-                                 logs=self.tag_dir() / "logs", job_name=job_name)
+                                 logs=self.log_path(), job_name=job_name)
+
+    _ACTIVITY = {"baseline": "", "eval_a": "eval_before", "propose": "propose",
+                 "eval_b": "eval_after", "eval_val": "val"}
+
+    def log_path(self) -> Path:
+        """<run>/logs/<activity>.out for the current stage; retries get a -attemptN suffix."""
+        st = self.st
+        tag = st["subset"]["a_tag"] if st["stage"] == "eval_a" and st["subset"] else self.tag
+        act = self._ACTIVITY[st["stage"]]
+        name = f"{tag}-{act}" if act else tag
+        if st.get("attempt", 1) > 1:
+            name += f"-attempt{st['attempt']}"
+        return self.run_dir / "logs" / f"{name}.out"
 
     def _out_dir(self, stage: str) -> Path:
         """Where this stage's trials land (submit and result must agree)."""
@@ -245,7 +260,7 @@ class HarnessLoop:
             st["propose_count"] += 1
             print(f"  [propose {st['propose_count']}/{self.args.iterations}] {tag}", flush=True)
             jid = self._submit_propose(self.sched, run_root=self.run_dir,
-                                       logs=self.tag_dir() / "logs", tag=tag, kind="harness")
+                                       logs=self.log_path(), tag=tag, kind="harness")
             if jid is None:
                 raise LoopAbort("propose job not configured (MHO_PROPOSE_JOB unset)")
             return jid
@@ -304,14 +319,18 @@ class HarnessLoop:
     def _done_propose(self, ok: bool, rc: int) -> None:
         st = self.st
         if not ok:
+            # Infra-type failure (proposer env / API): refund the budget and the subset slot,
+            # move to a new tag. MAX_INFRA_FAILS consecutive failures abort the run instead.
             st["propose_fails"] += 1
+            st["propose_count"] -= 1
+            st["subset"]["tries"] -= 1
             self._finish("no_proposal", reason=f"rc={rc} or no harness/pyproject.toml")
             if st["propose_fails"] >= MAX_INFRA_FAILS:
                 st["propose_fails"] = 0
                 self._next_try()
                 self._save()
                 raise LoopAbort(f"ABORT: {MAX_INFRA_FAILS} consecutive proposals produced no "
-                                f"harness; check the proposer logs under {self.cands}/*/logs.")
+                                f"harness; check {self.run_dir}/logs/*-propose.out.")
             self._next_try()
             return
         st["propose_fails"] = 0
@@ -333,6 +352,7 @@ class HarnessLoop:
             print(f"  train gate PASS ({st['ts_B']:.4f} > {ts_A:.4f}) -> val")
             self._goto("eval_val")
         else:
+            print(f"  train gate FAIL ({st['ts_B']:.4f} <= {ts_A:.4f}); not run on val")
             self._finish("train_fail")
             self._next_try()
 
