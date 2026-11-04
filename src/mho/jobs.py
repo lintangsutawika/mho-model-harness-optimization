@@ -25,6 +25,26 @@ PROPOSE_JOB = os.environ.get("MHO_PROPOSE_JOB", "")
 AGENT_IMPORT = os.environ.get("AGENT_IMPORT", "harness.micro_swe_agent:MicroSweAgent")
 POLL_SECONDS = int(os.environ.get("MHO_POLL_SECONDS", 60))
 LOG_VERBOSE = bool(os.environ.get("MHO_LOG_VERBOSE"))  # full job cmd in logs
+SACCT_MAX_MISSES = int(os.environ.get("MHO_SACCT_MAX_MISSES", "5"))  # polls before giving up
+
+
+def _slurm_final(state: str, exit_code: str) -> tuple[str, int | None]:
+    """(norm, rc) from one `sacct -X` row. Still-live states -> not done yet. A job that did
+    not finish as COMPLETED (TIMEOUT, CANCELLED, FAILED, OUT_OF_MEMORY, NODE_FAIL, PREEMPTED, ...)
+    is a failure even if its ExitCode is 0 (a timeout is "0:15"): rc = the exit code, else
+    128 + signal, else 1."""
+    state = state.strip().split()[0] if state.strip() else ""
+    if state in ("PENDING", "RUNNING", "REQUEUED", "RESIZING", "SUSPENDED", "COMPLETING",
+                 "CONFIGURING", "STAGE_OUT", "SIGNALING"):
+        return ("RUNNING" if state != "PENDING" else "PENDING"), None
+    code, _, sig = exit_code.strip().partition(":")
+    try:
+        rc, signo = int(code or 0), int(sig or 0)
+    except ValueError:
+        rc, signo = 1, 0
+    if state == "COMPLETED":
+        return "DONE", rc
+    return "DONE", rc or (128 + signo if signo else 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -41,6 +61,7 @@ class Scheduler:
 
     def __init__(self, kind: str | None = None):
         self.kind = kind or detect_scheduler()
+        self._sacct_misses: dict[str, int] = {}
 
     def submit(self, script: Path, env: dict[str, str], *, name: str = "", ngpus: int = 0,
                cpus: int = 0, walltime: str = "", queue: str = "", account: str = "",
@@ -98,7 +119,7 @@ class Scheduler:
                 print("      " + "  ".join(f"{k}={v}" for k, v in sorted(_sel.items())),
                       flush=True)
         else:
-            _n = next((cmd[i+1] for i, c in enumerate(cmd) if c == "-N"), "job")
+            _n = next((cmd[i+1] for i, c in enumerate(cmd) if c in ("-N", "-J")), "job")
             print(f"  submit[{self.kind}] {_n}", flush=True)
         r = subprocess.run(cmd, cwd=str(REPO_DIR), env=job_env, capture_output=True, text=True)
         if r.returncode != 0:
@@ -135,18 +156,18 @@ class Scheduler:
         live = r.stdout.strip()
         if live:
             return ("RUNNING" if live.startswith("RUN") else "PENDING"), None
-        s = subprocess.run(["sacct", "-j", str(job_id), "-n", "-P", "-o", "State,ExitCode"],
+        s = subprocess.run(["sacct", "-j", str(job_id), "-n", "-P", "-X", "-o", "State,ExitCode"],
                            capture_output=True, text=True)
-        exit_status = None
-        for line in s.stdout.splitlines():
-            parts = line.split("|")
-            if len(parts) >= 2 and parts[1].strip():
-                try:
-                    exit_status = int(parts[1].split(":")[0])
-                except ValueError:
-                    pass
-                break
-        return "DONE", exit_status
+        rows = [l.split("|") for l in s.stdout.splitlines() if l.count("|") >= 1]
+        if not rows:
+            # Left squeue but not in accounting yet (slurmdbd lag): keep polling for a while
+            # instead of reporting "done, rc unknown" (which the loop reads as success).
+            self._sacct_misses[job_id] = self._sacct_misses.get(job_id, 0) + 1
+            if self._sacct_misses[job_id] <= SACCT_MAX_MISSES:
+                return "PENDING", None
+            return "DONE", None
+        self._sacct_misses.pop(job_id, None)
+        return _slurm_final(rows[0][0], rows[0][1])
 
     def host(self, job_id: str) -> str | None:
         """The node a (running or finished) job ran on, if the scheduler still knows it."""

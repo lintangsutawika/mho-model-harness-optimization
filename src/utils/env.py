@@ -10,7 +10,9 @@ from . import REPO_DIR
 # Submits export the driver's env (qsub -V / sbatch --export=ALL); when the driver itself runs
 # inside a batch job these would leak into every child (e.g. RTYPE=rt_HC put GPU evals on
 # CPU nodes). The scheduler sets the child's own values for these at job start.
-_JOB_LOCAL_PREFIXES = ("PBS_", "SLURM_", "TMUX")
+# SBATCH_*/SALLOC_* are sbatch/salloc INPUT variables (e.g. SBATCH_PARTITION = default -p): a
+# driver launched with them would push its own partition/account onto every child job.
+_JOB_LOCAL_PREFIXES = ("PBS_", "SLURM_", "SBATCH_", "SALLOC_", "TMUX")
 _JOB_LOCAL_VARS = frozenset({
     "RTYPE", "JOB_NAME",                                     # submit_pbs.sh knobs
     "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",

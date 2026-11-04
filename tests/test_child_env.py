@@ -15,6 +15,7 @@ DRIVER_ENV = {  # an rt_HC driver launched via submit_pbs.sh
     "PBS_RTYPE": "rt_HC", "PBS_SELECT": "select=1:ncpus=8", "JOB_NAME": "mho-h-4b-math",
     "CUDA_VISIBLE_DEVICES": "", "TMPDIR": "/local/1.pbs1", "OMP_NUM_THREADS": "8",
     "TMUX": "/tmp/tmux", "HOSTNAME": "hnode008",
+    "SBATCH_PARTITION": "cpu", "SBATCH_ACCOUNT": "acct", "SLURM_JOB_ID": "77",
 }
 
 
@@ -23,7 +24,7 @@ def test_drops_job_local_and_sets_own_rtype():
     assert env["RTYPE"] == "rt_HF"
     for k in ("PBS_JOBID", "PBS_NODEFILE", "PBS_O_WORKDIR", "PBS_RTYPE", "PBS_SELECT",
               "JOB_NAME", "CUDA_VISIBLE_DEVICES", "TMPDIR", "OMP_NUM_THREADS", "TMUX",
-              "HOSTNAME"):
+              "HOSTNAME", "SBATCH_PARTITION", "SBATCH_ACCOUNT", "SLURM_JOB_ID"):
         assert k not in env and k in dropped
     # config the child needs is kept; this job's own settings are added
     for k in ("PATH", "HOME", "DATA_DIR", "MHO_EVAL_RTYPE", "MHO_MODEL", "HF_DIR"):
