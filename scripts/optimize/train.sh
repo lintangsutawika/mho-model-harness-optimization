@@ -15,7 +15,7 @@
 set -euo pipefail
 REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}}"
 cd "$REPO_DIR"
-source .env
+. scripts/utils/load_env.sh && load_env .env
 
 # --- optimizer interface: map MHO_* (set by optimize_loop / hpc submitters) to the
 # internal knobs below; each also honors its own env name for manual runs. ---

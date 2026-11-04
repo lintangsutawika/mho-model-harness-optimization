@@ -98,8 +98,9 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     run = Path(os.environ.get("MHO_RUN_DIR") or "").expanduser()
     if not run.is_dir():
         sys.exit(f"[propose] MHO_RUN_DIR not set or missing: {run}")
-    frontier = run / "frontier.json"
-    summary = run / "evolution_summary.jsonl"
+    # Relocated into candidates/ (the optimizer's single accessible root).
+    frontier = run / "candidates" / "frontier.json"
+    summary = run / "candidates" / "summary.json"
     diff_dir = candidate_dir.parent / "diff"
     best_tag = ""
     if frontier.is_file():
@@ -113,7 +114,18 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     parent = (run / "candidates" / best_tag / "harness") if best_tag else Path("")
     if not parent or not (parent / "pyproject.toml").exists():
         parent = _original_base()
-    trials = (run / "candidates" / best_tag / "eval") if best_tag else Path("")
+    cand_trials: list[Path] = []
+    _tags = sorted((d for d in (run / "candidates").glob("candidate_*") if d.is_dir()),
+                   key=lambda d: d.name, reverse=True)
+    _ordered = [run / "candidates" / best_tag] if best_tag else []
+    _ordered += [t for t in _tags if t.name != best_tag]
+    for _c in _ordered:
+        if len(cand_trials) >= _MAX_TRIAL_DIRS:
+            break
+        _src = _c / "eval_after" if (_c / "eval_after").is_dir() else _c / "eval_before"
+        if _src.is_dir() and any(_src.glob("*/result.json")):
+            cand_trials.append(_src)
+    trials = cand_trials if cand_trials else Path("")
     return {"frontier": frontier, "summary": summary, "diff_dir": diff_dir,
             "parent": parent, "trials": trials}
 
@@ -131,37 +143,36 @@ def _stage_prior_results(dst: Path, paths: dict[str, Path]) -> None:
     # so staging from it is safe; refuse any path that looks like a val eval just in case.
     prior = dst / "eval_prior"
     trials = paths["trials"]
-    if "evaluation" in trials.parts or "eval-val" in trials.parts:
-        raise RuntimeError(
-            "refusing to stage val-split trials into the proposer workspace: "
-            f"{trials} (validation set must stay hidden from the optimizer)"
-        )
-    srcs = {
-        "frontier.json": paths["frontier"],
-        "evolution_summary.jsonl": paths["summary"],
-        "aggregated.jsonl": trials / "aggregated.jsonl",
-    }
-    if not any(v.exists() for v in srcs.values()) and not trials.is_dir():
-        return
+    trial_srcs = trials if isinstance(trials, list) else ([trials] if trials and Path(trials).is_dir() else [])
+    for _t in trial_srcs:
+        if "evaluation" in _t.parts or "eval-val" in _t.parts:
+            raise RuntimeError(
+                "refusing to stage val-split trials into the proposer workspace: "
+                f"{_t} (validation set must stay hidden from the optimizer)"
+            )
+    # NOTE: frontier.json + evolution_summary.jsonl are intentionally NOT staged into
+    # eval_prior/ -- they live at the run root (<RUN>/frontier.json, <RUN>/evolution_summary.jsonl)
+    # and the proposer workspace is a subdir of the run, so the agent reads them at ../../.
     prior.mkdir(parents=True, exist_ok=True)
-    for name, path in srcs.items():
-        if path and path.is_file():
-            shutil.copy2(path, prior / name)
-    if trials and trials.is_dir():
+    if trial_srcs:
         traj = prior / "trials"
-        for i, trial_dir in enumerate(sorted(trials.glob("*"))):
-            if i >= _MAX_TRIAL_DIRS:
-                break
-            if not trial_dir.is_dir():
-                continue
-            tgt = traj / trial_dir.name
-            tgt.mkdir(parents=True, exist_ok=True)
-            for rel in ("result.json", "agent/mini-swe-agent.txt", "agent/mini-swe-agent.trajectory.json"):
-                f = trial_dir / rel
-                if f.is_file():
-                    tf = tgt / rel
-                    tf.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(f, tf)
+        _n = 0
+        for _src in trial_srcs:
+            _cand = _src.parent.name
+            for trial_dir in sorted(_src.glob("*")):
+                if _n >= _MAX_TRIAL_DIRS:
+                    break
+                if not trial_dir.is_dir():
+                    continue
+                tgt = traj / f"{_cand}__{trial_dir.name}"
+                tgt.mkdir(parents=True, exist_ok=True)
+                for rel in ("result.json", "agent/mini-swe-agent.txt", "agent/mini-swe-agent.trajectory.json"):
+                    f = trial_dir / rel
+                    if f.is_file():
+                        tf = tgt / rel
+                        tf.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(f, tf)
+                _n += 1
     print(f"[propose] staged prior eval results in {prior}")
 
 
@@ -290,20 +301,24 @@ def main() -> int:
     if kind not in PROPOSE_KINDS:
         sys.exit(f"[propose] unknown MHO_PROPOSE_KIND {kind!r} (choose from {PROPOSE_KINDS})")
 
-    cand_unit = run / "candidates" / tag          # one dir per candidate: harness/ + model_specs/ + eval_prior/
+    cand_root = run / "candidates"                # optimizer's single accessible root
+    cand_unit = cand_root / tag                   # one dir per candidate: harness/ + model_specs/
     harness_dst = cand_unit / "harness"           # installable scaffold (kind == harness)
     spec_dst = cand_unit / "model_specs"          # what-the-model-should-learn specs (kind == model)
     paths = _derive_paths(harness_dst)
     parent = paths["parent"]
 
-    # Workspace = the candidate unit dir. The archive (parent harness + train-sample eval +
-    # frontier/summary) is mounted under eval_prior/ for the agent to analyze. The agent then
-    # edits harness/ (harness) OR writes model_specs/ (model) -- exactly one output kind.
+    # Workspace = candidates/ (the whole candidate archive). The optimizer thus sees EVERYTHING:
+    # frontier.json, summary.json, every candidate's harness/, status.json (accepted/rejected),
+    # eval_before/ + eval_after/ train-sample traces -- no eval_prior/ staging needed. The agent
+    # edits <tag>/harness (harness) OR writes <tag>/model_specs (model) -- the only writable
+    # output; it should treat other candidates + summary/frontier as read-only reference
+    # (enforced soft by instructions; the proposal diff only counts harness/ or model_specs/).
+    cand_root.mkdir(parents=True, exist_ok=True)
     cand_unit.mkdir(parents=True, exist_ok=True)
     if kind == "harness":
         _materialize_from(parent, harness_dst)    # accumulate: build on the frontier-best
-    _stage_prior_results(cand_unit, paths)        # mount prior eval results -> eval_prior/
-    _run_openhands(cand_unit, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
+    _run_openhands(cand_root, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
 
     if kind == "model":
         from mho.optimizer import model_spec
