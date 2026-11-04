@@ -103,14 +103,14 @@ def extract(archive: Path, category: str, ids: list[str], output: Path) -> None:
         _fill(task / "instruction.md", instruction=instructions[task_id])
 
 
-def generate_all(output: Path | str, per_category: int = 50, seed: int = 1,
-                 categories: tuple[str, ...] = CATEGORIES) -> list[str]:
-    output = Path(output)
+def _write_tasks(output: Path, selection: list[tuple[str, Path, int, list[str]]],
+                 per_category: int, seed: int) -> list[str]:
+    """Render ``(category, archive, pool_size, ids)`` rows into one dataset directory."""
     output.mkdir(parents=True, exist_ok=True)
     manifest = {
         "dataset": DATASET_NAME,
         "split": SPLIT,
-        "archives": [f"{SPLIT}/{c}.tar.gz" for c in categories],
+        "archives": [f"{SPLIT}/{category}.tar.gz" for category, *_ in selection],
         "selection_seed": seed,
         "selection_method": (
             "per-category stratified. For each category c the pool is the sorted list of "
@@ -123,18 +123,65 @@ def generate_all(output: Path | str, per_category: int = 50, seed: int = 1,
         "per_category": {},
         "tasks": [],
     }
-    for category in categories:
-        archive = fetch_archive(category)
-        pool = task_ids(archive, category)
-        ids = select(category, pool, per_category, seed)
+    for category, archive, pool_size, ids in selection:
         extract(archive, category, ids, output)
-        manifest["per_category"][category] = {"archive_task_count": len(pool), "selected": len(ids)}
+        manifest["per_category"][category] = {"archive_task_count": pool_size, "selected": len(ids)}
         manifest["tasks"].extend(ids)
-        print(f"{category}: {len(ids)} of {len(pool)}")
+        print(f"{category}: {len(ids)} of {pool_size}")
     manifest["num_tasks"] = len(manifest["tasks"])
     (output / "selection_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"Wrote {manifest['num_tasks']} tasks to {output}")
     return manifest["tasks"]
+
+
+def generate_all(output: Path | str, per_category: int = 50, seed: int = 1,
+                 categories: tuple[str, ...] = CATEGORIES, val_size: int = 0) -> list[str]:
+    output = Path(output)
+    if val_size < 0:
+        raise SystemExit(f"--val-size must be >= 0, got {val_size}.")
+    train_out = output.with_name(output.name + "-train-split")
+    val_out = output.with_name(output.name + "-val-split")
+    if val_size:
+        for out in (train_out, val_out):
+            if out.exists():
+                raise SystemExit(f"Output directory already exists: {out}. Use a fresh --output-dir.")
+
+    # N is a total: every category gets base, and the first `extra` categories get one more.
+    base, extra = divmod(val_size, len(categories))
+    train, val = [], []
+    for i, category in enumerate(categories):
+        archive = fetch_archive(category)
+        pool = task_ids(archive, category)
+        ids = select(category, pool, per_category, seed)
+        k = base + (1 if i < extra else 0)
+        # Check every category before writing anything; train must keep at least one task.
+        if k and k >= len(ids):
+            raise SystemExit(f"--val-size {val_size} takes {k} tasks from {category}, "
+                             f"which only has {len(ids)} selected.")
+        cut = len(ids) - k  # one index, so k == 0 needs no special case (ids[-0:] is all of ids)
+        train.append((category, archive, len(pool), ids[:cut]))
+        val.append((category, archive, len(pool), ids[cut:]))
+
+    if not val_size:
+        return _write_tasks(output, train, per_category, seed)
+
+    train_ids = _write_tasks(train_out, train, per_category, seed)
+    val_ids = _write_tasks(val_out, val, per_category, seed)
+    (output.parent / f"{output.name}_split_manifest.json").write_text(json.dumps({
+        "dataset": DATASET_NAME,
+        "split": SPLIT,
+        "selection_seed": seed,
+        "tasks_per_category": per_category,
+        "val_size": val_size,
+        "split_method": "per category, the last k of the sorted selected task_ids are val; "
+                        "k = val_size // n_categories, plus 1 for the first val_size % n_categories",
+        "train_count": len(train_ids),
+        "val_count": len(val_ids),
+        "train_out": str(train_out),
+        "val_out": str(val_out),
+        "val_task_ids": val_ids,
+    }, indent=2) + "\n")
+    return train_ids + val_ids
 
 
 def main() -> None:
@@ -143,11 +190,16 @@ def main() -> None:
     parser.add_argument("--per-category", type=int, default=50,
                         help="Tasks sampled per skill category (0 = all 1000).")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--val-size", type=int, default=0,
+                        help="Total tasks to hold out as val, split evenly across categories "
+                             "(last task_ids of each, disjoint from train). Generates "
+                             "<out>-train-split + <out>-val-split. 0 disables (generate one dir).")
     parser.add_argument("--category", action="append", choices=CATEGORIES,
                         help="Repeatable; default all six.")
     args = parser.parse_args()
     generate_all(args.output_dir, args.per_category, args.seed,
-                 tuple(args.category) if args.category else CATEGORIES)
+                 tuple(args.category) if args.category else CATEGORIES,
+                 val_size=args.val_size)
 
 
 if __name__ == "__main__":
