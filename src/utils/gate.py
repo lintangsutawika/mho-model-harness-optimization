@@ -85,6 +85,27 @@ def _seconds(span: dict | None) -> float | None:
     return (b - a).total_seconds()
 
 
+def env_failed(result: dict) -> bool:
+    """The trial died before the agent was set up: the sandbox never started (e.g. a broken
+    node). It says nothing about the harness or the model, unlike a failure from agent setup on
+    (a harness that breaks its own install fails there, and that counts)."""
+    return bool(result.get("exception_info")) and not result.get("agent_setup")
+
+
+def env_failures(trials_dir: str | Path) -> tuple[int, int]:
+    """(trials whose sandbox never started, all trials) in <dir>/*/result.json."""
+    bad = n = 0
+    for f in glob.glob(str(Path(trials_dir) / "*" / "result.json")):
+        try:
+            j = json.loads(Path(f).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(j, dict):
+            n += 1
+            bad += env_failed(j)
+    return bad, n
+
+
 def trial_cost(result: dict, metric: str = "tokens") -> float | None:
     if metric == "seconds":
         return _seconds(result.get("agent_execution"))
@@ -94,7 +115,8 @@ def trial_cost(result: dict, metric: str = "tokens") -> float | None:
 
 def per_task(trials_dir: str | Path, cost_metric: str = "tokens") -> dict[str, dict[str, float]]:
     """{task: {"reward": mean over attempts (missing reward = 0), "cost": mean over attempts
-    that reported one (absent if none), "n": attempts}} from <dir>/*/result.json."""
+    that reported one (absent if none), "n": attempts}} from <dir>/*/result.json. Trials whose
+    sandbox never started (env_failed) are left out."""
     rewards: dict[str, list[float]] = {}
     costs: dict[str, list[float]] = {}
     for f in glob.glob(str(Path(trials_dir) / "*" / "result.json")):
@@ -103,7 +125,7 @@ def per_task(trials_dir: str | Path, cost_metric: str = "tokens") -> dict[str, d
         except (OSError, ValueError):
             continue
         task = j.get("task_name") if isinstance(j, dict) else None
-        if not task:
+        if not task or env_failed(j):        # no sandbox -> no evidence either way
             continue
         r = ((j.get("verifier_result") or {}).get("rewards") or {}).get("reward")
         rewards.setdefault(task, []).append(float(r) if r is not None else 0.0)

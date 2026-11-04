@@ -12,6 +12,8 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
     build   : the kind's job, if any (model: train the current model)   [kind.build_stage]
     eval_b  : evaluate the candidate pair on the SAME S                  -> ts_B
               train gate: utils.gate, B vs A paired per task (--gate-train-z)
+              [only kinds with train_gate: a model candidate was trained on the train data,
+               so it goes from build straight to eval_val]
     eval_val: evaluate the candidate pair on the val split               -> val
               val gate: utils.gate, vs the current best's val trials, paired per task
               (--gate-val-z); or the "cheaper" path: not worse by more than
@@ -25,7 +27,7 @@ Transitions:
     baseline --ok--> eval_a                          (iteration 0 = base pair on val)
     eval_a   --ok--> propose
     propose  --ok--> build | eval_b  --fail--> next_try   (outcome no_proposal)
-    build    --ok--> eval_b          --fail--> next_try   (outcome build_fail)
+    build    --ok--> eval_b | eval_val --fail--> next_try (outcome build_fail)
     eval_b   --pass-> eval_val       --fail--> next_try   (outcome train_fail | no_score)
     eval_val -------> new iteration                       (outcome accepted | val_fail | no_score)
     next_try: try += 1; re-propose on the same S, or after --ts-repropose-limit tries on S
@@ -59,7 +61,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mho.kinds import Kind, Pair
-from utils.gate import GateConfig, decide_dirs
+from utils.gate import GateConfig, decide_dirs, env_failures
 from utils.scores import metric_of, score_trials
 from utils.state import _candidate_hypothesis, _sample_subset
 
@@ -67,6 +69,12 @@ SCHEMA = 3
 MAX_ATTEMPTS = int(os.environ.get("MHO_MAX_ATTEMPTS", "3"))             # submits per eval stage
 MAX_BUILD_ATTEMPTS = int(os.environ.get("MHO_MAX_BUILD_ATTEMPTS", "1"))  # e.g. a training run
 MAX_INFRA_FAILS = int(os.environ.get("MHO_MAX_EVAL_INFRA_FAILS", "3"))  # consecutive, then abort
+# An eval where more than this fraction of trials never got a sandbox is an infra failure (bad
+# node), retried -- not a score of 0 for the candidate.
+ENV_FAIL_MAX = float(os.environ.get("MHO_ENV_FAIL_MAX", "0.1"))
+# Before that retry, park a sleeping job on the bad node for this long so the retry lands
+# elsewhere (0 = don't).
+BAD_NODE_HOLD = int(os.environ.get("MHO_BAD_NODE_HOLD", "7200"))
 
 # Generic proposal-title headers to skip when logging what a candidate changed.
 _GENERIC_TITLES = {"candidate.md", "candidate", "hypothesis", "candidate proposal",
@@ -107,6 +115,7 @@ class Loop:
     def __init__(self, args: Any, run_dir: Path, sched: Any, *, kinds: dict[str, Kind],
                  schedule: list[tuple[str, int]],
                  submit_eval: Callable[..., str], submit_propose: Callable[..., str | None],
+                 submit_hold: Callable[..., str] | None = None,
                  score_fn: Callable[[Path], dict] = score_trials,
                  sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 60):
         unknown = {k for k, _ in schedule} - set(kinds)
@@ -115,6 +124,7 @@ class Loop:
         self.args, self.run_dir, self.sched = args, run_dir, sched
         self.kinds, self.schedule = kinds, schedule
         self._submit_eval, self._submit_propose = submit_eval, submit_propose
+        self._submit_hold = submit_hold
         self.score_fn, self.sleep, self.poll_seconds = score_fn, sleep, poll_seconds
         self.gate_cfg = GateConfig.from_args(args)
         self.cands = run_dir / "candidates"
@@ -366,8 +376,41 @@ class Loop:
         if stage == "propose":
             return self.kind.proposal_ok(self.tag_dir())
         if stage in _EVAL_STAGES:
-            return (True, "") if _has_trials(self._out_dir(stage)) else (False, "no trials")
+            out = self._out_dir(stage)
+            if not _has_trials(out):
+                return False, "no trials"
+            bad, n = env_failures(out)
+            if n and bad / n > ENV_FAIL_MAX:
+                host = self._job_host()
+                self._park(host)
+                return False, (f"{bad}/{n} trials never got a sandbox (node {host or '?'}); "
+                               f"infra, not the candidate")
+            return True, ""
         return self.kind.build_ok(self.tag_dir())
+
+    def _job_host(self) -> str | None:
+        job = self.st.get("job") or {}
+        get = getattr(self.sched, "host", None)
+        try:
+            return get(job["id"]) if get and job.get("id") else None
+        except Exception:
+            return None
+
+    def _park(self, host: str | None) -> None:
+        """Hold a node whose sandboxes do not start, so retries go elsewhere (once per host)."""
+        held = self.st.setdefault("bad_hosts", {})
+        if not host or host in held or not self._submit_hold or BAD_NODE_HOLD <= 0:
+            return
+        log = self.run_dir / "logs" / f"hold-{host}.out"
+        try:
+            held[host] = self._submit_hold(self.sched, host, BAD_NODE_HOLD, log)
+        except Exception as e:                     # parking is best effort
+            held[host] = None
+            print(f"  could not park bad node {host}: {e}")
+            return
+        self._event(stage="bad_node", host=host, hold_job=held[host], seconds=BAD_NODE_HOLD)
+        print(f"  BAD NODE {host}: sandboxes do not start there; parked job {held[host]} on it "
+              f"for {BAD_NODE_HOLD}s so the retry runs elsewhere. Report {host} to the admins.")
 
     def _on_done(self, stage: str, rc: int) -> None:
         st = self.st
@@ -381,11 +424,23 @@ class Loop:
         limit = MAX_ATTEMPTS if stage in _EVAL_STAGES else \
             0 if stage == "propose" else MAX_BUILD_ATTEMPTS
         if not ok and st["attempt"] < limit:
+            if stage in _EVAL_STAGES:
+                self._set_aside(stage)
             st["attempt"] += 1
             st["job"] = None
             print(f"  {stage} {self.tag} failed ({why}); attempt {st['attempt']}/{limit}")
             return
         getattr(self, f"_done_{stage}", self._done_build)(ok, rc)
+
+    def _set_aside(self, stage: str) -> None:
+        """Move a failed eval's trials out of the way, so the retry starts clean (the same
+        --job-name dir would otherwise be resumed) and the evidence is kept."""
+        d = self._out_dir(stage)
+        if d.is_dir():
+            dst = d.with_name(f"{d.name}.failed-attempt{self.st['attempt']}")
+            if dst.exists():
+                shutil.rmtree(dst)
+            d.rename(dst)
 
     def _score(self, stage: str) -> float:
         self.st["infra_fails"] = 0
@@ -433,7 +488,7 @@ class Loop:
         title = _title(_candidate_hypothesis(self.tag_dir()))
         if title:
             print(f"  [+] {self.tag} ({st['kind']}): {title}")
-        self._goto(self.kind.build_stage or "eval_b")
+        self._goto(self.kind.build_stage or self._after_build())
 
     def _done_build(self, ok: bool, rc: int) -> None:
         """The kind's build job (e.g. model training) finished."""
@@ -446,7 +501,13 @@ class Loop:
             return
         self.st["infra_fails"] = 0
         print(f"  built {self.tag}: {self._cand_pair().model or self._cand_pair().harness}")
-        self._goto("eval_b")
+        self._goto(self._after_build())
+
+    def _after_build(self) -> str:
+        if self.kind.train_gate:
+            return "eval_b"
+        print(f"  {self.st['kind']} candidate: no train gate -> val")
+        return "eval_val"
 
     def _done_eval_b(self, ok: bool, rc: int) -> None:
         st = self.st

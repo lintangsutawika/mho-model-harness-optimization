@@ -44,7 +44,8 @@ class Scheduler:
 
     def submit(self, script: Path, env: dict[str, str], *, name: str = "", ngpus: int = 0,
                cpus: int = 0, walltime: str = "", queue: str = "", account: str = "",
-               select: str = "", resource_type: str = "", out_dir: Path | None = None) -> str:
+               select: str = "", resource_type: str = "", out_dir: Path | None = None,
+               host: str = "") -> str:
         # `select` (raw PBS -l select string, e.g. ABCI's "1:ncpus=192:mem=1920gb:ngpus=8") wins
         # over the auto-built ngpus/cpus select -- clusters with full-node/reservation shapes need
         # the exact string. `resource_type` -> PBS `-v RTYPE=...`, required by ABCI reservation
@@ -66,6 +67,9 @@ class Scheduler:
             if queue: cmd += ["-q", queue]
             if account: cmd += ["-P", account]
             sel = select or ("select=1" + (f":ngpus={ngpus}" if ngpus else "") + (f":ncpus={cpus}" if cpus else ""))
+            if host:   # pin to one node: select=1:host=<h>:...
+                head, _, rest = sel.partition(":")
+                sel = f"{head}:host={host}" + (f":{rest}" if rest else "")
             cmd += ["-l", sel]
             if walltime: cmd += ["-l", f"walltime={walltime}"]
             if out_dir: cmd += ["-o", str(out_dir), "-j", "oe"]
@@ -78,6 +82,7 @@ class Scheduler:
             if ngpus: cmd += [f"--gres=gpu:{ngpus}"]
             if cpus: cmd += [f"--cpus-per-task={cpus}"]
             if walltime: cmd += ["-t", walltime]
+            if host: cmd += ["-w", host]
             if out_dir: cmd += ["-o", str(out_dir if log_file else out_dir / "%x-%j.out")]
             cmd.append(str(script))
         if LOG_VERBOSE:
@@ -142,6 +147,19 @@ class Scheduler:
                     pass
                 break
         return "DONE", exit_status
+
+    def host(self, job_id: str) -> str | None:
+        """The node a (running or finished) job ran on, if the scheduler still knows it."""
+        if self.kind == "pbs":
+            r = subprocess.run(["qstat", "-x", "-f", job_id], capture_output=True, text=True)
+            for line in r.stdout.splitlines():
+                if line.strip().startswith("exec_host"):
+                    return line.split("=", 1)[1].strip().split("/")[0].split("+")[0] or None
+            return None
+        r = subprocess.run(["sacct", "-j", str(job_id), "-X", "-n", "-P", "-o", "NodeList"],
+                           capture_output=True, text=True)
+        node = (r.stdout.strip().splitlines() or [""])[0].strip()
+        return node if node and node not in ("None assigned", "(null)") else None
 
     def wait(self, job_id: str) -> int:
         """Block until `job_id` finishes; return its exit status (0 if unreported)."""
@@ -222,3 +240,16 @@ def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))
+
+
+HOLD_SCRIPT = REPO_DIR / "scripts" / "utils" / "hold_node.sh"
+
+
+def submit_hold(sched: Scheduler, host: str, seconds: int, logs: Path) -> str:
+    """Park a sleeping job on a broken node so the retried eval cannot land on it again
+    (PBS here cannot EXCLUDE a host, but it can pin a job to one). Same resources as an eval,
+    so it takes the whole node."""
+    res = _phase_res("EVAL")
+    res["walltime"] = f"{(seconds + 600) // 3600:02d}:{(seconds + 600) % 3600 // 60:02d}:00"
+    return sched.submit(HOLD_SCRIPT, _phase_env({"MHO_HOLD_SECONDS": str(seconds)}, None),
+                        name=f"mho-hold-{host}", account=_ACCOUNT, out_dir=logs, host=host, **res)

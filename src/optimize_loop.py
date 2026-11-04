@@ -28,8 +28,8 @@ from datetime import datetime
 from pathlib import Path
 
 from mho.jobs import (AGENT_IMPORT, EVAL_SCRIPT, LOG_VERBOSE, POLL_SECONDS,  # noqa: F401
-                      PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_propose,
-                      submit_train)
+                      PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_hold,
+                      submit_propose, submit_train)
 from mho.kinds import HarnessKind, ModelKind
 from mho.loop import Loop
 from utils.gate import GateConfig
@@ -171,7 +171,7 @@ def main(argv: list[str] | None = None) -> None:
                  "model": ModelKind(train_data=args.train_data, trainer=args.trainer,
                                     submit_train=submit_train)}
         Loop(args, run_dir, Scheduler(), kinds=kinds, schedule=schedule_for(args),
-             submit_eval=submit_eval, submit_propose=submit_propose,
+             submit_eval=submit_eval, submit_propose=submit_propose, submit_hold=submit_hold,
              poll_seconds=POLL_SECONDS).run()
     except Exception:
         import traceback as _tb

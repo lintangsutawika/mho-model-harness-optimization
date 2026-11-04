@@ -137,3 +137,20 @@ def test_decide_dirs_ignores_anchor_equal_to_reference(tmp_path):
         _trial(tmp_path / "B", f"t{i}", f"t{i}", float(r), 500)
     d = decide_dirs(tmp_path / "A", tmp_path / "B", z=1.645, cfg=CFG, anchor_dir=tmp_path / "A")
     assert d.accept and d.path == "cheaper" and d.anchor is None
+
+
+def test_env_failed_trials_are_left_out(tmp_path):
+    from utils.gate import env_failures
+    _trial(tmp_path, "ok", "x", 1.0, 100)
+    t = tmp_path / "nosandbox"
+    t.mkdir()
+    (t / "result.json").write_text(json.dumps({
+        "task_name": "x", "agent_setup": None, "exception_info": {"exception_type": "RuntimeError"}}))
+    h = tmp_path / "harnessbroke"                      # failed AFTER agent setup started: counts
+    h.mkdir()
+    (h / "result.json").write_text(json.dumps({
+        "task_name": "y", "agent_setup": {"started_at": "x"},
+        "exception_info": {"exception_type": "NonZeroAgentExitCodeError"}}))
+    pt = per_task(tmp_path)
+    assert pt["x"]["n"] == 1.0 and pt["x"]["reward"] == 1.0 and pt["y"]["reward"] == 0.0
+    assert env_failures(tmp_path) == (1, 3)

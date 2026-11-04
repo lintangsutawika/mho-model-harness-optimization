@@ -31,6 +31,13 @@ class Fake:
         self.jobs: dict[str, dict] = {}
 
     # scheduler
+    def host(self, jid):
+        return "hnode023"
+
+    def submit_hold(self, sched, host, seconds, logs):
+        self.calls.append({"stage": "hold", "host": host, "seconds": seconds})
+        return self._job()
+
     def state(self, jid):
         j = self.jobs[jid]
         if j["polls"] < self.pending:
@@ -53,7 +60,17 @@ class Fake:
         self.calls.append({"stage": stage, "harness": harness, "model": model,
                            "base_model": base_model, "data": data,
                            "out": str(Path(out_dir) / job_name), "score": score, "log": logs})
-        if isinstance(score, dict):          # per-task trials: {task: (reward, output_tokens)}
+        if score == "envfail":               # every sandbox failed to start (bad node)
+            for i in range(4):
+                tr = Path(out_dir) / job_name / f"t{i}"
+                tr.mkdir(parents=True, exist_ok=True)
+                (tr / "result.json").write_text(json.dumps({
+                    "task_name": f"x{i}", "agent_setup": None,
+                    "exception_info": {"exception_type": "RuntimeError"},
+                    "verifier_result": None}))
+            (Path(out_dir) / job_name / "fake_score.json").write_text("0.0")
+            score = 0.0
+        elif isinstance(score, dict):        # per-task trials: {task: (reward, output_tokens)}
             for i, (task, (r, tok)) in enumerate(score.items()):
                 t = Path(out_dir) / job_name / f"t{i}"
                 t.mkdir(parents=True, exist_ok=True)
@@ -125,6 +142,7 @@ def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pen
                                 submit_train=fake.submit_train, realize=fake_realize)}
     loop = Loop(args, run_dir, fake, kinds=kinds, schedule=list(schedule),
                 submit_eval=fake.submit_eval, submit_propose=fake.submit_propose,
+                submit_hold=fake.submit_hold,
                 score_fn=fake_score, sleep=lambda s: None, poll_seconds=0)
     return loop, fake
 
@@ -363,46 +381,47 @@ def test_cheaper_but_worse_is_rejected_on_val(tmp_path):
 
 
 # --------------------------------------------------------------------------- model candidates
-def test_model_candidate_trains_then_evaluates_its_checkpoint(tmp_path):
-    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6], a=[0.3, 0.3], b=[0.5, 0.1]),
+def test_model_candidate_trains_then_goes_straight_to_val(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6, 0.55], a=[0.3, 0.3], b=[]),
                       iterations=2, schedule=[("model", 1)])
     loop.run()
     stages = [c["stage"] for c in fake.calls]
-    assert stages[:6] == ["val", "eval_a", "propose", "train", "eval_b", "val"]
+    assert stages[:5] == ["val", "eval_a", "propose", "train", "val"]
+    assert "eval_b" not in stages                                  # no train gate for models
     train = next(c for c in fake.calls if c["stage"] == "train")
     assert train["model"] == "m" and train["harness"] is None       # from the current pair
     assert train["sigma"].endswith("candidate_1_0_1/model/sigma_rewards/spec.json")
     ckpt = str(loop.cands / "candidate_1_0_1" / "train" / "checkpoints" / "hf" / "step_7")
-    b, v = fake.calls[4], fake.calls[5]
-    assert b["model"] == v["model"] == ckpt and b["base_model"] == "m"
+    v = fake.calls[4]
+    assert v["model"] == ckpt and v["base_model"] == "m"
     assert fake.calls[1]["base_model"] is None                      # base model: no override
     row = summary(loop)[1]
     assert row["kind"] == "model" and row["outcome"] == "accepted" and row["pair"]["model"] == ckpt
+    assert row["ts_B"] is None and row["train_gate"] is None
     # accepted -> the checkpoint is the current model: next A and the next training use it
-    assert fake.calls[6]["stage"] == "eval_a" and fake.calls[6]["model"] == ckpt
+    assert fake.calls[5]["stage"] == "eval_a" and fake.calls[5]["model"] == ckpt
     assert [c["model"] for c in fake.calls if c["stage"] == "train"][1] == ckpt
     assert json.loads((loop.run_dir / "best" / "pair.json").read_text())["model"] == ckpt
-    assert (loop.run_dir / "logs" / "candidate_1_0_1-train.out").name in [
-        Path(c["log"]).name for c in fake.calls]
+    assert "candidate_1_0_1-train.out" in [Path(c["log"]).name for c in fake.calls]
 
 
 def test_rejected_model_is_never_trained_on(tmp_path):
-    loop, fake = make(tmp_path, scripted(val=[0.5, 0.4], a=[0.3, 0.3], b=[0.5, 0.1]),
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.4, 0.45], a=[0.3, 0.3], b=[]),
                       iterations=2, schedule=[("model", 1)])
     loop.run()
-    assert [r["outcome"] for r in summary(loop)] == ["baseline", "val_fail", "train_fail"]
+    assert [r["outcome"] for r in summary(loop)] == ["baseline", "val_fail", "val_fail"]
     assert [c["model"] for c in fake.calls if c["stage"] == "eval_a"] == ["m", "m"]
     assert [c["model"] for c in fake.calls if c["stage"] == "train"] == ["m", "m"]
     assert loop.st["pair"] == {"harness": None, "model": None}
 
 
 def test_failed_training_is_build_fail_then_next_try(tmp_path):
-    loop, fake = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[0.1]), iterations=2,
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.4], a=[0.3], b=[]), iterations=2,
                       schedule=[("model", 1)], trains=lambda tag: tag != "candidate_1_0_1")
     loop.run()
     rows = summary(loop)
     assert [(r["candidate"], r["outcome"]) for r in rows[1:]] == [
-        ("candidate_1_0_1", "build_fail"), ("candidate_1_0_2", "train_fail")]
+        ("candidate_1_0_1", "build_fail"), ("candidate_1_0_2", "val_fail")]
     assert len([c for c in fake.calls if c["stage"] == "train"]) == 2   # no retry by default
     assert "no HF checkpoint" in rows[1]["reason"]
 
@@ -410,7 +429,7 @@ def test_failed_training_is_build_fail_then_next_try(tmp_path):
 def test_model_harness_schedule_alternates_and_keeps_the_harness(tmp_path):
     """2 harness then 1 model, repeating. An accepted harness stays in the pair through the
     model candidate, and the accepted model candidate gets a copy of it for the proposer."""
-    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6, 0.7], a=[0.3] * 3, b=[0.5, 0.1, 0.5, 0.1]),
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6, 0.7], a=[0.3] * 3, b=[0.5, 0.1, 0.1]),
                       iterations=4, limit=5, schedule=[("harness", 2), ("model", 1)])
     loop.run()
     rows = summary(loop)[1:]
@@ -438,3 +457,31 @@ def test_schema2_harness_state_is_migrated_on_resume(tmp_path):
     assert loop.st["schema"] == 3 and loop.st["pair"] == {"harness": parent, "model": None}
     loop.run()
     assert fake.calls[0]["stage"] == "eval_a" and fake.calls[0]["harness"] == parent
+
+
+# --------------------------------------------------------------------------- bad nodes
+def test_sandbox_failures_are_retried_on_another_node_not_scored(tmp_path):
+    """Every trial failing before agent setup (a broken node) is infra: the eval is set aside
+    and retried after parking the node, never recorded as the candidate's score."""
+    loop, fake = make(tmp_path, scripted(val=[0.5, "envfail", 0.6], a=[0.3], b=[0.5]),
+                      iterations=1)
+    loop.run()
+    assert [r["outcome"] for r in summary(loop)] == ["baseline", "accepted"]
+    assert summary(loop)[1]["val"] == 0.6
+    holds = [c for c in fake.calls if c["stage"] == "hold"]
+    assert len(holds) == 1 and holds[0]["host"] == "hnode023"
+    stages = [c["stage"] for c in fake.calls]
+    assert stages[stages.index("hold") - 1] == "val" and stages[stages.index("hold") + 1] == "val"
+    ev = loop.run_dir / "evaluation"
+    assert (ev / "candidate_1_0_1.failed-attempt1").is_dir()           # evidence kept
+    assert not (ev / "candidate_1_0_1" / "t3").exists()               # retry started clean
+    assert list(loop.st["bad_hosts"]) == ["hnode023"]
+
+
+def test_node_is_parked_once(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=["envfail", "envfail", 0.3], b=[0.1]),
+                      iterations=1)
+    loop.run()
+    assert [c["stage"] for c in fake.calls].count("hold") == 1
+    assert [c["stage"] for c in fake.calls].count("eval_a") == 3
+    assert summary(loop)[-1]["outcome"] == "train_fail"

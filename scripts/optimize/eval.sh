@@ -346,6 +346,7 @@ echo "=================================================================="
 echo "agent: ${AGENT_IMPORT} | data: ${HARBOR_PATH:-${HARBOR_DATASET}} (${TASK_SET}) | model: ${MODEL}"
 echo "env: ${HARBOR_ENV} | harness: ${MINI_FORK_LOCAL:-<base>} | n=${N_CONCURRENT} attempts=${RUNS}"
 echo "output: ${EVAL_JOBS_DIR}/${EVAL_JOB_NAME}/"
+echo "host:   $(hostname)  job: ${PBS_JOBID:-${SLURM_JOB_ID:-none}}"
 echo "=================================================================="
 
 RUN_CMD=("${CMD[@]}")
