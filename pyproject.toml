@@ -5,6 +5,8 @@ requires-python = ">=3.12,<3.14"
 dependencies = [
   "harbor[modal]",
   "harbor-singularity-hpc; python_version >= '3.12'",
+  # Sail remote sandboxes (sail.harbor:SailboxEnvironment, HARBOR_ENV=sail). CPU-only; needs SAIL_API_KEY (or SAIL_KEY in .env).
+  "sail==0.16.0",
   "terminal-bench==0.2.18",
   "litellm",
   "python-dotenv",

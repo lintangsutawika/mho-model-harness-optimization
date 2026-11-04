@@ -111,10 +111,9 @@ def generate(
         "docker_image": docker_image,
         "name": f"mho/arxivmath-0826-{problem['problem_id']}",
     }
-    if docker_image.lower().endswith(".sif"):
-        df = task / "environment" / "Dockerfile"
-        if df.exists():
-            df.write_text("FROM scratch\nWORKDIR /workspace\n")
+    # Keep the template environment/Dockerfile even with a prebuilt .sif: singularity runs use
+    # docker_image (the .sif) and never build the Dockerfile, while Sail (HARBOR_ENV=sail,
+    # --force-build) builds it -- the same recipe the .sif was built from.
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
     _fill(task / "tests" / "test.py", **fills)
