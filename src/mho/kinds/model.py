@@ -2,7 +2,8 @@
 the model should learn); they are realized into sigma-reward configs
 (candidates/<tag>/model/sigma_rewards/*.json), and the build step trains the CURRENT model with
 the current harness on that reward (scripts/optimize/train.sh, Miles). The newest HF checkpoint
-under candidates/<tag>/train/checkpoints/hf/ is the candidate model.
+under candidates/<tag>/train/checkpoints/hf/ is the candidate model. It is trained on
+--train-data, so it skips eval_b and the train gate and is judged on the val split directly.
 """
 from __future__ import annotations
 
@@ -76,6 +77,7 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
 class ModelKind(Kind):
     name = "model"
     build_stage = "train"
+    train_gate = False      # trained on --train-data: judged on the val split only
 
     def __init__(self, *, train_data: str, trainer: str, submit_train: Callable[..., str],
                  realize: Callable[[Path, str], tuple[bool, Path | None]] = realize_model_specs):

@@ -39,6 +39,9 @@ class Kind(ABC):
     # Job run between propose and eval_b (its stage name), or None. The loop submits it via
     # submit_build() and checks it with build_ok(); its log is <run>/logs/<tag>-<build_stage>.out.
     build_stage: str | None = None
+    # Run eval_b + the train gate on the train subset before val? Off for kinds whose candidate
+    # has seen the train data (a model trained on it), where that comparison is meaningless.
+    train_gate: bool = True
 
     @abstractmethod
     def proposal_ok(self, cand_dir: Path) -> tuple[bool, str]:
