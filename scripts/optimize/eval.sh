@@ -9,13 +9,17 @@
 #                  and the sandbox shares the host net namespace, so the agent reaches the local
 #                  vLLM at localhost directly -- NO Modal, NO relay.
 #   modal       -> cloud sandboxes; the local vLLM is exposed to them via the Modal reverse relay.
-#   sail        -> Sail cloud sandboxes (sail.harbor:SailboxEnvironment); needs SAIL_API_KEY.
-#                  Usually paired with a hosted endpoint: MHO_MODEL unset,
-#                  MODEL=litellm_proxy/<name>, LITELLM_PROXY_API_BASE=<endpoint>/v1, LITELLM_PROXY_API_KEY.
+#   sail        -> Sail cloud sandboxes (sail.harbor:SailboxEnvironment, CPU-only); needs
+#                  SAIL_API_KEY (or SAIL_KEY in .env). With MHO_MODEL set, the local vLLM is
+#                  exposed via the same Modal reverse relay; or use a hosted endpoint: MHO_MODEL
+#                  unset, MODEL=litellm_proxy/<name>, LITELLM_PROXY_API_BASE=<endpoint>/v1,
+#                  LITELLM_PROXY_API_KEY. The task image is built from environment/Dockerfile
+#                  (--force-build), so a task whose docker_image is a local .sif still works;
+#                  identical Dockerfiles share one Sail build.
 #
 # Model handling:
 #   MHO_MODEL set  -> SELF-HOST it with vLLM (HF name OR local hf-compatible dir). singularity:
-#                     agent hits localhost:VLLM_PORT. modal: exposed via the relay.
+#                     agent hits localhost:VLLM_PORT. modal/sail: exposed via the relay.
 #   MHO_MODEL unset-> use MODEL (a litellm id) directly (API model; no self-serve).
 #
 # Env: HARBOR_ENV, MHO_MODEL, MHO_HARNESS (->MINI_FORK_LOCAL), MHO_DATA / MHO_DATA_PATH, MHO_OUT,
@@ -56,7 +60,19 @@ require_sif_dir() {
   exit 2
 }
 
-HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' for cloud
+HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' or 'sail' for cloud
+case "${HARBOR_ENV}" in
+  singularity|modal|sail) ;;
+  *) echo "ERROR: HARBOR_ENV must be singularity|modal|sail (got '${HARBOR_ENV}')" >&2; exit 2 ;;
+esac
+# Cloud sandboxes cannot reach this node: a self-served model goes through the Modal relay.
+CLOUD_SANDBOX=0; [ "${HARBOR_ENV}" != "singularity" ] && CLOUD_SANDBOX=1
+SAIL_IMPORT="${SAIL_IMPORT:-sail.harbor:SailboxEnvironment}"
+SAIL_FORCE_BUILD="${SAIL_FORCE_BUILD:-1}"   # build environment/Dockerfile, not the task's docker_image
+if [ "${HARBOR_ENV}" = "sail" ]; then
+  export SAIL_API_KEY="${SAIL_API_KEY:-${SAIL_KEY:-}}"
+  [ -n "${SAIL_API_KEY}" ] || { echo "ERROR: HARBOR_ENV=sail needs SAIL_API_KEY (or SAIL_KEY in .env)" >&2; exit 2; }
+fi
 AGENT_IMPORT="${AGENT_IMPORT:-harness.micro_swe_agent:MicroSweAgent}"
 # Custom harbor-singularity-hpc env class, selected by --environment-import-path (harbor's
 # -e is a fixed enum and cannot name a custom class). Override to test a fork.
@@ -150,7 +166,7 @@ if [ -n "${MHO_MODEL:-}" ]; then
   # via the Modal gateway. serve.sh runs vLLM in the foreground; we background it and poll.
   VLLM_PORT="${VLLM_PORT:-8000}"; SERVED_NAME="${SERVED_NAME:-$(basename "${MHO_MODEL}")}"
   echo "[eval] serving via scripts/utils/serve.sh: ${MHO_MODEL} -> :${VLLM_PORT}"
-  if [ "${HARBOR_ENV}" = "modal" ]; then USE_RELAY=1; fi
+  if [ "${CLOUD_SANDBOX}" = 1 ]; then USE_RELAY=1; fi
 
   MODEL="${MHO_MODEL}" \
   VLLM_PORT="${VLLM_PORT}" \
@@ -169,7 +185,7 @@ if [ -n "${MHO_MODEL:-}" ]; then
   curl -sf "http://localhost:${VLLM_PORT}/health" >/dev/null 2>&1 \
     || { echo "[eval] vLLM not healthy; see ${VLLM_LOG}" >&2; exit 1; }
   MODEL="litellm_proxy/${SERVED_NAME}"; VLLM_LOCAL_URL="http://localhost:${VLLM_PORT}"
-  if [ "${HARBOR_ENV}" = "modal" ]; then
+  if [ "${CLOUD_SANDBOX}" = 1 ]; then
     RELAY=1                                   # cloud sandboxes reach the vLLM via the relay
   else
     # local singularity: the sandbox shares the host net namespace -> hit vLLM directly.
@@ -224,7 +240,9 @@ if [ "${HARBOR_ENV}" = "singularity" ]; then
   [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
   [ -n "${SINGULARITY_MEMORY_ENFORCEMENT}" ] && ENV_FLAGS+=( --ek "memory_enforcement_policy=${SINGULARITY_MEMORY_ENFORCEMENT}" )
 elif [ "${HARBOR_ENV}" = "sail" ]; then
-  ENV_FLAGS=( --environment-import-path "sail.harbor:SailboxEnvironment" )
+  ENV_FLAGS=( --environment-import-path "${SAIL_IMPORT}" )
+  [ "${SAIL_FORCE_BUILD}" = "1" ] && ENV_FLAGS+=( --force-build )
+  [ -n "${ALLOW_HOST}" ] && ENV_FLAGS+=( --allow-agent-host "${ALLOW_HOST}" )
 else
   ENV_FLAGS=( -e modal )
   [ -n "${MODAL_APP_NAME}" ] && ENV_FLAGS+=( --ek "app_name=${MODAL_APP_NAME}" )
@@ -279,7 +297,7 @@ fi
 [ -n "${AGENT_CONFIG}" ] && CMD+=( --ak "config_file=${AGENT_CONFIG}" )
 [ -n "${MINI_FORK_LOCAL:-}" ] && CMD+=( --ak "mini_fork_local=${MINI_FORK_LOCAL}" )
 
-# --- Modal reverse relay (only for HARBOR_ENV=modal: expose local vLLM to cloud sandboxes) --
+# --- Modal reverse relay (HARBOR_ENV=modal|sail: expose local vLLM to cloud sandboxes) --
 if [ "${RELAY:-0}" = "1" ]; then
   VLLM_LOCAL_URL="${VLLM_LOCAL_URL:-http://localhost:8000}"
   RELAY_APP_NAME="${RELAY_APP_NAME:-mho-vllm-relay-$$}"

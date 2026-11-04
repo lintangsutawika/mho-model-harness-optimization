@@ -241,13 +241,9 @@ def generate(
         "name": f"mho/arxivmath-training-{_sanitize(problem.get('source') or '')}",
         "docker_image": docker_image,
     }
-    # A prebuilt .sif already carries the full toolchain -> the task's environment/Dockerfile
-    # must NOT re-trigger runtime image layering; replace it with a minimal no-RUN recipe that
-    # keeps WORKDIR /workspace (msl leetcode adapter pattern).
-    if docker_image.lower().endswith(".sif"):
-        df = task / "environment" / "Dockerfile"
-        if df.exists():
-            df.write_text("FROM scratch\nWORKDIR /workspace\n")
+    # Keep the template environment/Dockerfile even with a prebuilt .sif: singularity runs use
+    # docker_image (the .sif) and never build the Dockerfile, while Sail (HARBOR_ENV=sail,
+    # --force-build) builds it -- the same recipe the .sif was built from.
     _fill(task / "task.toml", **fills)
     _fill(task / "instruction.md", **fills)
     _fill(task / "tests" / "test.py", **fills)
