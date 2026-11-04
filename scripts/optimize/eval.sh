@@ -9,6 +9,9 @@
 #                  and the sandbox shares the host net namespace, so the agent reaches the local
 #                  vLLM at localhost directly -- NO Modal, NO relay.
 #   modal       -> cloud sandboxes; the local vLLM is exposed to them via the Modal reverse relay.
+#   sail        -> Sail cloud sandboxes (sail.harbor:SailboxEnvironment); needs SAIL_API_KEY.
+#                  Usually paired with a hosted endpoint: MHO_MODEL unset,
+#                  MODEL=litellm_proxy/<name>, LITELLM_PROXY_API_BASE=<endpoint>/v1, LITELLM_PROXY_API_KEY.
 #
 # Model handling:
 #   MHO_MODEL set  -> SELF-HOST it with vLLM (HF name OR local hf-compatible dir). singularity:
@@ -127,6 +130,7 @@ cleanup() {
   [ -n "${RELAY_BRIDGE_PID}" ] && { echo "[relay] stopping bridge (pid=${RELAY_BRIDGE_PID})"; kill "${RELAY_BRIDGE_PID}" 2>/dev/null; }
   [ -n "${RELAY_APP_STOP}" ] && { echo "[relay] stopping Modal app ${RELAY_APP_STOP}"; uv run modal app stop "${RELAY_APP_STOP}" </dev/null >/dev/null 2>&1 || true; }
   [ -n "${VLLM_PID}" ] && { echo "[eval] stopping vLLM (pid=${VLLM_PID})"; kill "${VLLM_PID}" 2>/dev/null; }
+  :  # a false test above would otherwise become the script's exit status
 }
 trap cleanup EXIT
 
@@ -219,6 +223,8 @@ if [ "${HARBOR_ENV}" = "singularity" ]; then
   [ -n "${SINGULARITY_SANDBOX_DIR}" ] && ENV_FLAGS+=( --ek "singularity_sandbox_dir=${SINGULARITY_SANDBOX_DIR}" )
   [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
   [ -n "${SINGULARITY_MEMORY_ENFORCEMENT}" ] && ENV_FLAGS+=( --ek "memory_enforcement_policy=${SINGULARITY_MEMORY_ENFORCEMENT}" )
+elif [ "${HARBOR_ENV}" = "sail" ]; then
+  ENV_FLAGS=( --environment-import-path "sail.harbor:SailboxEnvironment" )
 else
   ENV_FLAGS=( -e modal )
   [ -n "${MODAL_APP_NAME}" ] && ENV_FLAGS+=( --ek "app_name=${MODAL_APP_NAME}" )
