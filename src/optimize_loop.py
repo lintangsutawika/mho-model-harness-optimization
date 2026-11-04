@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Any
 
 from utils.env import _ACCOUNT, _data_env, _phase_env, _phase_res, child_job_env
-from utils.scores import (append_summary, latest_trials_dir, score_trials,
+from utils.gate import GateConfig, decide_dirs
+from utils.scores import (append_summary, latest_trials_dir, metric_of, score_trials,
                               update_frontier)
 from utils.state import (_candidate_hypothesis, _latest_hf_ckpt, _load_state,
                               _sample_subset, _save_state, detect_scheduler)
@@ -439,6 +440,7 @@ def optimize(args: argparse.Namespace) -> None:
     M_harness = max(1, args.harness_proposals)
     M_model = max(1, args.model_proposals)
     sched = Scheduler()
+    gate_cfg = GateConfig.from_args(args)
 
     st = None if args.fresh else _load_state(state_path)
     if st is None:
@@ -458,6 +460,7 @@ def optimize(args: argparse.Namespace) -> None:
               "scaffold_dir": None,     # the candidate currently being trained/evaled
               "parent_scaffold": None,  # frontier-best so far; next propose accumulates on it
               "model_dir": None,        # latest trained checkpoint (HF dir); None -> args.model
+              "accepted_model_dir": None,  # last ACCEPTED checkpoint; a rejected model reverts to it
               "last_eval_dir": None,    # most-recent eval's trials dir, for the next propose
               "last_ts_score": None,    # prior eval_train_sample mean_reward (harness gate)
               "ts_baseline": None,      # first eval_train_sample mean_reward (harness gate baseline)
@@ -506,6 +509,8 @@ def optimize(args: argparse.Namespace) -> None:
         # Backward-compat: older state.json has no propose-substep cursor. Default it so the
         # resume gate (which reads st["substep"]) never KeyErrors on a pre-substep run.
         st.setdefault("substep", "none")
+        # Pre-gate runs: treat the current model as accepted (no revert of existing progress).
+        st.setdefault("accepted_model_dir", st.get("model_dir"))
 
     def cur_tag() -> str:
         # candidate_{iteration}_{version}_{try}: iteration=total attempts, version=accepted
@@ -818,6 +823,7 @@ def optimize(args: argparse.Namespace) -> None:
                         # double-advanced and skipped propose). Set action_index to the propose
                         # slot (1) and job_id so the loop waits for the propose job deterministically.
                         st["ts_A"] = ts_score
+                        st["ts_A_dir"] = str(trials_dir)
                         st["eval_phase"] = "cand"
                         st.setdefault("ts_try", 0)
                         print(f"  harness base train-sample (A) = {ts_score:.4f}; propose B")
@@ -844,10 +850,12 @@ def optimize(args: argparse.Namespace) -> None:
                     else:
                         # Proposed B on the SAME subset: improved over A -> verify on eval_val.
                         tA = st.get("ts_A")
-                        if tA is None or ts_score > tA:
-                            print(f"  harness candidate train-sample improved "
-                                  f"({ts_score:.4f} > {tA if tA is not None else 0.0:.4f}); "
-                                  f"proceeding to eval_val")
+                        _tdec = decide_dirs(st.get("ts_A_dir"), trials_dir, z=gate_cfg.train_z,
+                                            cfg=gate_cfg, fallback=(tA, ts_score))
+                        if tA is None or _tdec.accept:
+                            print(f"  harness candidate train gate PASS [{_tdec.path}] "
+                                  f"(B {ts_score:.4f} vs A {tA if tA is not None else 0.0:.4f}): "
+                                  f"{_tdec.reason}; proceeding to eval_val")
                             # Deterministic transition: point action_index at the eval_val slot
                             # + clear job_id so the LOOP TICK submits eval_val and waits. Do NOT
                             # advance() (on_done advance + tick's None-submit advance double-fired
@@ -864,6 +872,7 @@ def optimize(args: argparse.Namespace) -> None:
                                                           "phase": "train_gate", "ts_A": tA,
                                                           "ts_B": ts_score,
                                                           "train_gate": "improved",
+                                                          "train_gate_stats": _tdec.fields(),
                                                           "outcome": "train_pass",
                                                           "hypothesis": _candidate_hypothesis(tag_dir(tag) / "harness")})
                             st["train_gate_result"] = "train_pass"
@@ -884,11 +893,12 @@ def optimize(args: argparse.Namespace) -> None:
                                                                       "phase": "train_gate", "ts_A": tA,
                                                                       "ts_B": ts_score,
                                                                       "train_gate": "no_improvement",
+                                                                      "train_gate_stats": _tdec.fields(),
                                                                       "outcome": "train_fail",
                                                                       "hypothesis": _candidate_hypothesis(tag_dir(tag) / "harness")})
-                                print(f"  harness candidate train-sample no improvement "
-                                      f"({ts_score:.4f} <= {tA:.4f}); re-propose same subset "
-                                      f"(try {st['ts_try']}/{lim})")
+                                print(f"  harness candidate train gate FAIL "
+                                      f"(B {ts_score:.4f} vs A {tA:.4f}): {_tdec.reason}; "
+                                      f"re-propose same subset (try {st['ts_try']}/{lim})")
                                 # Re-propose B from A on the SAME subset: keep the FULL action
                                 # list and point action_index at the PROPOSE slot, so the propose
                                 # on_done's anchored handoff schedules the cand eval (B) after it.
@@ -922,7 +932,26 @@ def optimize(args: argparse.Namespace) -> None:
                 # proposer must never see val trials.
                 if action == "eval":
                     st["last_eval_dir"] = str(trials_dir)   # next propose analyzes this eval
-                improved = update_frontier(frontier_path, tag, score)
+                _fr = json.loads(frontier_path.read_text()) if frontier_path.exists() else {}
+                _ref = _fr.get("_best", {}).get("candidate")
+                _anc = (_fr.get("_anchor") or _fr.get("_best") or {}).get("candidate")
+                _vdec = decide_dirs(run_dir / "evaluation" / _ref if _ref else None, trials_dir,
+                                    z=gate_cfg.val_z, cfg=gate_cfg,
+                                    anchor_dir=run_dir / "evaluation" / _anc if _anc else None,
+                                    fallback=(_fr.get("_best", {}).get("metric"), metric_of(score)))
+                if _ref:
+                    print(f"  val gate {'PASS [' + str(_vdec.path) + ']' if _vdec.accept else 'FAIL'} "
+                          f"vs {_ref}: {_vdec.reason}")
+                improved = update_frontier(frontier_path, tag, score,
+                                           accept=_vdec.accept if _ref else None)
+                # Models: the next training continues from the last ACCEPTED checkpoint, so a
+                # rejected model is discarded like a rejected harness (not silently built on).
+                if improved:
+                    st["accepted_model_dir"] = st.get("model_dir")
+                elif st.get("model_dir") != st.get("accepted_model_dir"):
+                    print(f"  rejected model {st.get('model_dir')}; next training starts from "
+                          f"{st.get('accepted_model_dir') or args.model}")
+                    st["model_dir"] = st.get("accepted_model_dir")
                 if improved and st["scaffold_dir"]:
                     # ACCEPTED: accumulate (next propose builds ON this new best), bump the
                     # harness version, reset the retry counter.
@@ -965,6 +994,7 @@ def optimize(args: argparse.Namespace) -> None:
                                               "trials_dir": str(trials_dir), "score": score,
                                               "scaffold_dir": st["scaffold_dir"], "improved": improved,
                                               "train_gate": _tgr, "outcome": _outcome,
+                                              "val_gate": _vdec.fields() if _ref else None,
                                               "hypothesis": hypothesis})
                 _cur = json.loads(frontier_path.read_text()).get("_best", {}) if frontier_path.exists() else {}
                 _inc = f"{_cur.get('candidate', 'none')} @ {_cur.get('metric')}"
@@ -1100,6 +1130,32 @@ def main(argv: list[str] | None = None) -> None:
                    help="Max consecutive train-sample failures (T_B < T_A on the same subset) "
                         "before giving up on this harness/subset and moving to a fresh subset.",
                    metavar="N")
+    _g = GateConfig.env_defaults()
+    p.add_argument("--gate-train-z", dest="gate_train_z", type=float, default=_g["train_z"],
+                   help="train gate, 'better' path: accept B iff mean_i(B_i - A_i) > z * SE over "
+                        "the subset's tasks (paired; attempts averaged per task). 0 = plain B > A. "
+                        "Env: MHO_GATE_TRAIN_Z.")
+    p.add_argument("--gate-val-z", dest="gate_val_z", type=float, default=_g["val_z"],
+                   help="val gate, 'better' path: same test vs the frontier best's val trials "
+                        "(1.645 = one-sided 95%%). Applies to harness and model candidates. "
+                        "Env: MHO_GATE_VAL_Z.")
+    p.add_argument("--gate-cheaper-delta", dest="gate_cheaper_delta", type=float,
+                   default=_g["cheaper_delta"],
+                   help="'cheaper' path (both gates): also accept a candidate whose accuracy is not "
+                        "worse by more than this (lower bound of the paired difference, vs the "
+                        "reference and the most accurate accepted entry) if it is clearly cheaper. "
+                        "0 disables the path. Env: MHO_GATE_CHEAPER_DELTA.")
+    p.add_argument("--gate-cheaper-z", dest="gate_cheaper_z", type=float, default=_g["cheaper_z"],
+                   help="z for the cheaper path's non-inferiority and cost tests. "
+                        "Env: MHO_GATE_CHEAPER_Z.")
+    p.add_argument("--gate-cheaper-min-gain", dest="gate_cheaper_min_gain", type=float,
+                   default=_g["cheaper_min_gain"],
+                   help="cheaper path: minimum relative cost reduction (0.10 = 10%%). "
+                        "Env: MHO_GATE_CHEAPER_MIN_GAIN.")
+    p.add_argument("--gate-cost", dest="gate_cost_metric", choices=["tokens", "seconds"],
+                   default=_g["cost_metric"],
+                   help="cost for the cheaper path: agent output tokens per trial (default; "
+                        "independent of node load) or agent wall seconds. Env: MHO_GATE_COST.")
     p.add_argument("--run-name", default=None, help="stable name so a killed run can resume its state.json")
     p.add_argument("--skip-baseline", action="store_true")
     p.add_argument("--fresh", action="store_true", help="ignore any existing state.json and restart the run")

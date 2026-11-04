@@ -49,7 +49,16 @@ class Fake:
         score = self.evals(stage, harness, n)
         self.calls.append({"stage": stage, "harness": harness, "data": data,
                            "out": str(Path(out_dir) / job_name), "score": score, "log": logs})
-        if score is not None:
+        if isinstance(score, dict):          # per-task trials: {task: (reward, output_tokens)}
+            for i, (task, (r, tok)) in enumerate(score.items()):
+                t = Path(out_dir) / job_name / f"t{i}"
+                t.mkdir(parents=True, exist_ok=True)
+                (t / "result.json").write_text(json.dumps({
+                    "task_name": task, "verifier_result": {"rewards": {"reward": r}},
+                    "agent_result": {"n_output_tokens": tok}}))
+            score = sum(r for r, _ in score.values()) / len(score)
+            (Path(out_dir) / job_name / "fake_score.json").write_text(json.dumps(score))
+        elif score is not None:
             t = Path(out_dir) / job_name / "t0"
             t.mkdir(parents=True, exist_ok=True)
             (t / "result.json").write_text("{}")
@@ -220,8 +229,8 @@ def test_transient_failure_is_retried_not_recorded(tmp_path):
     loop, fake = make(tmp_path, scripted(val=[None, 0.5, 0.4], a=[0.3], b=[0.4]), iterations=1)
     loop.run()
     assert [r["outcome"] for r in summary(loop)] == ["baseline", "val_fail"]
-    assert [json.loads(l)["ok"] for l in loop.events_path.read_text().splitlines()][:2] == [
-        False, True]
+    jobs = [e for e in map(json.loads, loop.events_path.read_text().splitlines()) if "rc" in e]
+    assert [e["ok"] for e in jobs][:2] == [False, True]
 
 
 # --------------------------------------------------------------------------- resume
@@ -251,3 +260,67 @@ def test_metric_of_keeps_zero():
     assert metric_of({"mean_reward": 0.0, "solved_pass@1": 0.7}) == 0.0
     assert metric_of({"mean_reward": None, "solved_pass@1": 0.7}) == 0.7
     assert metric_of({}) == 0.0
+
+
+# --------------------------------------------------------------------------- gates (utils.gate)
+BASE = [1, 0] * 10                                    # 20 tasks, mean 0.5
+
+
+def tasks(rewards, tokens=1000):
+    return {f"t{i}": (float(r), tokens) for i, r in enumerate(rewards)}
+
+
+def flip(rewards, up=(), down=()):
+    out = list(rewards)
+    for i in up:
+        out[i] = 1
+    for i in down:
+        out[i] = 0
+    return out
+
+
+def test_train_gate_rejects_an_improvement_within_noise(tmp_path):
+    # B > A on the mean (2 up, 1 down of 20 tasks) but t < 1: not worth a val run
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=[tasks(BASE)],
+                                         b=[tasks(flip(BASE, up=[1, 3], down=[0]))]),
+                      iterations=1)
+    loop.run()
+    row = summary(loop)[-1]
+    assert row["outcome"] == "train_fail" and row["ts_B"] > row["ts_A"]
+    assert row["train_gate"]["acc"]["n"] == 20 and row["train_gate"]["acc"]["t"] < 1
+    assert [c["stage"] for c in fake.calls].count("val") == 1          # baseline only
+
+
+def test_clear_improvement_is_accepted_as_better(tmp_path):
+    better = flip(BASE, up=[1, 3, 5, 7, 9, 11, 13, 15])
+    loop, _ = make(tmp_path, scripted(val=[tasks(BASE), tasks(better)], a=[tasks(BASE)],
+                                      b=[tasks(better)]), iterations=1)
+    loop.run()
+    row = summary(loop)[-1]
+    assert row["outcome"] == "accepted" and row["path"] == "better"
+    assert row["train_gate"]["path"] == "better" and row["val_gate"]["acc"]["n"] == 20
+
+
+def test_same_accuracy_fewer_tokens_is_accepted_as_cheaper(tmp_path):
+    loop, _ = make(tmp_path, scripted(val=[tasks(BASE, 1000), tasks(BASE, 600)],
+                                      a=[tasks(BASE, 1000)], b=[tasks(BASE, 600)]),
+                   iterations=1)
+    loop.run()
+    row = summary(loop)[-1]
+    assert row["outcome"] == "accepted" and row["path"] == "cheaper"
+    assert row["train_gate"]["path"] == "cheaper"
+    fr = json.loads(loop.frontier_path.read_text())
+    assert fr["_best"]["candidate"] == "candidate_1_0_1"                # new parent
+    assert fr["_anchor"]["candidate"] == "baseline"                     # accuracy bar unchanged
+    assert (loop.run_dir / "best" / "harness" / "pyproject.toml").exists()
+
+
+def test_cheaper_but_worse_is_rejected_on_val(tmp_path):
+    worse = flip(BASE, down=[0, 2, 4])
+    loop, _ = make(tmp_path, scripted(val=[tasks(BASE, 1000), tasks(worse, 600)],
+                                      a=[tasks(BASE, 1000)], b=[tasks(BASE, 600)]),
+                   iterations=1)
+    loop.run()
+    row = summary(loop)[-1]
+    assert row["outcome"] == "val_fail" and row["val_gate"]["accept"] is False
+    assert json.loads(loop.frontier_path.read_text())["_best"]["candidate"] == "baseline"

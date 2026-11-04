@@ -5,9 +5,13 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
     eval_a  : evaluate the PARENT harness (frontier best) on S          -> ts_A
     propose : the proposer writes candidates/<tag>/harness from the parent
     eval_b  : evaluate the candidate on the SAME S                       -> ts_B
-              train gate: pass iff ts_B > ts_A (strict)
+              train gate: utils.gate, B vs A paired per task (--gate-train-z)
     eval_val: evaluate the candidate on the val split                    -> val
-              val gate: accept iff val > frontier best (strict)
+              val gate: utils.gate, candidate vs the frontier best's val trials, paired per
+              task (--gate-val-z); or the "cheaper" path: not worse by more than
+              --gate-cheaper-delta (vs the best AND the most accurate accepted, `_anchor`)
+              and clearly cheaper (agent output tokens). Without per-task data both gates
+              fall back to the plain strict B > A.
 
 Transitions:
     baseline --ok--> eval_a                          (iteration 0 = base harness on val)
@@ -43,6 +47,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from utils.gate import GateConfig, decide_dirs
 from utils.scores import metric_of, score_trials
 from utils.state import _candidate_hypothesis, _sample_subset
 
@@ -87,6 +92,7 @@ class HarnessLoop:
         self.args, self.run_dir, self.sched = args, run_dir, sched
         self._submit_eval, self._submit_propose = submit_eval, submit_propose
         self.score_fn, self.sleep, self.poll_seconds = score_fn, sleep, poll_seconds
+        self.gate_cfg = GateConfig.from_args(args)
         self.cands = run_dir / "candidates"
         self.frontier_path = self.cands / "frontier.json"
         self.summary_path = self.cands / "summary.json"
@@ -160,6 +166,7 @@ class HarnessLoop:
             "iteration": st["iteration"], "candidate": tag, "outcome": outcome,
             "accepted": outcome in ("accepted", "baseline"),
             "ts_A": sub.get("ts_A"), "ts_B": st.get("ts_B"), "subset_seed": sub.get("seed"),
+            "train_gate": st.get("train_gate"),
             "hypothesis": _candidate_hypothesis(self.tag_dir(tag)),
             **fields,
         }
@@ -168,7 +175,8 @@ class HarnessLoop:
         with self.summary_path.open("a") as fh:
             fh.write(json.dumps(rec) + "\n")
         print(f"  => {tag}: {outcome.upper()}"
-              + "".join(f" {k}={v}" for k, v in fields.items() if k != "reason"))
+              + "".join(f" {k}={v}" for k, v in fields.items()
+                        if k != "reason" and not isinstance(v, dict)))
 
     # ------------------------------------------------------------- transitions
     def _goto(self, stage: str) -> None:
@@ -178,6 +186,7 @@ class HarnessLoop:
         self.st["iteration"] += 1
         self.st["subset"] = None
         self.st["ts_B"] = None
+        self.st["train_gate"] = None
         self._goto("eval_a")
 
     def _next_try(self) -> None:
@@ -185,6 +194,7 @@ class HarnessLoop:
         st = self.st
         st["try"] += 1
         st["ts_B"] = None
+        st["train_gate"] = None
         st["subset"]["tries"] += 1
         if st["subset"]["tries"] >= self.args.ts_repropose_limit:
             print(f"  {st['subset']['tries']} tries on this subset; fresh subset next iteration")
@@ -348,11 +358,17 @@ class HarnessLoop:
             return
         st["ts_B"] = self._score("eval_b")
         ts_A = st["subset"]["ts_A"]
-        if st["ts_B"] > ts_A:
-            print(f"  train gate PASS ({st['ts_B']:.4f} > {ts_A:.4f}) -> val")
+        dec = decide_dirs(self._out_dir("eval_a"), self._out_dir("eval_b"),
+                          z=self.gate_cfg.train_z, cfg=self.gate_cfg, fallback=(ts_A, st["ts_B"]))
+        st["train_gate"] = dec.fields()
+        self._event(stage="train_gate", tag=self.tag, **dec.fields())
+        if dec.accept:
+            print(f"  train gate PASS [{dec.path}] (B {st['ts_B']:.4f} vs A {ts_A:.4f}): "
+                  f"{dec.reason} -> val")
             self._goto("eval_val")
         else:
-            print(f"  train gate FAIL ({st['ts_B']:.4f} <= {ts_A:.4f}); not run on val")
+            print(f"  train gate FAIL (B {st['ts_B']:.4f} vs A {ts_A:.4f}): {dec.reason}; "
+                  f"not run on val")
             self._finish("train_fail")
             self._next_try()
 
@@ -366,33 +382,53 @@ class HarnessLoop:
             return
         val = self._score("eval_val")
         best = self._best_metric()
-        if self._update_frontier(val):
+        fr = self._frontier()
+        ref = fr.get("_best", {}).get("candidate")
+        anc = (fr.get("_anchor") or fr.get("_best") or {}).get("candidate")
+        dec = decide_dirs(self._val_dir(ref) if ref else None, self._out_dir("eval_val"),
+                          z=self.gate_cfg.val_z, cfg=self.gate_cfg,
+                          anchor_dir=self._val_dir(anc) if anc else None, fallback=(best, val))
+        self._event(stage="val_gate", tag=self.tag, ref=ref, anchor_tag=anc, **dec.fields())
+        print(f"  val gate {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
+              f"(val {val:.4f} vs {ref} {best}): {dec.reason}")
+        if self._update_frontier(val, accept=dec.accept):
             harness = self.tag_dir() / "harness"
             shutil.rmtree(self.run_dir / "best", ignore_errors=True)
             shutil.copytree(harness, self.run_dir / "best" / "harness")
-            self._finish("accepted", val=val, prev_best=best)
+            self._finish("accepted", val=val, prev_best=best, path=dec.path,
+                         val_gate=dec.fields())
             st["parent"] = str(harness)
             st["version"] += 1
             st["try"] = 1
         else:
-            self._finish("val_fail", val=val, best=best)
+            self._finish("val_fail", val=val, best=best, val_gate=dec.fields())
             st["try"] += 1
         self._new_iteration()
 
     # ------------------------------------------------------------- frontier
-    def _best_metric(self) -> float | None:
-        if not self.frontier_path.exists():
-            return None
-        return json.loads(self.frontier_path.read_text()).get("_best", {}).get("metric")
+    def _frontier(self) -> dict:
+        return json.loads(self.frontier_path.read_text()) if self.frontier_path.exists() else {}
 
-    def _update_frontier(self, val: float) -> bool:
-        """Same frontier.json format the proposer reads (_best.candidate -> parent harness)."""
-        fr = json.loads(self.frontier_path.read_text()) if self.frontier_path.exists() else {}
+    def _best_metric(self) -> float | None:
+        return self._frontier().get("_best", {}).get("metric")
+
+    def _val_dir(self, tag: str) -> Path:
+        return self.run_dir / "evaluation" / tag
+
+    def _update_frontier(self, val: float, accept: bool | None = None) -> bool:
+        """Same frontier.json format the proposer reads (_best.candidate -> parent harness).
+        `accept` is the gate's verdict (None = first entry / plain val > best). `_anchor` is
+        the most accurate accepted entry: the cheaper path must stay non-inferior to it."""
+        fr = self._frontier()
         best = fr.get("_best", {}).get("metric")
-        improved = best is None or val > best
+        improved = best is None or (val > best if accept is None else accept)
         if improved:
             fr["_best"] = {"candidate": self.tag, "metric": val}
-        fr.setdefault("history", []).append({"candidate": self.tag, "metric": val})
+            anc = fr.get("_anchor")
+            if anc is None or val > anc.get("metric", float("-inf")):
+                fr["_anchor"] = {"candidate": self.tag, "metric": val}
+        fr.setdefault("history", []).append({"candidate": self.tag, "metric": val,
+                                             "accepted": bool(improved)})
         self.frontier_path.write_text(json.dumps(fr, indent=2))
         return improved
 
