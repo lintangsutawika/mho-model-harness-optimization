@@ -134,8 +134,8 @@ class Loop:
                 st = self._migrate_v2(st)
             if st.get("schema") != SCHEMA:
                 raise LoopAbort(
-                    f"{self.state_path} was written by the legacy loop (no schema={SCHEMA}). "
-                    f"Resume it with MHO_LEGACY_LOOP=1, or start a new --run-name / --fresh.")
+                    f"{self.state_path} was written by the old optimize() loop (no schema). "
+                    f"Finish it with an older checkout, or start a new --run-name / --fresh.")
             self.st = st
             print(f"{_now()} RESUME {self.run_dir.name}: stage={st['stage']} "
                   f"tag={self.tag} job={(st.get('job') or {}).get('id')}")

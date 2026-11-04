@@ -287,7 +287,7 @@ def test_legacy_state_is_refused(tmp_path):
     run = tmp_path / "run"
     run.mkdir()
     (run / "state.json").write_text(json.dumps({"iteration": 29, "actions": []}))
-    with pytest.raises(LoopAbort, match="MHO_LEGACY_LOOP"):
+    with pytest.raises(LoopAbort, match="older checkout"):
         make(tmp_path, None)
 
 

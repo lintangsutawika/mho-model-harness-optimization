@@ -8,7 +8,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import mho.loop  # noqa: E402
 import optimize_loop as ol  # noqa: E402
 
 
@@ -28,10 +27,9 @@ def test_mode_sets_the_schedule(tmp_path, monkeypatch, mode, flags, schedule):
         def run(self):
             seen["ran"] = True
 
-    monkeypatch.setattr(mho.loop, "Loop", FakeLoop)
+    monkeypatch.setattr(ol, "Loop", FakeLoop)
     monkeypatch.setattr(ol, "RUNS_DIR", tmp_path / "runs")
     monkeypatch.setattr(ol, "_tee_driver_log", lambda path: None)
-    monkeypatch.delenv("MHO_LEGACY_LOOP", raising=False)
     train = tmp_path / "train"
     (train / "p0").mkdir(parents=True)
     ol.main(["--mode", mode, "--model", "Qwen/Qwen3.5-4B", "--train-data", str(train),
@@ -47,3 +45,11 @@ def test_model_is_required_with_val_data(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         ol.main(["--mode", "model-harness", "--model", "", "--train-data", str(train),
                  "--val-data", str(tmp_path / "val")])
+
+
+def test_val_data_is_required(tmp_path):
+    train = tmp_path / "train"
+    (train / "p0").mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        ol.main(["--mode", "harness-only", "--model", "m", "--train-data", str(train),
+                 "--val-data", ""])
