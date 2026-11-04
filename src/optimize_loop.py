@@ -36,6 +36,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from mho.kinds import realize_model_specs
 from mho.jobs import (AGENT_IMPORT, EVAL_SCRIPT, LOG_VERBOSE, POLL_SECONDS,  # noqa: F401
                       PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_propose,
                       submit_train)
@@ -60,61 +61,6 @@ AGGREGATE_PY = REPO_DIR / "scripts" / "optimize" / "aggregate_results.py"
 
 # --------------------------------------------------------------------------- #
 # Frontier + summary (JSONL) -- the fitting bits from the reference.
-def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
-    """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
-    Idempotent + re-runnable: on resume we call this again for any spec file that has no
-    realized config yet, so a crash between "specs written" and "sigma_rewards written" is
-    recovered instead of re-running the whole propose job.
-    Returns (ok, sigma_rewards_dir | None). Already-realized configs are left untouched."""
-    spec_dir = cand_dir / "model_specs"
-    sr_dir = cand_dir / "model" / "sigma_rewards"
-    if not spec_dir.is_dir():
-        return False, None
-    from mho.data import reward_synthesis
-    from mho.optimizer import model_spec as _ms
-    train_root = Path(train_data)
-    src_task = next((p for p in sorted(train_root.iterdir()) if p.is_dir()), None)
-    sr_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for md in sorted(spec_dir.glob("*.md")):
-        if md.name.startswith("eval_prior") or md.name == "harness.md":
-            continue
-        out = sr_dir / f"{md.stem}.json"
-        if out.exists():           # already realized -> skip, don't clobber
-            continue
-        try:
-            spec, _ = _ms.parse_spec(md)
-            cfg = reward_synthesis.produce_config(src_task, spec) if src_task else \
-                {"sigma": spec.name, "expected_answer": "", "checks": spec.checks}
-            out.write_text(json.dumps(cfg, indent=2) + "\n")
-            n += 1
-        except Exception as e:
-            print(f"  [realize] {md.name} failed: {e}")
-    if n:
-        print(f"  [realize] realized {n} sigma-reward config(s) -> {sr_dir}")
-    # Uniform candidate record: a MODEL proposal gets a CANDIDATE.md too (synthesized from its
-    # model_spec's hypothesis + evidence), so _candidate_hypothesis / evolution_summary record
-    # model candidates exactly like harness candidates. Idempotent: won't overwrite an existing
-    # CANDIDATE.md (e.g. one the proposer already wrote).
-    if not (cand_dir / "CANDIDATE.md").exists():
-        src = None
-        for md in sorted(spec_dir.glob("*.md")):
-            if md.name.startswith("eval_prior") or md.name == "harness.md":
-                continue
-            try:
-                src = _ms.parse_spec(md)[0]
-                break
-            except Exception:
-                continue
-        if src is not None:
-            ev = "\n".join(f"- {e}" for e in (src.evidence or [])[:5])
-            _cand_md = (f"# Model Proposal: {src.name}\n\n"
-                        f"A sigma-reward capability proposal realized for training. "
-                        f"See model_specs/{src.name}.md for the full spec.\n\n"
-                        f"## Hypothesis\n{src.hypothesis}\n\n"
-                        f"## Evidence\n{ev or '- (none)'}\n")
-            (cand_dir / "CANDIDATE.md").write_text(_cand_md)
-    return True, sr_dir
 # --------------------------------------------------------------------------- #
 # Main loop.
 # --------------------------------------------------------------------------- #
@@ -961,7 +907,7 @@ def main(argv: list[str] | None = None) -> None:
     # harness-only never trains, so no checkpoint is ever produced -- the harness must be
     # evaluated against a FIXED model. Without one, eval.sh falls back to a bogus litellm id and
     # every trial silently scores 0 ("eval produced no score"). Fail fast at launch instead.
-    if args.mode == "harness-only" and not args.model:
+    if (args.mode == "harness-only" or args.val_data) and not args.model:
         p.error("harness-only mode needs a fixed model to evaluate the harness against; pass "
                 "--model <HF name/dir or litellm id> (or set MHO_MODEL), e.g. --model Qwen/Qwen3.5-4B")
     if args.val_data:  # dual mode: the proposer's signal samples come from a LOCAL train dir
@@ -976,13 +922,22 @@ def main(argv: list[str] | None = None) -> None:
     run_dir = RUNS_DIR / args.run_name
     _tee_driver_log(run_dir / "logs" / "run.out")
     try:
-        if args.mode == "harness-only" and args.val_data and not os.environ.get("MHO_LEGACY_LOOP"):
-            # Dual-mode harness-only runs on the explicit state machine (src/harness_loop.py).
-            # MHO_LEGACY_LOOP=1 keeps the old optimize() path (e.g. to resume a run whose
-            # state.json the old loop wrote). Model modes always use optimize().
-            from harness_loop import HarnessLoop
-            HarnessLoop(args, run_dir, Scheduler(), submit_eval=submit_eval,
-                        submit_propose=submit_propose, poll_seconds=POLL_SECONDS).run()
+        if args.val_data and not os.environ.get("MHO_LEGACY_LOOP"):
+            # Dual mode (every --mode) runs on the explicit state machine, mho/loop.py; the
+            # mode only sets which candidate kinds it schedules. MHO_LEGACY_LOOP=1 keeps the
+            # old optimize() path (e.g. to resume a run whose state.json the old loop wrote).
+            from mho.kinds import HarnessKind, ModelKind
+            from mho.loop import Loop
+            kinds = {"harness": HarnessKind(),
+                     "model": ModelKind(train_data=args.train_data, trainer=args.trainer,
+                                        submit_train=submit_train)}
+            schedule = {"harness-only": [("harness", 1)],
+                        "model-only": [("model", 1)],
+                        "model-harness": [("harness", max(1, args.harness_proposals)),
+                                          ("model", max(1, args.model_proposals))]}[args.mode]
+            Loop(args, run_dir, Scheduler(), kinds=kinds, schedule=schedule,
+                 submit_eval=submit_eval, submit_propose=submit_propose,
+                 poll_seconds=POLL_SECONDS).run()
         else:
             optimize(args)
     except Exception:

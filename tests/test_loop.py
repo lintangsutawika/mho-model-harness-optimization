@@ -1,4 +1,4 @@
-"""State-machine tests for src/harness_loop.py with a fake scheduler (no PBS, no GPUs).
+"""State-machine tests for src/mho/loop.py with a fake scheduler (no PBS, no GPUs).
 
 Each fake eval writes <out_dir>/<job_name>/t0/result.json plus the score the test's `plan`
 chose; each fake propose writes candidates/<tag>/harness/pyproject.toml + CANDIDATE.md.
@@ -14,7 +14,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from harness_loop import HarnessLoop, LoopAbort  # noqa: E402
+from mho.kinds import HarnessKind, ModelKind  # noqa: E402
+from mho.loop import Loop, LoopAbort  # noqa: E402
 from utils.scores import metric_of  # noqa: E402
 
 
@@ -22,8 +23,10 @@ class Fake:
     """Scheduler + submitters. `evals(stage, harness, call_no)` -> score or None (no trials);
     `proposes(tag)` -> True (write a harness) / False (fail)."""
 
-    def __init__(self, run_dir: Path, evals, proposes=lambda tag: True, pending: int = 0):
+    def __init__(self, run_dir: Path, evals, proposes=lambda tag: True, pending: int = 0,
+                 trains=lambda tag: True):
         self.run_dir, self.evals, self.proposes, self.pending = run_dir, evals, proposes, pending
+        self.trains = trains
         self.calls: list[dict] = []
         self.jobs: dict[str, dict] = {}
 
@@ -42,12 +45,13 @@ class Fake:
 
     # submitters (same signatures as optimize_loop.submit_eval / submit_propose)
     def submit_eval(self, sched, task, *, model, harness, data, n_trials, n_concurrent,
-                    out_dir, logs, job_name):
+                    out_dir, logs, job_name, base_model=None):
         stage = ("eval_a" if job_name == "eval_before" else "eval_b" if job_name == "eval_after"
                  else "val")
         n = sum(c["stage"] == stage for c in self.calls)
         score = self.evals(stage, harness, n)
-        self.calls.append({"stage": stage, "harness": harness, "data": data,
+        self.calls.append({"stage": stage, "harness": harness, "model": model,
+                           "base_model": base_model, "data": data,
                            "out": str(Path(out_dir) / job_name), "score": score, "log": logs})
         if isinstance(score, dict):          # per-task trials: {task: (reward, output_tokens)}
             for i, (task, (r, tok)) in enumerate(score.items()):
@@ -68,11 +72,28 @@ class Fake:
     def submit_propose(self, sched, *, run_root, logs, tag, kind):
         ok = self.proposes(tag)
         self.calls.append({"stage": "propose", "tag": tag, "ok": ok, "log": logs})
-        if ok:
+        self.calls[-1]["kind"] = kind
+        if ok and kind == "model":
+            c = run_root / "candidates" / tag
+            (c / "model_specs").mkdir(parents=True, exist_ok=True)
+            (c / "model_specs" / "spec.md").write_text("spec")
+            (c / "CANDIDATE.md").write_text(f"# Model Proposal\nreward idea for {tag}\n")
+        elif ok:
             h = run_root / "candidates" / tag / "harness"
             h.mkdir(parents=True, exist_ok=True)
             (h / "pyproject.toml").write_text("")
             (h / "CANDIDATE.md").write_text(f"# CANDIDATE.md\nidea for {tag}\n")
+        return self._job()
+
+    def submit_train(self, sched, trainer, *, model, harness, out_dir, logs, tag,
+                     sigma_reward=None, train_data=None):
+        ok = self.trains(tag)
+        self.calls.append({"stage": "train", "tag": tag, "model": model, "harness": harness,
+                           "sigma": sigma_reward, "ok": ok, "log": logs})
+        if ok:
+            ck = Path(out_dir) / "checkpoints" / "hf" / "step_7"
+            ck.mkdir(parents=True, exist_ok=True)
+            (ck / "config.json").write_text("{}")
         return self._job()
 
 
@@ -80,8 +101,17 @@ def fake_score(d: Path) -> dict:
     return {"mean_reward": json.loads((Path(d) / "fake_score.json").read_text())}
 
 
+def fake_realize(cand_dir, train_data):
+    sr = Path(cand_dir) / "model" / "sigma_rewards"
+    if not (Path(cand_dir) / "model_specs").is_dir():
+        return False, None
+    sr.mkdir(parents=True, exist_ok=True)
+    (sr / "spec.json").write_text("{}")
+    return True, sr
+
+
 def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pending=0,
-         fresh=False, fake=None):
+         fresh=False, fake=None, schedule=(("harness", 1),), trains=lambda t: True):
     train = tmp_path / "train"
     for i in range(20):
         (train / f"p{i}").mkdir(parents=True, exist_ok=True)
@@ -89,10 +119,13 @@ def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pen
                            val_data="VAL", propose_sample=4, iterations=iterations,
                            ts_repropose_limit=limit, fresh=fresh, skip_baseline=False)
     run_dir = tmp_path / "run"
-    fake = fake or Fake(run_dir, evals, proposes, pending)
-    loop = HarnessLoop(args, run_dir, fake, submit_eval=fake.submit_eval,
-                       submit_propose=fake.submit_propose, score_fn=fake_score,
-                       sleep=lambda s: None, poll_seconds=0)
+    fake = fake or Fake(run_dir, evals, proposes, pending, trains)
+    kinds = {"harness": HarnessKind(),
+             "model": ModelKind(train_data=str(train), trainer="miles",
+                                submit_train=fake.submit_train, realize=fake_realize)}
+    loop = Loop(args, run_dir, fake, kinds=kinds, schedule=list(schedule),
+                submit_eval=fake.submit_eval, submit_propose=fake.submit_propose,
+                score_fn=fake_score, sleep=lambda s: None, poll_seconds=0)
     return loop, fake
 
 
@@ -120,6 +153,9 @@ def test_accept_then_next_A_uses_accepted_parent(tmp_path):
     fr = json.loads(loop.frontier_path.read_text())
     assert fr["_best"] == {"candidate": "candidate_1_0_1", "metric": 0.6}
     assert (loop.run_dir / "best" / "harness" / "pyproject.toml").exists()
+    best = json.loads((loop.run_dir / "best" / "pair.json").read_text())
+    assert best["candidate"] == "candidate_1_0_1" and best["model"] == "m"
+    assert best["harness"].endswith("candidate_1_0_1/harness")
     # iteration 2: A is the ACCEPTED harness, and the candidate tag bumped version, reset try
     a_calls = [c for c in fake.calls if c["stage"] == "eval_a"]
     assert a_calls[0]["harness"] is None
@@ -324,3 +360,81 @@ def test_cheaper_but_worse_is_rejected_on_val(tmp_path):
     row = summary(loop)[-1]
     assert row["outcome"] == "val_fail" and row["val_gate"]["accept"] is False
     assert json.loads(loop.frontier_path.read_text())["_best"]["candidate"] == "baseline"
+
+
+# --------------------------------------------------------------------------- model candidates
+def test_model_candidate_trains_then_evaluates_its_checkpoint(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6], a=[0.3, 0.3], b=[0.5, 0.1]),
+                      iterations=2, schedule=[("model", 1)])
+    loop.run()
+    stages = [c["stage"] for c in fake.calls]
+    assert stages[:6] == ["val", "eval_a", "propose", "train", "eval_b", "val"]
+    train = next(c for c in fake.calls if c["stage"] == "train")
+    assert train["model"] == "m" and train["harness"] is None       # from the current pair
+    assert train["sigma"].endswith("candidate_1_0_1/model/sigma_rewards/spec.json")
+    ckpt = str(loop.cands / "candidate_1_0_1" / "train" / "checkpoints" / "hf" / "step_7")
+    b, v = fake.calls[4], fake.calls[5]
+    assert b["model"] == v["model"] == ckpt and b["base_model"] == "m"
+    assert fake.calls[1]["base_model"] is None                      # base model: no override
+    row = summary(loop)[1]
+    assert row["kind"] == "model" and row["outcome"] == "accepted" and row["pair"]["model"] == ckpt
+    # accepted -> the checkpoint is the current model: next A and the next training use it
+    assert fake.calls[6]["stage"] == "eval_a" and fake.calls[6]["model"] == ckpt
+    assert [c["model"] for c in fake.calls if c["stage"] == "train"][1] == ckpt
+    assert json.loads((loop.run_dir / "best" / "pair.json").read_text())["model"] == ckpt
+    assert (loop.run_dir / "logs" / "candidate_1_0_1-train.out").name in [
+        Path(c["log"]).name for c in fake.calls]
+
+
+def test_rejected_model_is_never_trained_on(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.4], a=[0.3, 0.3], b=[0.5, 0.1]),
+                      iterations=2, schedule=[("model", 1)])
+    loop.run()
+    assert [r["outcome"] for r in summary(loop)] == ["baseline", "val_fail", "train_fail"]
+    assert [c["model"] for c in fake.calls if c["stage"] == "eval_a"] == ["m", "m"]
+    assert [c["model"] for c in fake.calls if c["stage"] == "train"] == ["m", "m"]
+    assert loop.st["pair"] == {"harness": None, "model": None}
+
+
+def test_failed_training_is_build_fail_then_next_try(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[0.1]), iterations=2,
+                      schedule=[("model", 1)], trains=lambda tag: tag != "candidate_1_0_1")
+    loop.run()
+    rows = summary(loop)
+    assert [(r["candidate"], r["outcome"]) for r in rows[1:]] == [
+        ("candidate_1_0_1", "build_fail"), ("candidate_1_0_2", "train_fail")]
+    assert len([c for c in fake.calls if c["stage"] == "train"]) == 2   # no retry by default
+    assert "no HF checkpoint" in rows[1]["reason"]
+
+
+def test_model_harness_schedule_alternates_and_keeps_the_harness(tmp_path):
+    """2 harness then 1 model, repeating. An accepted harness stays in the pair through the
+    model candidate, and the accepted model candidate gets a copy of it for the proposer."""
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6, 0.7], a=[0.3] * 3, b=[0.5, 0.1, 0.5, 0.1]),
+                      iterations=4, limit=5, schedule=[("harness", 2), ("model", 1)])
+    loop.run()
+    rows = summary(loop)[1:]
+    assert [(r["candidate"], r["kind"], r["outcome"]) for r in rows] == [
+        ("candidate_1_0_1", "harness", "accepted"), ("candidate_2_1_1", "harness", "train_fail"),
+        ("candidate_2_1_2", "model", "accepted"), ("candidate_3_2_1", "harness", "train_fail")]
+    h1 = str(loop.cands / "candidate_1_0_1" / "harness")
+    train = next(c for c in fake.calls if c["stage"] == "train")
+    assert train["harness"] == h1                                      # model trains with it
+    assert loop.st["pair"]["harness"] == h1 and loop.st["pair"]["model"].endswith("step_7")
+    assert (loop.cands / "candidate_2_1_2" / "harness" / "pyproject.toml").exists()
+    assert [c["kind"] for c in fake.calls if c["stage"] == "propose"] == [
+        "harness", "harness", "model", "harness"]
+
+
+def test_schema2_harness_state_is_migrated_on_resume(tmp_path):
+    run = tmp_path / "run"
+    (run / "candidates" / "candidate_1_0_1" / "harness").mkdir(parents=True)
+    parent = str(run / "candidates" / "candidate_1_0_1" / "harness")
+    (run / "state.json").write_text(json.dumps({
+        "schema": 2, "run_id": "run", "mode": "harness-only", "stage": "eval_a", "iteration": 2,
+        "version": 1, "try": 1, "propose_count": 1, "parent": parent, "subset": None,
+        "ts_B": None, "job": None, "attempt": 1, "infra_fails": 0, "propose_fails": 0}))
+    loop, fake = make(tmp_path, scripted(val=[0.7], a=[0.3], b=[0.5]), iterations=2)
+    assert loop.st["schema"] == 3 and loop.st["pair"] == {"harness": parent, "model": None}
+    loop.run()
+    assert fake.calls[0]["stage"] == "eval_a" and fake.calls[0]["harness"] == parent

@@ -154,7 +154,7 @@ class Scheduler:
 
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
-                job_name: str) -> str:
+                job_name: str, base_model: str | None = None) -> str:
     # The loop hands eval.sh the (model, harness, data) explicitly via MHO_* -- exactly the
     # manual form `MHO_MODEL=<model> MHO_DATA=<data> MHO_HARNESS=<harness> bash .../eval.sh`.
     # Trials land at MHO_OUT/<job_name>/ (eval.sh: EVAL_JOBS_DIR= MHO_OUT, EVAL_JOB_NAME= job_name).
@@ -171,6 +171,10 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
         extra["MHO_MODEL"] = model
     if harness:
         extra["MHO_HARNESS"] = harness
+    if base_model:
+        # `model` is a trained checkpoint dir: serve/sample it with its base model's configs
+        # (configs/serve/<base>.json, configs/sampling/<base>.yaml).
+        extra["MHO_BASE_MODEL"] = base_model
     if logs.suffix == ".out":       # <activity>.out -> <activity>-vllm.out
         extra["MHO_VLLM_LOG"] = str(logs.with_name(logs.stem + "-vllm.out"))
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B

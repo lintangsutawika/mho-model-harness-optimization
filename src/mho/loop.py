@@ -1,41 +1,52 @@
-"""Harness-only optimization loop (dual mode: --train-data + --val-data) as an explicit state machine.
+"""The optimization loop (dual mode: --train-data + --val-data) as an explicit state machine.
+
+Every eval is of a (harness, model) PAIR; the state holds the current best pair. Each candidate
+changes one side of it, as decided by its kind (mho/kinds/): a harness candidate edits the
+harness, a model candidate trains a new checkpoint. The schedule picks the kind of each new
+candidate (harness-only, model-only, or N harness then M model, repeating).
 
 One candidate cycle, over a train subset S that is fixed until a new iteration starts:
 
-    eval_a  : evaluate the PARENT harness (frontier best) on S          -> ts_A
-    propose : the proposer writes candidates/<tag>/harness from the parent
-    eval_b  : evaluate the candidate on the SAME S                       -> ts_B
+    eval_a  : evaluate the CURRENT pair on S                             -> ts_A
+    propose : the proposer writes candidates/<tag>/ (harness/ or model_specs/)
+    build   : the kind's job, if any (model: train the current model)   [kind.build_stage]
+    eval_b  : evaluate the candidate pair on the SAME S                  -> ts_B
               train gate: utils.gate, B vs A paired per task (--gate-train-z)
-    eval_val: evaluate the candidate on the val split                    -> val
-              val gate: utils.gate, candidate vs the frontier best's val trials, paired per
-              task (--gate-val-z); or the "cheaper" path: not worse by more than
+    eval_val: evaluate the candidate pair on the val split               -> val
+              val gate: utils.gate, vs the current best's val trials, paired per task
+              (--gate-val-z); or the "cheaper" path: not worse by more than
               --gate-cheaper-delta (vs the best AND the most accurate accepted, `_anchor`)
               and clearly cheaper (agent output tokens). Without per-task data both gates
               fall back to the plain strict B > A.
+    accept  : the candidate pair becomes the current pair (a rejected one changes nothing,
+              so a rejected model is never trained on).
 
 Transitions:
-    baseline --ok--> eval_a                          (iteration 0 = base harness on val)
+    baseline --ok--> eval_a                          (iteration 0 = base pair on val)
     eval_a   --ok--> propose
-    propose  --ok--> eval_b      --fail--> next_try   (outcome no_proposal)
-    eval_b   --pass-> eval_val   --fail--> next_try   (outcome train_fail | no_score)
-    eval_val -------> new iteration                   (outcome accepted | val_fail | no_score)
+    propose  --ok--> build | eval_b  --fail--> next_try   (outcome no_proposal)
+    build    --ok--> eval_b          --fail--> next_try   (outcome build_fail)
+    eval_b   --pass-> eval_val       --fail--> next_try   (outcome train_fail | no_score)
+    eval_val -------> new iteration                       (outcome accepted | val_fail | no_score)
     next_try: try += 1; re-propose on the same S, or after --ts-repropose-limit tries on S
               start a new iteration (fresh S, fresh A).
 
 Every finished candidate gets exactly ONE terminal record, written by `_finish`: its
 candidates/<tag>/status.json and one candidates/summary.json row, with the same fields.
-Outcomes: baseline | no_proposal | no_score | train_fail | val_fail | accepted.
+Outcomes: baseline | no_proposal | build_fail | no_score | train_fail | val_fail | accepted.
 Non-terminal events go to <run>/logs/events.jsonl (not visible to the proposer).
 Logs: <run>/logs/run.out (driver), <run>/logs/<activity>.out per job (+ <activity>-vllm.out
-for evals), e.g. baseline.out, candidate_1_0_1-eval_before.out, candidate_1_0_1-propose.out.
+for evals), e.g. baseline.out, candidate_1_0_1-eval_before.out, candidate_1_0_1-propose.out,
+candidate_1_0_1-train.out.
 
-Infra failures (a job that produced no score / no harness) are retried up to
-MAX_ATTEMPTS. After that the stage is treated as failed, and the loop ABORTS on a failed
-baseline or after MAX_INFRA_FAILS consecutive failed stages, so a broken node/vLLM/API never
-silently burns the iteration budget.
+Infra failures (a job that produced no score / no harness) are retried up to MAX_ATTEMPTS
+(builds: MAX_BUILD_ATTEMPTS). After that the stage is treated as failed, and the loop ABORTS on a
+failed baseline or after MAX_INFRA_FAILS consecutive failed stages, so a broken node/vLLM/API
+never silently burns the iteration budget.
 
-The state is a JSON dict persisted after every transition (schema 2), so the driver can be
-killed and resumed: an in-flight job is re-attached, never resubmitted.
+The state is a JSON dict persisted after every transition (schema 3; schema-2 harness runs are
+migrated on resume), so the driver can be killed and resumed: an in-flight job is re-attached,
+never resubmitted.
 """
 from __future__ import annotations
 
@@ -47,17 +58,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from mho.kinds import Kind, Pair
 from utils.gate import GateConfig, decide_dirs
 from utils.scores import metric_of, score_trials
 from utils.state import _candidate_hypothesis, _sample_subset
 
-SCHEMA = 2
-MAX_ATTEMPTS = int(os.environ.get("MHO_MAX_ATTEMPTS", "3"))          # submits per stage
+SCHEMA = 3
+MAX_ATTEMPTS = int(os.environ.get("MHO_MAX_ATTEMPTS", "3"))             # submits per eval stage
+MAX_BUILD_ATTEMPTS = int(os.environ.get("MHO_MAX_BUILD_ATTEMPTS", "1"))  # e.g. a training run
 MAX_INFRA_FAILS = int(os.environ.get("MHO_MAX_EVAL_INFRA_FAILS", "3"))  # consecutive, then abort
 
 # Generic proposal-title headers to skip when logging what a candidate changed.
 _GENERIC_TITLES = {"candidate.md", "candidate", "hypothesis", "candidate proposal",
                    "proposal", "candidate overview"}
+_EVAL_STAGES = ("baseline", "eval_a", "eval_b", "eval_val")
 
 
 class LoopAbort(RuntimeError):
@@ -80,16 +94,26 @@ def _title(hyp: str | None) -> str:
     return ""
 
 
-class HarnessLoop:
-    """Drives the harness-only dual-mode loop. All side effects go through injectable
-    callables (submit_eval / submit_propose / scheduler / score_fn / sleep) so the whole
-    state machine is unit-testable with a fake scheduler."""
+class Loop:
+    """Drives the dual-mode loop. All side effects go through injectable callables
+    (submit_eval / submit_propose / the kinds' builds / scheduler / score_fn / sleep), so the
+    whole state machine is unit-testable with a fake scheduler.
 
-    def __init__(self, args: Any, run_dir: Path, sched: Any, *,
+    kinds:    {"harness": HarnessKind(), "model": ModelKind(...)} (only the ones scheduled)
+    schedule: [(kind, n), ...] cycled: n candidates of each kind in turn, e.g.
+              [("harness", 1)] (harness-only) or [("harness", 10), ("model", 2)].
+    """
+
+    def __init__(self, args: Any, run_dir: Path, sched: Any, *, kinds: dict[str, Kind],
+                 schedule: list[tuple[str, int]],
                  submit_eval: Callable[..., str], submit_propose: Callable[..., str | None],
                  score_fn: Callable[[Path], dict] = score_trials,
                  sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 60):
+        unknown = {k for k, _ in schedule} - set(kinds)
+        if not schedule or unknown or any(n < 1 for _, n in schedule):
+            raise ValueError(f"bad schedule {schedule!r} for kinds {sorted(kinds)}")
         self.args, self.run_dir, self.sched = args, run_dir, sched
+        self.kinds, self.schedule = kinds, schedule
         self._submit_eval, self._submit_propose = submit_eval, submit_propose
         self.score_fn, self.sleep, self.poll_seconds = score_fn, sleep, poll_seconds
         self.gate_cfg = GateConfig.from_args(args)
@@ -106,6 +130,8 @@ class HarnessLoop:
     def _load_or_init(self) -> dict:
         if not self.args.fresh and self.state_path.exists():
             st = json.loads(self.state_path.read_text())
+            if st.get("schema") == 2:
+                st = self._migrate_v2(st)
             if st.get("schema") != SCHEMA:
                 raise LoopAbort(
                     f"{self.state_path} was written by the legacy loop (no schema={SCHEMA}). "
@@ -120,22 +146,39 @@ class HarnessLoop:
         shutil.rmtree(self.run_dir / "best", ignore_errors=True)
         skip = bool(getattr(self.args, "skip_baseline", False))
         st = {
-            "schema": SCHEMA, "run_id": self.run_dir.name, "mode": "harness-only",
+            "schema": SCHEMA, "run_id": self.run_dir.name, "mode": getattr(self.args, "mode", ""),
             "stage": "eval_a" if skip else "baseline",
             "iteration": 1 if skip else 0,
             "version": 0,              # accepted candidates so far
             "try": 1,                  # attempts at the current version (resets on accept)
-            "propose_count": 0,        # --iterations budget = proposals that produced a harness
-            "parent": None,            # parent harness dir (frontier best); None = base scaffold
+            "propose_count": 0,        # --iterations budget = proposals that produced a candidate
+            "pair": Pair().as_dict(),  # current best (harness, model); None = base / --model
+            "kind": None,              # kind of the candidate in flight (set at propose)
+            "schedule": {"i": 0, "done": 0},   # position in self.schedule
             "subset": None,            # {dir, seed, a_tag, ts_A, tries} for the current iteration
             "ts_B": None,              # current candidate's train-sample score
+            "train_gate": None,        # current candidate's train-gate stats
             "job": None,               # in-flight {id, stage, attempt}
             "attempt": 1,              # submit attempt for the current stage
             "infra_fails": 0,          # consecutive stages that failed after all attempts
             "propose_fails": 0,        # consecutive no_proposal outcomes
         }
         self._save(st)
-        print(f"{_now()} MHO harness-only  run={self.run_dir.name}  budget={self.args.iterations}")
+        print(f"{_now()} MHO {st['mode'] or 'loop'}  run={self.run_dir.name}  "
+              f"budget={self.args.iterations}  schedule={self.schedule}")
+        return st
+
+    @staticmethod
+    def _migrate_v2(st: dict) -> dict:
+        """A schema-2 run (the harness-only HarnessLoop) is a schema-3 run whose pair has the
+        base model and whose every candidate was a harness candidate."""
+        st = dict(st)
+        st["pair"] = {"harness": st.pop("parent", None), "model": None}
+        st["kind"] = "harness" if st.get("stage") in ("propose", "eval_b", "eval_val") else None
+        st.setdefault("schedule", {"i": 0, "done": 0})
+        st.setdefault("train_gate", None)
+        st["schema"] = SCHEMA
+        print("  migrated state.json schema 2 -> 3 (pair.harness = previous parent)")
         return st
 
     def _save(self, st: dict | None = None) -> None:
@@ -152,6 +195,28 @@ class HarnessLoop:
     def tag_dir(self, tag: str | None = None) -> Path:
         return self.cands / (tag or self.tag)
 
+    @property
+    def pair(self) -> Pair:
+        return Pair.from_dict(self.st["pair"])
+
+    @property
+    def kind(self) -> Kind:
+        return self.kinds[self.st["kind"]]
+
+    def _scheduled_kind(self) -> str:
+        return self.schedule[self.st["schedule"]["i"] % len(self.schedule)][0]
+
+    def _schedule_step(self) -> None:
+        """A candidate of the scheduled kind finished: count it, switch kind after n of them."""
+        sch = self.st["schedule"]
+        sch["done"] += 1
+        name, n = self.schedule[sch["i"] % len(self.schedule)]
+        if sch["done"] >= n:
+            sch["i"], sch["done"] = (sch["i"] + 1) % len(self.schedule), 0
+            nxt = self._scheduled_kind()
+            if nxt != name:
+                print(f"  [schedule] {n} {name} candidate(s) done -> {nxt} candidates")
+
     # ------------------------------------------------------------- records
     def _event(self, **row: Any) -> None:
         row = {"time": datetime.now().isoformat(timespec="seconds"), **row}
@@ -162,8 +227,9 @@ class HarnessLoop:
         """The ONE terminal record per candidate: status.json + one summary.json row."""
         st, tag = self.st, self.tag
         sub = st["subset"] or {}
+        kind = "baseline" if outcome == "baseline" else st.get("kind")
         rec = {
-            "iteration": st["iteration"], "candidate": tag, "outcome": outcome,
+            "iteration": st["iteration"], "candidate": tag, "kind": kind, "outcome": outcome,
             "accepted": outcome in ("accepted", "baseline"),
             "ts_A": sub.get("ts_A"), "ts_B": st.get("ts_B"), "subset_seed": sub.get("seed"),
             "train_gate": st.get("train_gate"),
@@ -177,24 +243,27 @@ class HarnessLoop:
         print(f"  => {tag}: {outcome.upper()}"
               + "".join(f" {k}={v}" for k, v in fields.items()
                         if k != "reason" and not isinstance(v, dict)))
+        if outcome not in ("baseline", "no_proposal"):
+            self._schedule_step()
 
     # ------------------------------------------------------------- transitions
     def _goto(self, stage: str) -> None:
         self.st.update(stage=stage, job=None, attempt=1)
 
+    def _reset_candidate(self) -> None:
+        self.st.update(ts_B=None, train_gate=None, kind=None)
+
     def _new_iteration(self) -> None:
         self.st["iteration"] += 1
         self.st["subset"] = None
-        self.st["ts_B"] = None
-        self.st["train_gate"] = None
+        self._reset_candidate()
         self._goto("eval_a")
 
     def _next_try(self) -> None:
         """Same version, next attempt: re-propose on the same subset, or give up on it."""
         st = self.st
         st["try"] += 1
-        st["ts_B"] = None
-        st["train_gate"] = None
+        self._reset_candidate()
         st["subset"]["tries"] += 1
         if st["subset"]["tries"] >= self.args.ts_repropose_limit:
             print(f"  {st['subset']['tries']} tries on this subset; fresh subset next iteration")
@@ -210,16 +279,18 @@ class HarnessLoop:
             why = "baseline" if st["stage"] == "baseline" else f"{st['infra_fails']} consecutive stages"
             st.update(job=None, attempt=1, infra_fails=0)   # a restart retries this stage
             self._save()
-            raise LoopAbort(f"ABORT: {why} failed after {MAX_ATTEMPTS} attempts each "
-                            f"(last: {what}). Likely infra (no GPU / vLLM / proposer API); "
-                            f"check {self.log_path()}. Restart the driver to retry.")
+            raise LoopAbort(f"ABORT: {why} failed after all attempts "
+                            f"(last: {what}). Likely infra (no GPU / vLLM / proposer API / "
+                            f"trainer); check {self.log_path()}. Restart the driver to retry.")
 
     # ------------------------------------------------------------- submit
-    def _eval(self, *, harness: str | None, data: str, out_dir: Path, job_name: str) -> str:
-        return self._submit_eval(self.sched, "", model=self.args.model, harness=harness,
-                                 data=data, n_trials=self.args.trials,
+    def _eval(self, pair: Pair, *, data: str, out_dir: Path, job_name: str) -> str:
+        # A trained checkpoint is served/sampled with its base model's configs (MHO_BASE_MODEL).
+        return self._submit_eval(self.sched, "", model=pair.model or self.args.model,
+                                 harness=pair.harness, data=data, n_trials=self.args.trials,
                                  n_concurrent=self.args.concurrent, out_dir=out_dir,
-                                 logs=self.log_path(), job_name=job_name)
+                                 logs=self.log_path(), job_name=job_name,
+                                 base_model=self.args.model if pair.model else None)
 
     _ACTIVITY = {"baseline": "", "eval_a": "eval_before", "propose": "propose",
                  "eval_b": "eval_after", "eval_val": "val"}
@@ -228,7 +299,7 @@ class HarnessLoop:
         """<run>/logs/<activity>.out for the current stage; retries get a -attemptN suffix."""
         st = self.st
         tag = st["subset"]["a_tag"] if st["stage"] == "eval_a" and st["subset"] else self.tag
-        act = self._ACTIVITY[st["stage"]]
+        act = self._ACTIVITY.get(st["stage"], st["stage"])     # build stages: their own name
         name = f"{tag}-{act}" if act else tag
         if st.get("attempt", 1) > 1:
             name += f"-attempt{st['attempt']}"
@@ -243,11 +314,16 @@ class HarnessLoop:
             return self.tag_dir(st["subset"]["a_tag"]) / "eval_before"
         return self.tag_dir() / "eval_after"            # eval_b
 
+    def _cand_pair(self) -> Pair:
+        return self.kind.candidate_pair(self.tag_dir(), self.pair)
+
     def _submit(self) -> str | None:
         st, stage, tag = self.st, self.st["stage"], self.tag
-        if stage in ("baseline", "eval_val"):
-            harness = None if stage == "baseline" else str(self.tag_dir() / "harness")
-            return self._eval(harness=harness, data=self.args.val_data,
+        if stage == "baseline":
+            return self._eval(self.pair, data=self.args.val_data,
+                              out_dir=self.run_dir / "evaluation", job_name=tag)
+        if stage == "eval_val":
+            return self._eval(self._cand_pair(), data=self.args.val_data,
                               out_dir=self.run_dir / "evaluation", job_name=tag)
         if stage == "eval_a":
             if st["subset"] is None:
@@ -257,9 +333,10 @@ class HarnessLoop:
                 st["subset"] = {"dir": str(sdir), "seed": seed, "a_tag": tag,
                                 "ts_A": None, "tries": 0}
                 self._save()
-            return self._eval(harness=st["parent"], data=st["subset"]["dir"],
+            return self._eval(self.pair, data=st["subset"]["dir"],
                               out_dir=self.tag_dir(st["subset"]["a_tag"]), job_name="eval_before")
         if stage == "propose":
+            st["kind"] = st.get("kind") or self._scheduled_kind()
             # Each try is its own candidate dir; give it the subset's A traces so every
             # candidate is self-contained for the proposer (eval_before + eval_after).
             a_tag = st["subset"]["a_tag"]
@@ -268,39 +345,47 @@ class HarnessLoop:
                 link.parent.mkdir(parents=True, exist_ok=True)
                 link.symlink_to(Path("..") / a_tag / "eval_before")
             st["propose_count"] += 1
-            print(f"  [propose {st['propose_count']}/{self.args.iterations}] {tag}", flush=True)
+            print(f"  [propose {st['propose_count']}/{self.args.iterations}] {tag} "
+                  f"({st['kind']})", flush=True)
             jid = self._submit_propose(self.sched, run_root=self.run_dir,
-                                       logs=self.log_path(), tag=tag, kind="harness")
+                                       logs=self.log_path(), tag=tag, kind=st["kind"])
             if jid is None:
                 raise LoopAbort("propose job not configured (MHO_PROPOSE_JOB unset)")
             return jid
         if stage == "eval_b":
-            return self._eval(harness=str(self.tag_dir() / "harness"), data=st["subset"]["dir"],
+            return self._eval(self._cand_pair(), data=st["subset"]["dir"],
                               out_dir=self.tag_dir(), job_name="eval_after")
+        if st.get("kind") and stage == self.kind.build_stage:
+            return self.kind.submit_build(self, self.tag_dir(), self.pair)
         raise AssertionError(f"no submit for stage {stage!r}")
 
     # ------------------------------------------------------------- results
-    def _job_ok(self, stage: str, rc: int) -> bool:
+    def _job_ok(self, stage: str, rc: int) -> tuple[bool, str]:
         if rc != 0:
-            return False
+            return False, f"rc={rc}"
         if stage == "propose":
-            return (self.tag_dir() / "harness" / "pyproject.toml").exists()
-        return _has_trials(self._out_dir(stage))
+            return self.kind.proposal_ok(self.tag_dir())
+        if stage in _EVAL_STAGES:
+            return (True, "") if _has_trials(self._out_dir(stage)) else (False, "no trials")
+        return self.kind.build_ok(self.tag_dir())
 
     def _on_done(self, stage: str, rc: int) -> None:
         st = self.st
-        ok = self._job_ok(stage, rc)
-        self._event(stage=stage, tag=self.tag, rc=rc, ok=ok, attempt=st["attempt"])
-        # Evals are retried (same inputs, transient infra). A failed propose is NOT: each
-        # propose burns budget, so it is recorded as no_proposal and the next try proposes
-        # afresh; repeated failures trip the propose_fails abort instead.
-        if not ok and stage != "propose" and st["attempt"] < MAX_ATTEMPTS:
+        ok, why = self._job_ok(stage, rc)
+        self._why = why
+        self._event(stage=stage, tag=self.tag, rc=rc, ok=ok, attempt=st["attempt"],
+                    **({"why": why} if why else {}))
+        # Evals (and builds, up to MAX_BUILD_ATTEMPTS) are retried: same inputs, transient
+        # infra. A failed propose is NOT: each propose burns budget, so it is recorded as
+        # no_proposal and the next try proposes afresh; repeated failures abort instead.
+        limit = MAX_ATTEMPTS if stage in _EVAL_STAGES else \
+            0 if stage == "propose" else MAX_BUILD_ATTEMPTS
+        if not ok and st["attempt"] < limit:
             st["attempt"] += 1
             st["job"] = None
-            why = f"rc={rc}" if rc else "no trials"
-            print(f"  {stage} {self.tag} failed ({why}); attempt {st['attempt']}/{MAX_ATTEMPTS}")
+            print(f"  {stage} {self.tag} failed ({why}); attempt {st['attempt']}/{limit}")
             return
-        getattr(self, f"_done_{stage}")(ok, rc)
+        getattr(self, f"_done_{stage}", self._done_build)(ok, rc)
 
     def _score(self, stage: str) -> float:
         self.st["infra_fails"] = 0
@@ -311,6 +396,7 @@ class HarnessLoop:
             self._infra_fail(f"baseline eval rc={rc}")
         val = self._score("baseline")
         self._update_frontier(val)
+        self._write_best_pair()
         self._finish("baseline", val=val)
         self._new_iteration()
 
@@ -323,7 +409,7 @@ class HarnessLoop:
             self._goto("eval_a")
             return
         st["subset"]["ts_A"] = self._score("eval_a")
-        print(f"  A (parent) on subset = {st['subset']['ts_A']:.4f}")
+        print(f"  A (current pair) on subset = {st['subset']['ts_A']:.4f}")
         self._goto("propose")
 
     def _done_propose(self, ok: bool, rc: int) -> None:
@@ -334,19 +420,32 @@ class HarnessLoop:
             st["propose_fails"] += 1
             st["propose_count"] -= 1
             st["subset"]["tries"] -= 1
-            self._finish("no_proposal", reason=f"rc={rc} or no harness/pyproject.toml")
+            self._finish("no_proposal", reason=self._why)
             if st["propose_fails"] >= MAX_INFRA_FAILS:
                 st["propose_fails"] = 0
                 self._next_try()
                 self._save()
                 raise LoopAbort(f"ABORT: {MAX_INFRA_FAILS} consecutive proposals produced no "
-                                f"harness; check {self.run_dir}/logs/*-propose.out.")
+                                f"candidate; check {self.run_dir}/logs/*-propose.out.")
             self._next_try()
             return
         st["propose_fails"] = 0
         title = _title(_candidate_hypothesis(self.tag_dir()))
         if title:
-            print(f"  [+] {self.tag}: {title}")
+            print(f"  [+] {self.tag} ({st['kind']}): {title}")
+        self._goto(self.kind.build_stage or "eval_b")
+
+    def _done_build(self, ok: bool, rc: int) -> None:
+        """The kind's build job (e.g. model training) finished."""
+        why = self._why
+        if not ok:
+            stage = self.st["stage"]
+            self._infra_fail(f"{stage} {self.tag}: {why}")
+            self._finish("build_fail", reason=f"{stage}: {why}")
+            self._next_try()
+            return
+        self.st["infra_fails"] = 0
+        print(f"  built {self.tag}: {self._cand_pair().model or self._cand_pair().harness}")
         self._goto("eval_b")
 
     def _done_eval_b(self, ok: bool, rc: int) -> None:
@@ -391,17 +490,18 @@ class HarnessLoop:
         self._event(stage="val_gate", tag=self.tag, ref=ref, anchor_tag=anc, **dec.fields())
         print(f"  val gate {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
               f"(val {val:.4f} vs {ref} {best}): {dec.reason}")
+        cand = self._cand_pair()
         if self._update_frontier(val, accept=dec.accept):
-            harness = self.tag_dir() / "harness"
-            shutil.rmtree(self.run_dir / "best", ignore_errors=True)
-            shutil.copytree(harness, self.run_dir / "best" / "harness")
+            self.kind.on_accept(self.tag_dir(), self.run_dir, cand)
+            st["pair"] = cand.as_dict()
+            self._write_best_pair()
             self._finish("accepted", val=val, prev_best=best, path=dec.path,
-                         val_gate=dec.fields())
-            st["parent"] = str(harness)
+                         val_gate=dec.fields(), pair=cand.as_dict())
             st["version"] += 1
             st["try"] = 1
         else:
-            self._finish("val_fail", val=val, best=best, val_gate=dec.fields())
+            self._finish("val_fail", val=val, best=best, val_gate=dec.fields(),
+                         pair=cand.as_dict())
             st["try"] += 1
         self._new_iteration()
 
@@ -414,6 +514,15 @@ class HarnessLoop:
 
     def _val_dir(self, tag: str) -> Path:
         return self.run_dir / "evaluation" / tag
+
+    def _write_best_pair(self) -> None:
+        """<run>/best/pair.json: the current best (harness, model) -- what to deploy."""
+        p = self.pair
+        d = self.run_dir / "best"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "pair.json").write_text(json.dumps({
+            "candidate": self._frontier().get("_best", {}).get("candidate"),
+            "harness": p.harness, "model": p.model or self.args.model}, indent=2))
 
     def _update_frontier(self, val: float, accept: bool | None = None) -> bool:
         """Same frontier.json format the proposer reads (_best.candidate -> parent harness).
@@ -428,6 +537,7 @@ class HarnessLoop:
             if anc is None or val > anc.get("metric", float("-inf")):
                 fr["_anchor"] = {"candidate": self.tag, "metric": val}
         fr.setdefault("history", []).append({"candidate": self.tag, "metric": val,
+                                             "kind": self.st.get("kind") or "baseline",
                                              "accepted": bool(improved)})
         self.frontier_path.write_text(json.dumps(fr, indent=2))
         return improved
@@ -455,7 +565,7 @@ class HarnessLoop:
         if st["stage"] in ("eval_a", "propose") and not self._budget_left():
             return False
         print(f"{_now()} iter {st['iteration']} {st['stage']} {self.tag} -> submit"
-              + (f" (attempt {st['attempt']}/{MAX_ATTEMPTS})" if st["attempt"] > 1 else ""))
+              + (f" (attempt {st['attempt']})" if st["attempt"] > 1 else ""))
         jid = self._submit()
         st["job"] = {"id": jid, "stage": st["stage"], "attempt": st["attempt"]}
         self._save()
@@ -464,7 +574,9 @@ class HarnessLoop:
     def run(self) -> None:
         while self.step():
             pass
-        fr = json.loads(self.frontier_path.read_text()) if self.frontier_path.exists() else {}
-        best = fr.get("_best", {})
+        best = self._frontier().get("_best", {})
+        p = self.pair
         print(f"\n{_now()} Optimize complete. proposals={self.st['propose_count']} "
-              f"best={best.get('candidate')} @ {best.get('metric')}  run_dir={self.run_dir}")
+              f"best={best.get('candidate')} @ {best.get('metric')}  "
+              f"harness={p.harness or 'base'} model={p.model or self.args.model}  "
+              f"run_dir={self.run_dir}")

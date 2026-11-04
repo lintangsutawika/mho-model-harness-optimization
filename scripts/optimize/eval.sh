@@ -113,7 +113,8 @@ fi
 # config exits here, before vLLM starts: the `--ak temperature=` this replaces was ignored
 # by harbor's MiniSweAgent, and every trial ran at mini.yaml's defaults without saying so.
 if [ -n "${MHO_MODEL:-}" ]; then
-  _AGENT_CONFIG_MODEL="${MHO_MODEL}"
+  # A trained checkpoint (MHO_MODEL = its dir) uses its base model's configs: MHO_BASE_MODEL.
+  _AGENT_CONFIG_MODEL="${MHO_BASE_MODEL:-${MHO_MODEL}}"
 else
   _AGENT_CONFIG_MODEL="${MODEL:-}"; _AGENT_CONFIG_MODEL="${_AGENT_CONFIG_MODEL#*/}"
 fi
@@ -171,6 +172,7 @@ if [ -n "${MHO_MODEL:-}" ]; then
   VLLM_LOG="${MHO_VLLM_LOG:-${MHO_OUT:-/tmp}/vllm_serve.log}"; mkdir -p "$(dirname "$VLLM_LOG")"
   # Keep this a single command: the VAR=value prefixes only reach serve.sh as one statement.
   MODEL="${MHO_MODEL}" \
+  SERVE_CONFIG="${SERVE_CONFIG:-configs/serve/${MHO_BASE_MODEL:-${MHO_MODEL}}.json}" \
   VLLM_PORT="${VLLM_PORT}" \
   SERVED_NAME="${SERVED_NAME}" \
   BASE_SIF="${BASE_SIF}" \
