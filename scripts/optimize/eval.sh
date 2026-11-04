@@ -168,12 +168,13 @@ if [ -n "${MHO_MODEL:-}" ]; then
   echo "[eval] serving via scripts/utils/serve.sh: ${MHO_MODEL} -> :${VLLM_PORT}"
   if [ "${CLOUD_SANDBOX}" = 1 ]; then USE_RELAY=1; fi
 
+  VLLM_LOG="${MHO_VLLM_LOG:-${MHO_OUT:-/tmp}/vllm_serve.log}"; mkdir -p "$(dirname "$VLLM_LOG")"
+  # Keep this a single command: the VAR=value prefixes only reach serve.sh as one statement.
   MODEL="${MHO_MODEL}" \
   VLLM_PORT="${VLLM_PORT}" \
   SERVED_NAME="${SERVED_NAME}" \
   BASE_SIF="${BASE_SIF}" \
   USE_RELAY="${USE_RELAY:-0}" \
-  VLLM_LOG="${MHO_VLLM_LOG:-${MHO_OUT:-/tmp}/vllm_serve.log}"; mkdir -p "$(dirname "$VLLM_LOG")"
   bash "${REPO_DIR}/scripts/utils/serve.sh" > "${VLLM_LOG}" 2>&1 &
 
   VLLM_PID=$!
