@@ -16,7 +16,7 @@
 #       bash scripts/utils/serve.sh                                        # reuse a deployed relay
 #
 # Knobs (env):
-#   MODEL            HF repo to serve (default Qwen/Qwen3.5-4B).
+#   MODEL            HF repo or local dir to serve (required; e.g. Qwen/Qwen3.5-4B).
 #   PORT             serve port (default 8000).
 #   TENSOR_PARALLEL  TP (default 1); DATA_PARALLEL DP (default #visible GPUs).
 #   MAX_MODEL_LEN    context length (default from configs/serve/<MODEL>.json, else 32768).
@@ -31,7 +31,7 @@
 set -euo pipefail
 REPO_ROOT="${REPO_ROOT:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../.." && pwd)}}}"
 cd "$REPO_ROOT"
-MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
+: "${MODEL:?serve.sh: MODEL is required (e.g. MODEL=Qwen/Qwen3.5-4B); refusing to fall back to a default model}"
 PORT="${PORT:-8000}"
 # Name vLLM registers the served model under. Must match what the agent sends to the litellm
 # proxy (eval.sh sets MODEL="litellm_proxy/<SERVED_NAME>" and the agent resolves that to the

@@ -8,7 +8,6 @@
     "--enable-prefix-caching",
     "--long-prefill-token-threshold",
     "0",
-    "--enforce-eager",
     "--enable-auto-tool-choice",
     "--language-model-only",
     "--tool-call-parser",

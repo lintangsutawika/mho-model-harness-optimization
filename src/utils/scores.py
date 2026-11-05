@@ -47,13 +47,21 @@ def metric_of(score: dict[str, Any]) -> float:
     return 0.0
 
 
-def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any]) -> bool:
+def update_frontier(frontier_path: Path, candidate: str, score: dict[str, Any],
+                    accept: bool | None = None) -> bool:
+    """`accept` = the gate's verdict (utils.gate); None -> plain metric > best. `_anchor` is
+    the most accurate accepted entry (the cheaper path must stay non-inferior to it)."""
     frontier = json.loads(frontier_path.read_text()) if frontier_path.exists() else {}
     metric = metric_of(score)
-    improved = metric > frontier.get("_best", {}).get("metric", -1)
+    best = frontier.get("_best", {}).get("metric")
+    improved = best is None or (metric > best if accept is None else accept)
     if improved:
         frontier["_best"] = {"candidate": candidate, "metric": metric, "score": score}
-    frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric})
+        anc = frontier.get("_anchor")
+        if anc is None or metric > anc.get("metric", float("-inf")):
+            frontier["_anchor"] = {"candidate": candidate, "metric": metric}
+    frontier.setdefault("history", []).append({"candidate": candidate, "metric": metric,
+                                               "accepted": bool(improved)})
     frontier_path.write_text(json.dumps(frontier, indent=2))
     return improved
 

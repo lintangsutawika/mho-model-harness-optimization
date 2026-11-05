@@ -27,18 +27,22 @@ Required `.env`/env keys:
 ### Optimization loop (choose a mode)
 
 ```bash
-# harness-only: propose -> eval (fixed model)
-bash scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B --iterations 10 --run-name test
-
-# model-only: train -> eval (fixed harness)
-bash scripts/run/model-only.sh     --model Qwen/Qwen3.5-4B --iterations 10 --run-name test
-
-# model-harness: propose -> train -> eval
-bash scripts/run/model-harness.sh  --model Qwen/Qwen3.5-4B --iterations 10 --run-name test
+DATA="--train-data <train task dir> --val-data <val split>"
+# harness-only: harness candidates (fixed model)
+bash scripts/run/harness-only.sh  --model Qwen/Qwen3.5-4B $DATA --iterations 10 --run-name test
+# model-only: model candidates (RL-train the model; fixed harness)
+bash scripts/run/model-only.sh    --model Qwen/Qwen3.5-4B $DATA --iterations 10 --run-name test
+# model-harness: 10 harness candidates, then 2 model candidates, repeating
+bash scripts/run/model-harness.sh --model Qwen/Qwen3.5-4B $DATA --iterations 50 --run-name test \
+    --harness-proposals 10 --model-proposals 2
 ```
 
-Each phase is a `qsub` job; the driver polls `qstat`. See `src/optimize_loop.py` for the
-env interface (`MHO_MODEL`, `MHO_TASK`, `MHO_OUT`, `MHO_TRAINER`, ...).
+All modes run one loop (`src/mho/loop.py`) over a (harness, model) pair: each candidate goes
+eval_a -> propose -> [train, model candidates] -> eval_b -> train gate -> eval_val -> val gate,
+and an accepted candidate's pair becomes the current one (`<run>/best/pair.json`). Candidate
+kinds live in `src/mho/kinds/`, the accept gates in `src/utils/gate.py` (`--gate-*` flags).
+Each stage is a batch job (`src/mho/jobs.py`, PBS or SLURM); the driver polls it. Logs:
+`<run>/logs/run.out` and one `<run>/logs/<candidate>-<stage>.out` per job.
 
 ### Train directly (Miles)
 
