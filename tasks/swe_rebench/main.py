@@ -305,6 +305,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None,
                         help="Seed for --sample. Two subsets drawn with different seeds are "
                              "independent; --limit would return the same leading rows.")
+    parser.add_argument("--val-size", type=int, default=0,
+                        help="Hold out the last N selected problems by problem_id as val "
+                             "(disjoint from train). Generates <out>-train-split + "
+                             "<out>-val-split. 0 disables (generate one dir).")
     parser.add_argument("--skip-unsupported", action="store_true",
                         help="Record unusable rows in exclusions.json instead of aborting.")
     parser.add_argument("--refresh-parsers", action="store_true",
@@ -345,29 +349,67 @@ def main() -> None:
     elif args.limit is not None and args.limit >= 0:
         problems = problems[: args.limit]
 
+    def write_dataset(out: Path, subset: list[dict[str, Any]]) -> int:
+        exclusions, count = generate_all(subset, output=out,
+                                         skip_unsupported=args.skip_unsupported)
+        (out / "selection_manifest.json").write_text(
+            json.dumps(
+                {
+                    "dataset": DATASET_NAME,
+                    "split": SPLIT,
+                    "seed": args.seed,
+                    "sample": args.sample,
+                    "limit": args.limit,
+                    "languages": args.language,
+                    "count": count,
+                    "problem_ids": [int(p["problem_id"]) for p in subset],
+                    "instance_ids": [p["instance_id"] for p in subset],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"Generated {count} tasks in {out}; excluded {len(exclusions)}")
+        return count
+
+    if args.val_size:
+        if not 0 < args.val_size < len(problems):
+            raise SystemExit(f"--val-size {args.val_size} must be in [0, {len(problems)}) "
+                             f"(got {len(problems)} selected problems).")
+        train_out = output_dir.with_name(output_dir.name + "-train-split")
+        val_out = output_dir.with_name(output_dir.name + "-val-split")
+        for out in (train_out, val_out):
+            if out.exists():
+                raise SystemExit(f"Output directory already exists: {out}. Use a fresh --output-dir.")
+        train, val = problems[:-args.val_size], problems[-args.val_size:]
+        train_count = write_dataset(train_out, train)
+        val_count = write_dataset(val_out, val)
+        (output_dir.parent / f"{output_dir.name}_split_manifest.json").write_text(
+            json.dumps(
+                {
+                    "dataset": DATASET_NAME,
+                    "split": SPLIT,
+                    "seed": args.seed,
+                    "val_size": args.val_size,
+                    "split_method": "the last val_size selected problems by problem_id are val",
+                    "train_count": train_count,
+                    "val_count": val_count,
+                    "train_out": str(train_out),
+                    "val_out": str(val_out),
+                    "val_problem_ids": [int(p["problem_id"]) for p in val],
+                    "val_instance_ids": [p["instance_id"] for p in val],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return
+
     if output_dir.exists():
         raise SystemExit(f"Output directory already exists: {output_dir}. Use a fresh --output-dir.")
-    exclusions, count = generate_all(problems, output=output_dir,
-                                     skip_unsupported=args.skip_unsupported)
-    (output_dir / "selection_manifest.json").write_text(
-        json.dumps(
-            {
-                "dataset": DATASET_NAME,
-                "split": SPLIT,
-                "seed": args.seed,
-                "sample": args.sample,
-                "limit": args.limit,
-                "languages": args.language,
-                "count": count,
-                "problem_ids": [int(p["problem_id"]) for p in problems],
-                "instance_ids": [p["instance_id"] for p in problems],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    print(f"Generated {count} tasks in {output_dir}; excluded {len(exclusions)}")
+    write_dataset(output_dir, problems)
 
 
 if __name__ == "__main__":
