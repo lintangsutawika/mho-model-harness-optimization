@@ -57,15 +57,19 @@ def _phase_res(phase: str) -> dict[str, str]:
     them, so the same MHO_<PHASE>_NGPUS/CPUS works on either backend. QUEUE/ACCOUNT/WALLTIME
     are already neutral (PBS -q/-P/-l walltime vs SLURM -p/-A/-t). SELECT (raw PBS
     ``-l select=`` for full-node/reservation shapes) and RTYPE (PBS ``-v RTYPE=``, ABCI RESERVE
-    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. Per-phase
+    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. QOS/MEM are the
+    SLURM-only counterparts (--qos / --mem), e.g. a CPU-only QoS when the default one needs
+    a GPU; PBS ignores them. Per-phase
     MHO_<PHASE>_<VAR> overrides the shared base MHO_<VAR>; unset falls back to phase defaults.
     """
-    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
+    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS", "QOS", "MEM")}
     get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
     return {
         "queue": get("QUEUE") or "",
         "select": get("SELECT") or "",
         "resource_type": get("RTYPE") or "",
+        "qos": get("QOS") or "",
+        "mem": get("MEM") or "",
         "walltime": get("WALLTIME") or ("08:00:00" if phase == "EVAL" else "24:00:00" if phase == "TRAIN" else "02:00:00"),
         "ngpus": int(get("NGPUS") or (1 if phase == "EVAL" else 8 if phase == "TRAIN" else 0)),
         "cpus": int(os.environ.get(f"MHO_{phase}_CPUS", 0) or 0),

@@ -46,6 +46,17 @@ def test_submit_flags_log_file_and_env(slurm, monkeypatch):
     assert "SBATCH_PARTITION=" not in env and "SLURM_JOB_ID=" not in env
 
 
+def test_phase_qos_and_mem_reach_sbatch(slurm, monkeypatch):
+    from utils.env import _phase_res
+    monkeypatch.setenv("MHO_QOS", "cpu_qos")              # shared base
+    monkeypatch.setenv("MHO_EVAL_MEM", "16G")             # per-phase
+    monkeypatch.setenv("MHO_EVAL_NGPUS", "0")
+    ol.Scheduler("slurm").submit(Path("/bin/true"), {}, name="mho-eval-x", **_phase_res("EVAL"))
+    cmd = (slurm / "cmd").read_text().split()
+    assert "--qos=cpu_qos" in cmd and "--mem=16G" in cmd
+    assert not any(c.startswith("--gres") for c in cmd)
+
+
 @pytest.mark.parametrize("row,expected", [
     ("COMPLETED|0:0", ("DONE", 0)),
     ("FAILED|2:0", ("DONE", 2)),

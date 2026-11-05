@@ -66,11 +66,12 @@ class Scheduler:
     def submit(self, script: Path, env: dict[str, str], *, name: str = "", ngpus: int = 0,
                cpus: int = 0, walltime: str = "", queue: str = "", account: str = "",
                select: str = "", resource_type: str = "", out_dir: Path | None = None,
-               host: str = "") -> str:
+               host: str = "", qos: str = "", mem: str = "") -> str:
         # `select` (raw PBS -l select string, e.g. ABCI's "1:ncpus=192:mem=1920gb:ngpus=8") wins
         # over the auto-built ngpus/cpus select -- clusters with full-node/reservation shapes need
         # the exact string. `resource_type` -> PBS `-v RTYPE=...`, required by ABCI reservation
         # (RESERVE) queues (e.g. rt_HF / rt_HC). On SLURM both are ignored (use gres/cpus).
+        # `qos` / `mem` are SLURM-only (--qos / --mem); PBS ignores them.
         # qsub -V / --export=ALL export the SUBMITTER's env. Strip the driver job's own
         # PBS_*/RTYPE/CUDA_VISIBLE_DEVICES/TMPDIR/... first: e.g. an rt_HC driver's RTYPE made
         # ABCI's reservation hook put GPU evals on CPU-only nodes (ngpus=0).
@@ -100,6 +101,8 @@ class Scheduler:
             if name: cmd += ["-J", name]
             if queue: cmd += ["-p", queue]
             if account: cmd += ["-A", account]
+            if qos: cmd += [f"--qos={qos}"]
+            if mem: cmd += [f"--mem={mem}"]
             if ngpus: cmd += [f"--gres=gpu:{ngpus}"]
             if cpus: cmd += [f"--cpus-per-task={cpus}"]
             if walltime: cmd += ["-t", walltime]
