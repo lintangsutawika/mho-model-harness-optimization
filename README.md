@@ -44,6 +44,21 @@ kinds live in `src/mho/kinds/`, the accept gates in `src/utils/gate.py` (`--gate
 Each stage is a batch job (`src/mho/jobs.py`, PBS or SLURM); the driver polls it. Logs:
 `<run>/logs/run.out` and one `<run>/logs/<candidate>-<stage>.out` per job.
 
+### Track a run in W&B
+
+`src/wandb_sync.py` mirrors a run dir into Weights & Biases. It is a read-only sidecar, so run
+it wherever W&B is reachable (e.g. the login node), during or after a run. It logs one step per
+finished candidate (x-axis = proposals used): train/val gate numbers, best-so-far and anchor
+margin, outcome counts, stage wall times, eval health (timeouts, durations, tokens), plus
+candidate / round / job tables and a train-t vs val-t scatter. Re-runs only log new candidates
+(state in `<run>/logs/wandb_sync.json`); `--restart` starts a fresh W&B run. `WANDB_*` keys are
+read from `.env`.
+
+```bash
+uv run --no-project --with wandb --with python-dotenv \
+  python src/wandb_sync.py --run-dir mho-runs/<run> --watch 600   # or --offline
+```
+
 ### Train directly (Miles)
 
 ```bash
