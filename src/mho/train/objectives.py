@@ -10,7 +10,7 @@ run_training.py (the Miles launcher) asks this module, for MHO_TRAIN_OBJECTIVE:
         Keeps only groups whose rewards vary (all right / all wrong carry no advantage).
   rsft  rejection-sampling fine-tuning (WHALE): SFT loss on the successful rollouts only.
         Keeps every prompt group; failed trajectories are removed by its sample filter
-        (mho/train/rsft.py). Batch shape: train.sh's RSFT defaults (WHALE: 256 prompts x 8).
+        (mho/train/rsft.py). Batch shape: train.sh's defaults (WHALE: rsft 256 x 8, grpo 64 x 8).
 
 Plain string builders (no miles import), so they are unit-testable outside the container.
 """
@@ -23,9 +23,9 @@ RSFT_GROUP_FILTER = "mho.train.rsft.any_success"
 RSFT_SAMPLE_FILTER = "mho.train.rsft.keep_successful"
 
 
-# Rollout sampling temperature per objective (MHO_ROLLOUT_TEMPERATURE overrides): RSFT samples
-# at 1.0 as WHALE; GRPO keeps the launcher's 0.8.
-ROLLOUT_TEMPERATURE = {"grpo": 0.8, "rsft": 1.0}
+# Rollout sampling temperature per objective (MHO_ROLLOUT_TEMPERATURE overrides): 1.0 for both,
+# as WHALE's verl script, so the objectives sample the same distribution.
+ROLLOUT_TEMPERATURE = {"grpo": 1.0, "rsft": 1.0}
 
 
 def rollout_temperature(objective: str) -> float:

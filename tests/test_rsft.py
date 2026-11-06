@@ -79,7 +79,7 @@ def test_objective_flags():
 def test_rollout_temperature(monkeypatch):
     monkeypatch.delenv("MHO_ROLLOUT_TEMPERATURE", raising=False)
     assert objectives.rollout_temperature("rsft") == 1.0
-    assert objectives.rollout_temperature("grpo") == 0.8
+    assert objectives.rollout_temperature("grpo") == 1.0
     monkeypatch.setenv("MHO_ROLLOUT_TEMPERATURE", "0.7")
     assert objectives.rollout_temperature("rsft") == 0.7
 
