@@ -86,9 +86,10 @@ class Fake:
             (Path(out_dir) / job_name / "fake_score.json").write_text(json.dumps(score))
         return self._job()
 
-    def submit_propose(self, sched, *, run_root, logs, tag, kind):
+    def submit_propose(self, sched, *, run_root, logs, tag, kind, sibling=(1, 1)):
         ok = self.proposes(tag)
-        self.calls.append({"stage": "propose", "tag": tag, "ok": ok, "log": logs})
+        self.calls.append({"stage": "propose", "tag": tag, "ok": ok, "log": logs,
+                           "sibling": sibling})
         self.calls[-1]["kind"] = kind
         if ok and kind == "model":
             c = run_root / "candidates" / tag
@@ -128,13 +129,15 @@ def fake_realize(cand_dir, train_data):
 
 
 def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pending=0,
-         fresh=False, fake=None, schedule=(("harness", 1),), trains=lambda t: True):
+         fresh=False, fake=None, schedule=(("harness", 1),), trains=lambda t: True,
+         proposals=1):
     train = tmp_path / "train"
     for i in range(20):
         (train / f"p{i}").mkdir(parents=True, exist_ok=True)
     args = SimpleNamespace(model="m", trials=1, concurrent=1, train_data=str(train),
                            val_data="VAL", propose_sample=4, iterations=iterations,
-                           ts_repropose_limit=limit, fresh=fresh, skip_baseline=False)
+                           ts_repropose_limit=limit, fresh=fresh, skip_baseline=False,
+                           proposals=proposals)
     run_dir = tmp_path / "run"
     fake = fake or Fake(run_dir, evals, proposes, pending, trains)
     kinds = {"harness": HarnessKind(),
@@ -454,7 +457,7 @@ def test_schema2_harness_state_is_migrated_on_resume(tmp_path):
         "version": 1, "try": 1, "propose_count": 1, "parent": parent, "subset": None,
         "ts_B": None, "job": None, "attempt": 1, "infra_fails": 0, "propose_fails": 0}))
     loop, fake = make(tmp_path, scripted(val=[0.7], a=[0.3], b=[0.5]), iterations=2)
-    assert loop.st["schema"] == 3 and loop.st["pair"] == {"harness": parent, "model": None}
+    assert loop.st["schema"] == 4 and loop.st["pair"] == {"harness": parent, "model": None}
     loop.run()
     assert fake.calls[0]["stage"] == "eval_a" and fake.calls[0]["harness"] == parent
 
@@ -485,3 +488,162 @@ def test_node_is_parked_once(tmp_path):
     assert [c["stage"] for c in fake.calls].count("hold") == 1
     assert [c["stage"] for c in fake.calls].count("eval_a") == 3
     assert summary(loop)[-1]["outcome"] == "train_fail"
+
+
+# --------------------------------------------------------------------------- parallel rounds
+def by_tag(scores):
+    """evals plan for eval_b keyed by the candidate tag (siblings finish in any order)."""
+    def plan(stage, harness, n, _s=scores):
+        if stage == "eval_b":
+            return _s["b"].get(Path(harness).parent.name, 0.1)     # unlisted: train_fail
+        return _s[stage][n]
+    return plan
+
+
+def test_round_of_four_sends_only_the_best_passer_to_val(tmp_path):
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [0.3],
+        "b": {"candidate_1_0_1a": 0.4, "candidate_1_0_1b": 0.6,
+              "candidate_1_0_1c": 0.2, "candidate_1_0_1d": 0.5}}),
+        iterations=4, proposals=4)
+    loop.run()
+    props = [c for c in fake.calls if c["stage"] == "propose"]
+    assert [c["tag"] for c in props] == [f"candidate_1_0_1{x}" for x in "abcd"]
+    assert [c["sibling"] for c in props] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+    # all four proposed before any eval_b (they run concurrently), A evaluated once
+    stages = [c["stage"] for c in fake.calls]
+    assert stages == ["val", "eval_a"] + ["propose"] * 4 + ["eval_b"] * 4 + ["val"]
+    vals = [c for c in fake.calls if c["stage"] == "val"]
+    assert vals[1]["harness"].endswith("candidate_1_0_1b/harness")     # best train score
+    rows = {r["candidate"]: r for r in summary(loop)[1:]}
+    assert {t: r["outcome"] for t, r in rows.items()} == {
+        "candidate_1_0_1a": "not_selected", "candidate_1_0_1b": "accepted",
+        "candidate_1_0_1c": "train_fail", "candidate_1_0_1d": "not_selected"}
+    assert rows["candidate_1_0_1a"]["selected"] == "candidate_1_0_1b"
+    assert rows["candidate_1_0_1b"]["ts_B"] == 0.6
+    assert loop.st["pair"]["harness"].endswith("candidate_1_0_1b/harness")
+    assert loop.st["propose_count"] == 4
+    # each sibling has its own logs and its own link to the shared A traces
+    logs = {Path(c["log"]).name for c in fake.calls}
+    assert {f"candidate_1_0_1{x}-eval_after.out" for x in "abcd"} <= logs
+    assert (loop.cands / "candidate_1_0_1c" / "eval_before" / "t0" / "result.json").exists()
+
+
+def test_selection_prefers_the_larger_paired_t(tmp_path):
+    a = {f"q{i}": (0.0, 100) for i in range(8)}
+    noisy = {f"q{i}": (1.0 if i < 4 else 0.0, 100) for i in range(8)}      # mean 0.5, t ~ 2.6
+    steady = {f"q{i}": (0.4, 100) for i in range(8)}                       # mean 0.4, every task
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [a],
+        "b": {"candidate_1_0_1a": noisy, "candidate_1_0_1b": steady}}),
+        iterations=2, proposals=2)
+    loop.run()
+    rows = {r["candidate"]: r for r in summary(loop)[1:]}
+    # steady has the smaller mean but improves every task (zero variance: the strongest
+    # evidence; the gate stores its infinite t as None) -> it is selected, not the noisy one
+    assert rows["candidate_1_0_1a"]["train_gate"]["acc"]["t"] > 1
+    assert rows["candidate_1_0_1b"]["train_gate"]["acc"]["t"] is None
+    assert rows["candidate_1_0_1b"]["outcome"] == "accepted"
+    assert rows["candidate_1_0_1a"]["outcome"] == "not_selected"
+
+
+def test_no_passer_reproposes_once_then_fresh_subset(tmp_path):
+    b = {f"candidate_{i}_0_{j}{x}": 0.1 for i in (1, 2) for j in (1, 2, 3) for x in "ab"}
+    loop, fake = make(tmp_path, by_tag({"val": [0.5], "eval_a": [0.3, 0.3], "b": b}),
+                      iterations=6, limit=2, proposals=2)
+    loop.run()
+    rows = summary(loop)[1:]
+    assert [r["candidate"] for r in rows] == [
+        "candidate_1_0_1a", "candidate_1_0_1b", "candidate_1_0_2a", "candidate_1_0_2b",
+        "candidate_2_0_3a", "candidate_2_0_3b"]
+    assert all(r["outcome"] == "train_fail" for r in rows)
+    seeds = [r["subset_seed"] for r in rows]
+    assert len(set(seeds[:4])) == 1 and seeds[4] != seeds[0]          # fresh S after 2 rounds
+    assert len([c for c in fake.calls if c["stage"] == "eval_a"]) == 2
+
+
+def test_round_size_is_capped_by_the_budget(tmp_path):
+    b = {f"candidate_{i}_0_{j}{x}": 0.1 for i in (1, 2) for j in (1, 2) for x in "abcd"}
+    loop, fake = make(tmp_path, by_tag({"val": [0.5], "eval_a": [0.3, 0.3], "b": b}),
+                      iterations=6, limit=2, proposals=4)
+    loop.run()
+    tags = [c["tag"] for c in fake.calls if c["stage"] == "propose"]
+    assert tags == [f"candidate_1_0_1{x}" for x in "abcd"] + ["candidate_1_0_2a", "candidate_1_0_2b"]
+    assert loop.st["propose_count"] == 6
+
+
+def test_one_failed_sibling_does_not_stop_the_round(tmp_path):
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [0.3, 0.3],
+        "b": {"candidate_1_0_1a": 0.5, "candidate_1_0_1c": 0.4}}),
+        iterations=3, proposals=3, proposes=lambda t: t != "candidate_1_0_1b")
+    loop.run()
+    out = {r["candidate"]: r["outcome"] for r in summary(loop)[1:4]}
+    assert out == {"candidate_1_0_1b": "no_proposal", "candidate_1_0_1a": "accepted",
+                   "candidate_1_0_1c": "not_selected"}
+    # the failed one is refunded: one more proposal fits in the budget of 3
+    assert [r["candidate"] for r in summary(loop)[4:]] == ["candidate_2_1_1"]
+    assert loop.st["propose_count"] == 3
+
+
+def test_model_kind_ignores_proposals(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6], a=[0.3], b=[]), iterations=1,
+                      schedule=[("model", 1)], proposals=4)
+    loop.run()
+    assert [c["tag"] for c in fake.calls if c["stage"] in ("propose", "train")] == [
+        "candidate_1_0_1", "candidate_1_0_1"]
+
+
+def test_round_respects_the_schedule_slot(tmp_path):
+    b = {f"candidate_1_0_1{x}": 0.1 for x in "ab"}
+    loop, fake = make(tmp_path, by_tag({"val": [0.5, 0.6], "eval_a": [0.3, 0.3], "b": b}),
+                      iterations=3, proposals=4, limit=1, schedule=[("harness", 2), ("model", 1)])
+    loop.run()
+    props = [(c["tag"], c["kind"]) for c in fake.calls if c["stage"] == "propose"]
+    assert props == [("candidate_1_0_1a", "harness"), ("candidate_1_0_1b", "harness"),
+                     ("candidate_2_0_2", "model")]
+
+
+def test_resume_mid_round_reattaches_every_sibling(tmp_path):
+    plan = by_tag({"val": [0.5, 0.6], "eval_a": [0.3],
+                   "b": {"candidate_1_0_1a": 0.5, "candidate_1_0_1b": 0.4}})
+    loop, fake = make(tmp_path, plan, iterations=2, proposals=2, pending=1)
+    while not (loop.st["stage"] == "round" and loop.st["round"]
+               and all(m["stage"] == "eval_b" and m["job"] for m in loop.st["round"]["members"])):
+        loop.step()
+    jobs = [m["job"] for m in loop.st["round"]["members"]]
+    loop2, _ = make(tmp_path, None, iterations=2, proposals=2, fake=fake)
+    assert [m["job"] for m in loop2.st["round"]["members"]] == jobs
+    loop2.run()
+    assert len([c for c in fake.calls if c["stage"] == "eval_b"]) == 2      # not resubmitted
+    assert {r["candidate"]: r["outcome"] for r in summary(loop2)[1:]} == {
+        "candidate_1_0_1a": "accepted", "candidate_1_0_1b": "not_selected"}
+
+
+def test_schema3_state_mid_eval_b_becomes_a_one_sibling_round(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6], a=[0.3], b=[0.5]), iterations=1,
+                      pending=1)
+    while not (loop.st["stage"] == "round" and loop.st["round"]
+               and loop.st["round"]["members"][0]["stage"] == "eval_b"
+               and loop.st["round"]["members"][0]["job"]):
+        loop.step()
+    m = loop.st["round"]["members"][0]
+    v3 = dict(loop.st, schema=3, stage="eval_b", kind="harness",
+              job={"id": m["job"], "stage": "eval_b", "attempt": 1}, attempt=1)
+    del v3["round"], v3["cur"]
+    loop.state_path.write_text(json.dumps(v3))
+    loop2, _ = make(tmp_path, None, iterations=1, fake=fake)
+    assert loop2.st["schema"] == 4 and loop2.st["stage"] == "round"
+    assert loop2.st["round"]["members"][0]["job"] == m["job"]
+    loop2.run()
+    assert len([c for c in fake.calls if c["stage"] == "eval_b"]) == 1
+    assert summary(loop2)[-1]["outcome"] == "accepted"
+
+
+def test_sibling_note_gives_each_sibling_its_own_focus():
+    from mho.optimizer.agent import SIBLING_FOCUS, sibling_note
+    assert sibling_note("candidate_1_0_1", "1/1") == ""
+    notes = [sibling_note(f"candidate_1_0_1{x}", f"{k}/4") for k, x in enumerate("abcd", 1)]
+    for k, n in enumerate(notes):
+        assert f"proposal {k + 1} of 4" in n and SIBLING_FOCUS[k] in n
+        assert f"candidate_1_0_1{'abcd'[k]}/" in n

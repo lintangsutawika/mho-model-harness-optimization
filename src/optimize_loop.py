@@ -112,10 +112,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--concurrent", type=int, default=int(os.environ.get("EVAL_CONCURRENCY", 16)),
                    help="trials run in parallel (harbor -n). Pure throughput; does not affect the "
                         "score. Bounded by GPU serving capacity. Env override: EVAL_CONCURRENCY.")
+    p.add_argument("--proposals", type=int, default=int(os.environ.get("MHO_PROPOSALS", 4)),
+                   help="sibling candidates proposed and evaluated in parallel per round (same "
+                        "parent, same train subset); the best one that passes the train gate "
+                        "goes to val. Kinds that are not parallel (model) always use 1. "
+                        "Env: MHO_PROPOSALS.", metavar="M")
     p.add_argument("--ts-repropose-limit", type=int,
-                   default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 3)),
-                   help="Max consecutive train-sample failures (T_B < T_A on the same subset) "
-                        "before giving up on this harness/subset and moving to a fresh subset.",
+                   default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 2)),
+                   help="Rounds on the same train subset with no sibling passing the train gate "
+                        "before moving to a fresh subset (and a fresh A).",
                    metavar="N")
     _g = GateConfig.env_defaults()
     p.add_argument("--gate-train-z", dest="gate_train_z", type=float, default=_g["train_z"],
@@ -162,6 +167,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.propose_sample <= 0:
         p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
     args.ts_repropose_limit = max(1, args.ts_repropose_limit)
+    args.proposals = max(1, args.proposals)
     # Fix the run name once so the driver log and the loop agree on the run dir.
     args.run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / args.run_name

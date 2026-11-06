@@ -78,6 +78,7 @@ class ModelKind(Kind):
     name = "model"
     build_stage = "train"
     train_gate = False      # trained on --train-data: judged on the val split only
+    parallel = False        # one training run at a time
 
     def __init__(self, *, train_data: str, trainer: str, submit_train: Callable[..., str],
                  realize: Callable[[Path, str], tuple[bool, Path | None]] = realize_model_specs):
@@ -102,12 +103,12 @@ class ModelKind(Kind):
             return False, "no sigma-reward config realized from model_specs/"
         return True, ""
 
-    def submit_build(self, loop: Any, cand_dir: Path, current: Pair) -> str:
+    def submit_build(self, loop: Any, cand_dir: Path, current: Pair, logs: Path) -> str:
         # Train from the CURRENT best model (a rejected checkpoint is never trained on) with the
         # current best harness.
         return self._submit_train(loop.sched, self.trainer,
                                   model=current.model or loop.args.model, harness=current.harness,
-                                  out_dir=cand_dir / "train", logs=loop.log_path(),
+                                  out_dir=cand_dir / "train", logs=logs,
                                   tag=cand_dir.name, sigma_reward=str(self.sigma_reward(cand_dir)),
                                   train_data=self.train_data)
 
