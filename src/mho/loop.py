@@ -71,7 +71,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from mho.kinds import Kind, Pair
-from utils.gate import GateConfig, decide_dirs, env_failures
+from utils import alloc
+from utils.gate import (GateConfig, decide, decide_dirs, env_failures, paired, per_task_dirs,
+                        task_mean)
 from utils.scores import metric_of, score_trials
 from utils.state import _candidate_hypothesis, _sample_subset
 
@@ -180,6 +182,7 @@ class Loop:
             "subset": None,            # {dir, seed, a_tag, ts_A, tries} for the current iteration
             "round": None,             # {members: [sibling, ...]} while stage == "round"
             "cur": None,               # the selected sibling's tag (eval_val)
+            "val": None,               # adaptive val: {look, parts: [eval job, ...]}
             "ts_B": None,              # selected candidate's train-sample score
             "train_gate": None,        # selected candidate's train-gate stats
             "job": None,               # in-flight {id, stage, attempt} (not used by "round")
@@ -212,6 +215,7 @@ class Loop:
         st = dict(st)
         st.setdefault("round", None)
         st.setdefault("cur", None)
+        st.setdefault("val", None)
         if st["stage"] not in ("baseline", "eval_a", "eval_val"):
             st["kind"] = st.get("kind") or self.schedule[st["schedule"]["i"] % len(self.schedule)][0]
             tag = f"candidate_{st['iteration']}_{st['version']}_{st['try']}"
@@ -301,7 +305,7 @@ class Loop:
         self.st.update(stage=stage, job=None, attempt=1)
 
     def _reset_candidate(self) -> None:
-        self.st.update(ts_B=None, train_gate=None, kind=None, round=None, cur=None)
+        self.st.update(ts_B=None, train_gate=None, kind=None, round=None, cur=None, val=None)
 
     def _new_iteration(self) -> None:
         self.st["iteration"] += 1
@@ -696,6 +700,7 @@ class Loop:
         self._goto("eval_val")
 
     def _done_eval_val(self, ok: bool, rc: int) -> None:
+        """Uniform val eval (--no-val-adaptive): one job, one look at --gate-z."""
         st = self.st
         if not ok:
             self._infra_fail(f"eval_val {self.tag} rc={rc}")
@@ -703,30 +708,296 @@ class Loop:
             st["try"] += 1
             self._new_iteration()
             return
-        val = self._score("eval_val")
-        best = self._best_metric()
+        self.st["infra_fails"] = 0
+        g = self._val_gate_inputs()
+        dec = decide(g["a"], g["b"], z=self.gate_cfg.z, cfg=self.gate_cfg, anchor=g["anc"],
+                     fallback=(g["best"], g["val"]))
+        self._val_verdict(dec, g, look=None)
+
+    # ------------------------------------------------------------- val (adaptive)
+    # The candidate's val eval is spent where it can change the decision (utils.alloc):
+    #   look 1 : every val task >= 1 trial; the rest of --val-budget by task uncertainty
+    #            (sqrt(p(1-p)) from the best's and earlier configs' val trials, never B's own).
+    #            accept if t >= --gate-early-z; reject if t <= 0 and not plausibly cheaper;
+    #            else look 2.
+    #   look 2 : --val-topup more trials for B AND the same for the best (reused by every later
+    #            comparison), by pooled uncertainty; accept if t >= --gate-z + LOOK2_Z_EXTRA
+    #            (two looks: each bar is a bit stricter, so the overall false-accept rate stays
+    #            about what --gate-z gives with one look).
+    #   accept : the new best is filled up to --trials trials on every task (a uniform eval: a
+    #            solid reference for later comparisons, and an unbiased score to report).
+    # B's results never decide which tasks get trials. Accuracy = mean over tasks of per-task
+    # means (utils.gate.task_mean).
+    LOOK2_Z_EXTRA = 0.05
+
+    def _adaptive(self) -> bool:
+        return bool(getattr(self.args, "val_adaptive", False)) and Path(self.args.val_data).is_dir()
+
+    def _val_dirs(self, tag: str) -> list[Path]:
+        """Every val eval dir of `tag`: evaluation/<tag> plus its groups / top-ups
+        evaluation/<tag>.<suffix> (not set-aside failed attempts, not harbor's yaml files)."""
+        ev = self.run_dir / "evaluation"
+        dirs = [ev / tag] if (ev / tag).is_dir() else []
+        dirs += sorted(d for d in ev.glob(f"{tag}.*")
+                       if d.is_dir() and ".failed-attempt" not in d.name)
+        return dirs
+
+    def _val_pt(self, tag: str | None) -> dict:
+        return per_task_dirs(self._val_dirs(tag), self.gate_cfg.cost_metric) if tag else {}
+
+    def _val_tasks(self) -> dict[str, Path]:
+        if getattr(self, "_val_task_dirs", None) is None:
+            self._val_task_dirs = alloc.task_dirs(self.args.val_data)
+        return self._val_task_dirs
+
+    def _val_gate_inputs(self) -> dict:
         fr = self._frontier()
         ref = fr.get("_best", {}).get("candidate")
         anc = (fr.get("_anchor") or fr.get("_best") or {}).get("candidate")
-        dec = decide_dirs(self._val_dir(ref) if ref else None, self._out_dir("eval_val"),
-                          z=self.gate_cfg.z, cfg=self.gate_cfg,
-                          anchor_dir=self._val_dir(anc) if anc else None, fallback=(best, val))
-        self._event(stage="val_gate", tag=self.tag, ref=ref, anchor_tag=anc, **dec.fields())
-        print(f"  val gate {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
+        a, b = self._val_pt(ref), self._val_pt(self.tag)
+        val = task_mean(b) if b else self._score("eval_val")
+        best = task_mean(a) if a else self._best_metric()
+        return {"ref": ref, "anc_tag": anc, "a": a, "b": b,
+                "anc": self._val_pt(anc) if anc and anc != ref else None,
+                "val": val, "best": best}
+
+    def _history_counts(self, exclude: str) -> dict[str, tuple[float, float]]:
+        """{task: (successes, trials)} over every val eval so far except `exclude`'s own."""
+        ev = self.run_dir / "evaluation"
+        dirs = [d for d in ev.iterdir() if d.is_dir() and ".failed-attempt" not in d.name
+                and d.name != exclude and not d.name.startswith(exclude + ".")] \
+            if ev.is_dir() else []
+        pt = per_task_dirs(dirs)
+        return {t: (r["reward"] * r["n"], r["n"]) for t, r in pt.items()}
+
+    def _plan(self, look: Any, adds: dict[str, dict[str, int]]) -> dict:
+        """A val look as eval jobs: for each of 'cand' / 'best', one job per trial count."""
+        parts = []
+        for who, k in adds.items():
+            owner = self.tag if who == "cand" else self._frontier()["_best"]["candidate"]
+            for c, tasks in alloc.groups(k).items():
+                full = len(tasks) == len(self._val_tasks())
+                if look == 1 and full and not any(p["name"] == owner for p in parts):
+                    name = owner                                   # evaluation/<tag> itself
+                else:
+                    suffix = {1: "a", 2: "b", "fill": "f"}[look]
+                    name = (f"{owner}.{suffix}k{c}" if who == "cand"
+                            else f"{owner}.t-{self.tag.replace('candidate_', '')}-k{c}")
+                parts.append({"name": name, "who": who, "n": c,
+                              "tasks": None if full else tasks,
+                              "job": None, "attempt": 1, "done": False, "ok": None})
+        return {"look": look, "parts": parts}
+
+    def _plan_look1(self) -> dict:
+        tasks = list(self._val_tasks())
+        hist = self._history_counts(self.tag)
+        w = {t: alloc.spread(*hist.get(t, (0.0, 0.0))) for t in tasks}
+        budget = int(round(self.args.val_budget * self.args.trials * len(tasks)))
+        k = alloc.first_look(w, budget, cap=self.args.trials)
+        dist = ", ".join(f"{len(ts)} tasks x{c}" for c, ts in alloc.groups(k).items())
+        print(f"  val look 1: {sum(k.values())} trials ({dist})")
+        return self._plan(1, {"cand": k})
+
+    def _plan_look2(self, a: dict, b: dict) -> dict:
+        tasks = list(self._val_tasks())
+        w, start = {}, {}
+        for t in tasks:
+            ra, rb = a.get(t, {}), b.get(t, {})
+            s = ra.get("reward", 0) * ra.get("n", 0) + rb.get("reward", 0) * rb.get("n", 0)
+            w[t] = alloc.spread(s, ra.get("n", 0) + rb.get("n", 0))     # pooled: not B-vs-A
+            start[t] = int(rb.get("n", 0))
+        extra = int(round(self.args.val_topup * self.args.trials * len(tasks)))
+        add = alloc.neyman(w, extra, start=start, cap=self.args.val_cap)
+        print(f"  val look 2: +{sum(add.values())} trials each for {self.tag} and the best "
+              f"over {sum(1 for v in add.values() if v)} uncertain tasks")
+        return self._plan(2, {"cand": add, "best": dict(add)})
+
+    def _plan_fill(self) -> dict | None:
+        b = self._val_pt(self.tag)
+        tasks = list(self._val_tasks())
+        add = alloc.fill_to({t: int(b.get(t, {}).get("n", 0)) for t in tasks}, tasks,
+                            self.args.trials)
+        if not any(add.values()):
+            return None
+        print(f"  filling {self.tag} to {self.args.trials} trials/task: +{sum(add.values())}")
+        return self._plan("fill", {"cand": add})
+
+    def _stage_tasks(self, name: str, tasks: list[str]) -> Path:
+        d = self.run_dir / "samples" / "val" / name
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        src = self._val_tasks()
+        for t in tasks:
+            shutil.copytree(src[t], d / src[t].name, symlinks=True)
+        return d
+
+    def _part_pair(self, p: dict) -> Pair:
+        return self._cand_pair() if p["who"] == "cand" else self.pair
+
+    def _part_log(self, p: dict) -> Path:
+        name = f"{p['name']}-val" + (f"-attempt{p['attempt']}" if p["attempt"] > 1 else "")
+        return self.run_dir / "logs" / f"{name}.out"
+
+    def _submit_part(self, p: dict) -> str:
+        data = self.args.val_data if p["tasks"] is None else str(self._stage_tasks(p["name"], p["tasks"]))
+        pair = self._part_pair(p)
+        return self._submit_eval(self.sched, "", model=pair.model or self.args.model,
+                                 harness=pair.harness, data=data, n_trials=p["n"],
+                                 n_concurrent=self.args.concurrent,
+                                 out_dir=self.run_dir / "evaluation", logs=self._part_log(p),
+                                 job_name=p["name"],
+                                 base_model=self.args.model if pair.model else None)
+
+    def _part_done(self, p: dict, rc: int) -> None:
+        out = self.run_dir / "evaluation" / p["name"]
+        ok, why = (rc == 0), f"rc={rc}"
+        if ok and not _has_trials(out):
+            ok, why = False, "no trials"
+        if ok:
+            bad, n = env_failures(out)
+            if n and bad / n > ENV_FAIL_MAX:
+                host = self._job_host(p["job"])
+                self._park(host)
+                ok, why = False, f"{bad}/{n} trials never got a sandbox (node {host or '?'})"
+        self._event(stage="eval_val", tag=p["name"], rc=rc, ok=ok, attempt=p["attempt"],
+                    **({"why": why} if not ok else {}))
+        if not ok and p["attempt"] < MAX_ATTEMPTS:
+            if out.is_dir():
+                dst = out.with_name(f"{out.name}.failed-attempt{p['attempt']}")
+                shutil.rmtree(dst, ignore_errors=True)
+                out.rename(dst)
+            p["attempt"] += 1
+            p["job"] = None
+            print(f"  val part {p['name']} failed ({why}); attempt {p['attempt']}/{MAX_ATTEMPTS}")
+            return
+        p.update(done=True, ok=ok, job=None, why=None if ok else why)
+
+    def _step_val(self) -> bool:
+        st = self.st
+        if st.get("val") is None:
+            st["val"] = self._plan_look1()
+            self._save()
+        v = st["val"]
+        progressed = False
+        for p in v["parts"]:
+            if p["done"]:
+                continue
+            if p["job"] is None:
+                print(f"{_now()} iter {st['iteration']} val {p['name']} (x{p['n']}) -> submit"
+                      + (f" (attempt {p['attempt']})" if p["attempt"] > 1 else ""))
+                p["job"] = self._submit_part(p)
+                self._save()
+                progressed = True
+                continue
+            norm, rc = self.sched.state(p["job"])
+            if norm != "DONE":
+                continue
+            rc = 0 if rc is None else rc
+            print(f"{_now()} [val] {p['name']} job {p['job']} done (rc={rc})")
+            self._part_done(p, rc)
+            self._save()
+            progressed = True
+        if all(p["done"] for p in v["parts"]):
+            self._after_look(v)
+            self._save()
+            return True
+        if not progressed:
+            self.sleep(self.poll_seconds)
+        return True
+
+    def _after_look(self, v: dict) -> None:
+        st, look = self.st, v["look"]
+        failed = [p for p in v["parts"] if not p["ok"]]
+        if look == "fill":
+            if failed:
+                print(f"  WARNING: filling {self.tag} failed ({failed[0].get('why')}); it stays the "
+                      f"best with fewer trials on some tasks")
+            self._finish_accept()
+            return
+        if failed:
+            self._infra_fail(f"val look {look} {failed[0]['name']}: {failed[0].get('why')}")
+            self._finish("no_score", reason=f"val look {look}: {failed[0].get('why')}")
+            st["try"] += 1
+            self._new_iteration()
+            return
+        st["infra_fails"] = 0
+        g = self._val_gate_inputs()
+        cfg, z = self.gate_cfg, self.gate_cfg.z
+        two_looks = self.args.val_topup > 0
+        if look == 1 and two_looks:
+            dec = decide(g["a"], g["b"], z=self.args.gate_early_z, cfg=cfg, anchor=g["anc"],
+                         fallback=(g["best"], g["val"]))
+            if dec.accept or not self._worth_look2(dec, g):
+                self._val_verdict(dec, g, look=1)
+                return
+            print(f"  val look 1 inconclusive (val {g['val']:.4f} vs {g['ref']} {g['best']:.4f}): "
+                  f"{dec.reason}")
+            self._event(stage="val_gate", tag=self.tag, ref=g["ref"], anchor_tag=g["anc_tag"],
+                        look=1, **dec.fields())
+            st["val"] = self._plan_look2(g["a"], g["b"])
+            return
+        z_final = z + self.LOOK2_Z_EXTRA if look == 2 else z
+        dec = decide(g["a"], g["b"], z=z_final, cfg=cfg, anchor=g["anc"],
+                     fallback=(g["best"], g["val"]))
+        self._val_verdict(dec, g, look=look)
+
+    def _worth_look2(self, dec, g: dict) -> bool:
+        """After look 1: is the candidate borderline (more trials could change the verdict)?
+        No when it scored below the best (t <= 0) and is not plausibly cheaper either."""
+        acc = dec.acc
+        if acc is None:
+            return False
+        if acc.t() > 0:
+            return True
+        cost = paired(g["a"], g["b"], "cost")
+        if cost is None or cost.mean_a <= 0 or self.gate_cfg.cheaper_delta <= 0:
+            return False
+        return (cost.mean_a - cost.mean_b) / cost.mean_a >= self.gate_cfg.cheaper_min_gain
+
+    def _val_verdict(self, dec, g: dict, *, look: Any) -> None:
+        st = self.st
+        val, best, ref = g["val"], g["best"], g["ref"]
+        self._event(stage="val_gate", tag=self.tag, ref=ref, anchor_tag=g["anc_tag"],
+                    look=look, **dec.fields())
+        lk = f" look {look}" if look else ""
+        print(f"  val gate{lk} {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
               f"(val {val:.4f} vs {ref} {best}): {dec.reason}")
         cand = self._cand_pair()
+        trials = int(sum(r["n"] for r in g["b"].values())) if g["b"] else None
         if self._update_frontier(val, accept=dec.accept):
             self.kind.on_accept(self.tag_dir(), self.run_dir, cand)
             st["pair"] = cand.as_dict()
             self._write_best_pair()
-            self._finish("accepted", val=val, prev_best=best, path=dec.path,
-                         val_gate=dec.fields(), pair=cand.as_dict())
-            st["version"] += 1
-            st["try"] = 1
+            self._finish("accepted", val=val, prev_best=best, path=dec.path, look=look,
+                         val_trials=trials, val_gate=dec.fields(), pair=cand.as_dict())
+            fill = self._plan_fill() if self._adaptive() else None
+            if fill:
+                st["val"] = fill
+                return
+            self._finish_accept()
         else:
-            self._finish("val_fail", val=val, best=best, val_gate=dec.fields(),
-                         pair=cand.as_dict())
+            self._finish("val_fail", val=val, best=best, look=look, val_trials=trials,
+                         val_gate=dec.fields(), pair=cand.as_dict())
             st["try"] += 1
+            self._new_iteration()
+
+    def _finish_accept(self) -> None:
+        """After an accept (and its fill): record the best's uniform score, move on."""
+        st = self.st
+        if self._adaptive():
+            b = self._val_pt(self.tag)
+            if b:
+                fr = self._frontier()
+                m = task_mean(b)
+                for key in ("_best", "_anchor"):
+                    if (fr.get(key) or {}).get("candidate") == self.tag:
+                        fr[key]["metric"] = m
+                self.frontier_path.write_text(json.dumps(fr, indent=2))
+                self._write_best_pair()
+                print(f"  {self.tag}: val {m:.4f} over {int(sum(r['n'] for r in b.values()))} "
+                      f"trials (reported score)")
+        st["version"] += 1
+        st["try"] = 1
         self._new_iteration()
 
     # ------------------------------------------------------------- frontier
@@ -775,6 +1046,8 @@ class Loop:
         st = self.st
         if st["stage"] == "round":
             return self._step_round()
+        if st["stage"] == "eval_val" and self._adaptive() and not st.get("job"):
+            return self._step_val()
         job = st["job"]
         if job:
             norm, rc = self.sched.state(job["id"])

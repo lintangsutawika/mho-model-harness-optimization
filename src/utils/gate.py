@@ -141,6 +141,33 @@ def per_task(trials_dir: str | Path, cost_metric: str = "tokens") -> dict[str, d
     return out
 
 
+def per_task_dirs(dirs: list[str | Path], cost_metric: str = "tokens") -> dict[str, dict[str, float]]:
+    """per_task over several eval dirs of the SAME pair (e.g. an adaptive val eval's layers and
+    top-ups), merged per task: means weighted by each dir's trial count."""
+    acc: dict[str, dict[str, float]] = {}
+    for d in dirs:
+        for t, row in per_task(d, cost_metric).items():
+            a = acc.setdefault(t, {"rs": 0.0, "n": 0.0, "cs": 0.0, "nc": 0.0})
+            a["rs"] += row["reward"] * row["n"]
+            a["n"] += row["n"]
+            if "cost" in row:                   # weighted by the dir's trial count
+                a["cs"] += row["cost"] * row["n"]
+                a["nc"] += row["n"]
+    out: dict[str, dict[str, float]] = {}
+    for t, a in acc.items():
+        row = {"reward": a["rs"] / a["n"], "n": a["n"]}
+        if a["nc"]:
+            row["cost"] = a["cs"] / a["nc"]
+        out[t] = row
+    return out
+
+
+def task_mean(pt: dict[str, dict[str, float]]) -> float:
+    """Accuracy as the mean over tasks of per-task means (= the trial mean when every task has
+    the same number of trials; the right one when they do not)."""
+    return sum(r["reward"] for r in pt.values()) / len(pt) if pt else 0.0
+
+
 # --------------------------------------------------------------------------- statistics
 @dataclass(frozen=True)
 class Paired:

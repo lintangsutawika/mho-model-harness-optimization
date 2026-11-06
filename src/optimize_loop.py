@@ -123,6 +123,28 @@ def main(argv: list[str] | None = None) -> None:
                         "before moving to a fresh subset (and a fresh A).",
                    metavar="N")
     _g = GateConfig.env_defaults()
+    p.add_argument("--val-adaptive", action=argparse.BooleanOptionalAction,
+                   default=os.environ.get("MHO_VAL_ADAPTIVE", "1") != "0",
+                   help="adaptive val eval: trials go to the val tasks whose outcome is uncertain "
+                        "(every task >= 1 trial), with a second look (top-up of the candidate AND "
+                        "the best) only for borderline candidates; an accepted best is filled to "
+                        "--trials per task. --no-val-adaptive = uniform --trials on every task. "
+                        "Env: MHO_VAL_ADAPTIVE=0|1.")
+    p.add_argument("--val-budget", type=float, default=float(os.environ.get("MHO_VAL_BUDGET", 0.67)),
+                   help="adaptive look 1: the candidate's val trials as a fraction of the uniform "
+                        "eval (--trials x #val tasks). Env: MHO_VAL_BUDGET.", metavar="F")
+    p.add_argument("--val-topup", type=float, default=float(os.environ.get("MHO_VAL_TOPUP", 0.5)),
+                   help="adaptive look 2 (borderline candidates only): extra trials for the "
+                        "candidate, and the same for the best, as a fraction of the uniform eval. "
+                        "0 = one look at --gate-z. Env: MHO_VAL_TOPUP.", metavar="F")
+    p.add_argument("--val-cap", type=int, default=int(os.environ.get("MHO_VAL_CAP", 10)),
+                   help="max val trials per task per pair after top-ups. Env: MHO_VAL_CAP.",
+                   metavar="K")
+    p.add_argument("--gate-early-z", dest="gate_early_z", type=float,
+                   default=float(os.environ.get("MHO_GATE_EARLY_Z", 2.5)),
+                   help="adaptive val, look 1: accept right away only if t >= this; borderline "
+                        "candidates get look 2, which accepts at --gate-z + 0.05. "
+                        "Env: MHO_GATE_EARLY_Z.")
     p.add_argument("--gate-z", dest="gate_z", type=float, default=_g["z"],
                    help="'better' path of the accept gate, on the train subset (each sibling) and "
                         "on val (the selected one): accept B iff mean_i(B_i - A_i) > z * SE over "
@@ -165,6 +187,7 @@ def main(argv: list[str] | None = None) -> None:
         p.error(f"--propose-sample must be > 0 (got {args.propose_sample})")
     args.ts_repropose_limit = max(1, args.ts_repropose_limit)
     args.proposals = max(1, args.proposals)
+    args.val_cap = max(args.trials, args.val_cap)
     # Fix the run name once so the driver log and the loop agree on the run dir.
     args.run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = RUNS_DIR / args.run_name
