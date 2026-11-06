@@ -133,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
                    help="how a model candidate's rollouts update the weights. grpo: policy "
                         "gradient. rsft: rejection-sampling fine-tuning, an SFT step on the "
                         "successful rollouts only (MHO_RSFT_THRESHOLD [0.5]). lr: MHO_TRAIN_LR "
-                        "[grpo 1e-6, rsft 1e-7]. Env: MHO_MODEL_OBJECTIVE.")
+                        "[1e-6, as in WHALE]. Env: MHO_MODEL_OBJECTIVE.")
     p.add_argument("--model-accept", choices=["gate", "always"],
                    default=os.environ.get("MHO_MODEL_ACCEPT", "gate"),
                    help="gate: a model candidate must pass the val gate. always (WHALE): every "

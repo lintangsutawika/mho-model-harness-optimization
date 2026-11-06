@@ -58,7 +58,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # (WHALE): keep the successful rollouts of each step and take an SFT step on them; see
     # mho/train/objectives.py.
     objective: Literal["grpo", "rsft"] = os.environ.get("MHO_TRAIN_OBJECTIVE", "grpo")  # type: ignore[assignment]
-    # 0 = the objective's default (grpo 1e-6; rsft 1e-7, WHALE's).
+    # 0 = the default, 1e-6 for both objectives (WHALE trains RSFT with its GRPO optimizer, lr 1e-6).
     lr: float = float(os.environ.get("MHO_TRAIN_LR", "0") or 0)
 
     # Harbor settings (see harbor_agent_function.py for what each does)
@@ -147,7 +147,7 @@ def execute(args: ScriptArgs):
         "--use-precision-aware-optimizer "
     )
     objective_args = objective_train_args(args.objective)
-    lr = args.lr or {"grpo": 1e-6, "rsft": 1e-7}[args.objective]
+    lr = args.lr or 1e-6
     optimizer_args = (
         "--optimizer adam "
         f"--lr {lr} "
