@@ -46,7 +46,8 @@ class Kind(ABC):
     # kinds whose build is heavy (model: a training run per sibling).
     parallel: bool = True
     # Does a candidate start with a proposer job? Off for kinds whose candidate is fully
-    # determined by the current pair (rsft: train the current model with the current harness).
+    # determined by the current pair (a model candidate with --model-source sample: train the
+    # current model with the current harness on the task reward).
     # Such a kind skips eval_a (no subset evidence is needed) and starts at its build stage.
     proposes: bool = True
     # Accept every candidate that gets a val score, without the val gate (WHALE's weight

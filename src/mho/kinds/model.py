@@ -1,9 +1,26 @@
-"""Model candidates: the proposer writes model specs (candidates/<tag>/model_specs/*.md: what
-the model should learn); they are realized into sigma-reward configs
-(candidates/<tag>/model/sigma_rewards/*.json), and the build step trains the CURRENT model with
-the current harness on that reward (scripts/optimize/train.sh, Miles). The newest HF checkpoint
-under candidates/<tag>/train/checkpoints/hf/ is the candidate model. It is trained on
---train-data, so it skips eval_b and the train gate and is judged on the val split directly.
+"""Model candidates: train the CURRENT model with the current harness on --train-data
+(scripts/optimize/train.sh, Miles); the newest HF checkpoint under
+candidates/<tag>/train/checkpoints/hf/ is the candidate model. It trained on --train-data, so it
+skips eval_b and the train gate and is judged on the val split directly.
+
+A model candidate is configured on two independent axes:
+
+  source     where the training signal comes from
+    propose  the proposer writes model specs (candidates/<tag>/model_specs/*.md: what the model
+             should learn), realized into sigma-reward configs
+             (candidates/<tag>/model/sigma_rewards/*.json) that the train job stages into the
+             train tasks (MHO_SIGMA_REWARD). Needs the proposer and eval_a's train-sample traces.
+    sample   no proposer: roll out the train tasks and use their own verifier reward (WHALE).
+  objective  how the rollouts update the weights (MHO_TRAIN_OBJECTIVE; mho/train/objectives.py)
+    grpo     policy gradient with group-relative advantages
+    rsft     rejection-sampling fine-tuning: SFT on the successful rollouts only
+
+  accept     gate (the val gate, like every candidate) | always (WHALE keeps every update; its
+             val score is still recorded)
+  steps      rollout+update steps per candidate (NUM_ROLLOUT); None = train.sh's default
+
+    propose x grpo   the sigma method (default)       sample x grpo   RL on the task reward
+    propose x rsft   SFT on sigma-successful rollouts sample x rsft   WHALE's weight update
 """
 from __future__ import annotations
 
@@ -74,6 +91,10 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
     return True, sr_dir
 
 
+SOURCES = ("propose", "sample")
+OBJECTIVES = ("grpo", "rsft")
+
+
 class ModelKind(Kind):
     name = "model"
     build_stage = "train"
@@ -81,9 +102,21 @@ class ModelKind(Kind):
     parallel = False        # one training run at a time
 
     def __init__(self, *, train_data: str, trainer: str, submit_train: Callable[..., str],
-                 realize: Callable[[Path, str], tuple[bool, Path | None]] = realize_model_specs):
+                 realize: Callable[[Path, str], tuple[bool, Path | None]] = realize_model_specs,
+                 source: str = "propose", objective: str = "grpo", accept: str = "gate",
+                 steps: int | None = None):
+        if source not in SOURCES or objective not in OBJECTIVES or accept not in ("gate", "always"):
+            raise ValueError(f"bad model kind config: source={source!r} objective={objective!r} "
+                             f"accept={accept!r}")
         self.train_data, self.trainer = train_data, trainer
         self._submit_train, self._realize = submit_train, realize
+        self.source, self.objective, self.steps = source, objective, steps
+        self.proposes = source == "propose"         # loop: proposer + eval_a, else straight to train
+        self.always_accept = accept == "always"
+
+    def describe(self) -> str:
+        return (f"source={self.source} objective={self.objective} "
+                f"accept={'always' if self.always_accept else 'gate'} steps={self.steps or 'default'}")
 
     @staticmethod
     def sigma_reward(cand_dir: Path) -> Path | None:
@@ -106,11 +139,24 @@ class ModelKind(Kind):
     def submit_build(self, loop: Any, cand_dir: Path, current: Pair, logs: Path) -> str:
         # Train from the CURRENT best model (a rejected checkpoint is never trained on) with the
         # current best harness.
-        return self._submit_train(loop.sched, self.trainer,
-                                  model=current.model or loop.args.model, harness=current.harness,
-                                  out_dir=cand_dir / "train", logs=logs,
-                                  tag=cand_dir.name, sigma_reward=str(self.sigma_reward(cand_dir)),
-                                  train_data=self.train_data)
+        model = current.model or loop.args.model
+        sigma = None
+        if self.proposes:
+            sigma = str(self.sigma_reward(cand_dir))
+        else:
+            # no proposer wrote a CANDIDATE.md: say what this candidate is, for its record
+            cand_dir.mkdir(parents=True, exist_ok=True)
+            (cand_dir / "CANDIDATE.md").write_text(
+                f"# Model update: {self.objective.upper()} on the task reward, "
+                f"{self.steps or 'default'} steps\n\n"
+                f"From model `{model}` with harness `{current.harness or '(base scaffold)'}`: roll "
+                f"out the train tasks with the current weights and "
+                + ("keep the successful trajectories for an SFT step." if self.objective == "rsft"
+                   else "take a GRPO step on their rewards.") + "\n")
+        return self._submit_train(loop.sched, self.trainer, model=model, harness=current.harness,
+                                  out_dir=cand_dir / "train", logs=logs, tag=cand_dir.name,
+                                  sigma_reward=sigma, train_data=self.train_data,
+                                  objective=self.objective, steps=self.steps)
 
     def build_ok(self, cand_dir: Path) -> tuple[bool, str]:
         ok = self.checkpoint(cand_dir) is not None
