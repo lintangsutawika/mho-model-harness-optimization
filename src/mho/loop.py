@@ -14,7 +14,7 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
                 M is told so (MHO_PROPOSE_SIBLING=k/M) to steer it to a different idea
       build   : the kind's job, if any (model: train the current model) [kind.build_stage]
       eval_b  : evaluate the candidate pair on the SAME S                -> ts_B
-                train gate: utils.gate, B vs A paired per task (--gate-train-z)
+                train gate: utils.gate, B vs A paired per task (--gate-z)
                 [only kinds with train_gate: a model candidate was trained on the train data,
                  so it goes from build straight to selection]
       select  : of the siblings that passed, the one with the largest paired t (train gate)
@@ -22,7 +22,7 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
                 val, so the val gate's false-accept rate does not grow with M.
     eval_val: evaluate the selected candidate pair on the val split      -> val
               val gate: utils.gate, vs the current best's val trials, paired per task
-              (--gate-val-z); or the "cheaper" path: not worse by more than
+              (--gate-z, the same test as the train gate); or the "cheaper" path: not worse by more than
               --gate-cheaper-delta (vs the best AND the most accurate accepted, `_anchor`)
               and clearly cheaper (agent output tokens). Without per-task data both gates
               fall back to the plain strict B > A.
@@ -652,7 +652,7 @@ class Loop:
         m["ts_B"] = self._score("eval_b", tag)
         ts_A = st["subset"]["ts_A"]
         dec = decide_dirs(self._out_dir("eval_a"), self._out_dir("eval_b", tag),
-                          z=self.gate_cfg.train_z, cfg=self.gate_cfg, fallback=(ts_A, m["ts_B"]))
+                          z=self.gate_cfg.z, cfg=self.gate_cfg, fallback=(ts_A, m["ts_B"]))
         m["train_gate"] = dec.fields()
         self._event(stage="train_gate", tag=tag, **dec.fields())
         if dec.accept:
@@ -709,7 +709,7 @@ class Loop:
         ref = fr.get("_best", {}).get("candidate")
         anc = (fr.get("_anchor") or fr.get("_best") or {}).get("candidate")
         dec = decide_dirs(self._val_dir(ref) if ref else None, self._out_dir("eval_val"),
-                          z=self.gate_cfg.val_z, cfg=self.gate_cfg,
+                          z=self.gate_cfg.z, cfg=self.gate_cfg,
                           anchor_dir=self._val_dir(anc) if anc else None, fallback=(best, val))
         self._event(stage="val_gate", tag=self.tag, ref=ref, anchor_tag=anc, **dec.fields())
         print(f"  val gate {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "

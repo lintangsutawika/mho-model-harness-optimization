@@ -123,14 +123,11 @@ def main(argv: list[str] | None = None) -> None:
                         "before moving to a fresh subset (and a fresh A).",
                    metavar="N")
     _g = GateConfig.env_defaults()
-    p.add_argument("--gate-train-z", dest="gate_train_z", type=float, default=_g["train_z"],
-                   help="train gate, 'better' path: accept B iff mean_i(B_i - A_i) > z * SE over "
-                        "the subset's tasks (paired; attempts averaged per task). 0 = plain B > A. "
-                        "Env: MHO_GATE_TRAIN_Z.")
-    p.add_argument("--gate-val-z", dest="gate_val_z", type=float, default=_g["val_z"],
-                   help="val gate, 'better' path: same test vs the frontier best's val trials "
-                        "(1.645 = one-sided 95%%). Applies to harness and model candidates. "
-                        "Env: MHO_GATE_VAL_Z.")
+    p.add_argument("--gate-z", dest="gate_z", type=float, default=_g["z"],
+                   help="'better' path of the accept gate, on the train subset (each sibling) and "
+                        "on val (the selected one): accept B iff mean_i(B_i - A_i) > z * SE over "
+                        "tasks (paired; attempts averaged per task). 1.645 = one-sided 95%%; "
+                        "0 = plain B > A. Env: MHO_GATE_Z.")
     p.add_argument("--gate-cheaper-delta", dest="gate_cheaper_delta", type=float,
                    default=_g["cheaper_delta"],
                    help="'cheaper' path (both gates): also accept a candidate whose accuracy is not "

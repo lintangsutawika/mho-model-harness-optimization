@@ -45,8 +45,9 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class GateConfig:
-    train_z: float = 1.0           # better-path z on the train subset (a cheap screen)
-    val_z: float = 1.645           # better-path z on val (one-sided 95%)
+    # better-path z, the SAME on the train subset and on val (one-sided 95%). With M siblings
+    # the one selected is the max-t of M, so a looser train bar mostly passes lucky siblings.
+    z: float = 1.645
     cheaper_delta: float = 0.03    # max accuracy loss tolerated on the cheaper path; 0 = off
     cheaper_z: float = 1.0         # z for the cheaper path (non-inferiority + cost tests)
     cheaper_min_gain: float = 0.10  # min relative cost reduction on the cheaper path
@@ -56,7 +57,7 @@ class GateConfig:
     def from_args(cls, args: Any) -> "GateConfig":
         d = cls()
         return cls(**{f: getattr(args, f"gate_{f}", getattr(d, f)) for f in
-                      ("train_z", "val_z", "cheaper_delta", "cheaper_z", "cheaper_min_gain",
+                      ("z", "cheaper_delta", "cheaper_z", "cheaper_min_gain",
                        "cost_metric")})
 
     @classmethod
@@ -64,8 +65,7 @@ class GateConfig:
         """CLI defaults, overridable from the environment (MHO_GATE_*)."""
         d = cls()
         return {
-            "train_z": _env_float("MHO_GATE_TRAIN_Z", d.train_z),
-            "val_z": _env_float("MHO_GATE_VAL_Z", d.val_z),
+            "z": _env_float("MHO_GATE_Z", d.z),
             "cheaper_delta": _env_float("MHO_GATE_CHEAPER_DELTA", d.cheaper_delta),
             "cheaper_z": _env_float("MHO_GATE_CHEAPER_Z", d.cheaper_z),
             "cheaper_min_gain": _env_float("MHO_GATE_CHEAPER_MIN_GAIN", d.cheaper_min_gain),
