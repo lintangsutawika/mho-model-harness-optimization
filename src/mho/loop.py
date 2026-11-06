@@ -319,6 +319,9 @@ class Loop:
         st = self.st
         st["try"] += 1
         self._reset_candidate()
+        if st["subset"] is None:                  # a kind without eval_a: just start over
+            self._new_iteration()
+            return
         if count_try:
             st["subset"]["tries"] += 1
         if st["subset"]["tries"] >= self.args.ts_repropose_limit:
@@ -423,6 +426,10 @@ class Loop:
             return self._eval(self._cand_pair(tag), data=st["subset"]["dir"],
                               out_dir=self.tag_dir(tag), job_name="eval_after", logs=logs)
         if stage == self.kind.build_stage:
+            if not self.kind.proposes and m["attempt"] == 1:
+                st["propose_count"] += 1          # the budget counts candidates of every kind
+                print(f"  [{st['kind']} {st['propose_count']}/{self.args.iterations}] {tag}",
+                      flush=True)
             return self.kind.submit_build(self, self.tag_dir(tag), self.pair, logs)
         raise AssertionError(f"no submit for sibling stage {stage!r}")
 
@@ -547,8 +554,9 @@ class Loop:
         n = self._round_size()
         base = self.tag
         tags = [base] if n == 1 else [base + chr(ord("a") + k) for k in range(n)]
+        first = "propose" if self.kind.proposes else self.kind.build_stage
         st["round"] = {"members": [
-            {"tag": t, "i": k, "n": n, "stage": "propose", "job": None, "attempt": 1,
+            {"tag": t, "i": k, "n": n, "stage": first, "job": None, "attempt": 1,
              "ts_B": None, "train_gate": None, "status": "running"}
             for k, t in enumerate(tags)]}
         if n > 1:
@@ -732,6 +740,11 @@ class Loop:
 
     def _adaptive(self) -> bool:
         return bool(getattr(self.args, "val_adaptive", False)) and Path(self.args.val_data).is_dir()
+
+    def _val_looks(self) -> bool:
+        """Adaptive val looks for this candidate? Not for an always-accepted kind: there is no
+        decision to make early, and its uniform eval is the reported score."""
+        return self._adaptive() and not (self.st.get("kind") and self.kind.always_accept)
 
     def _val_dirs(self, tag: str) -> list[Path]:
         """Every val eval dir of `tag`: evaluation/<tag> plus its groups / top-ups
@@ -962,15 +975,19 @@ class Loop:
         lk = f" look {look}" if look else ""
         print(f"  val gate{lk} {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
               f"(val {val:.4f} vs {ref} {best}): {dec.reason}")
+        accept, path = dec.accept, dec.path
+        if not accept and self.kind.always_accept:
+            accept, path = True, "always"
+            print(f"  {self.st['kind']} candidates are always accepted (the gate is only recorded)")
         cand = self._cand_pair()
         trials = int(sum(r["n"] for r in g["b"].values())) if g["b"] else None
-        if self._update_frontier(val, accept=dec.accept):
+        if self._update_frontier(val, accept=accept):
             self.kind.on_accept(self.tag_dir(), self.run_dir, cand)
             st["pair"] = cand.as_dict()
             self._write_best_pair()
-            self._finish("accepted", val=val, prev_best=best, path=dec.path, look=look,
+            self._finish("accepted", val=val, prev_best=best, path=path, look=look,
                          val_trials=trials, val_gate=dec.fields(), pair=cand.as_dict())
-            fill = self._plan_fill() if self._adaptive() else None
+            fill = self._plan_fill() if self._val_looks() else None
             if fill:
                 st["val"] = fill
                 return
@@ -1046,7 +1063,7 @@ class Loop:
         st = self.st
         if st["stage"] == "round":
             return self._step_round()
-        if st["stage"] == "eval_val" and self._adaptive() and not st.get("job"):
+        if st["stage"] == "eval_val" and self._val_looks() and not st.get("job"):
             return self._step_val()
         job = st["job"]
         if job:
@@ -1063,6 +1080,11 @@ class Loop:
         # a candidate already proposed always runs to its terminal outcome.
         if st["stage"] == "eval_a" and not self._budget_left():
             return False
+        if st["stage"] == "eval_a" and not self.kinds[self._scheduled_kind()].proposes:
+            # nothing to propose from: no subset / A traces needed, go straight to the build
+            self._goto("round")
+            self._save()
+            return True
         print(f"{_now()} iter {st['iteration']} {st['stage']} {self.tag} -> submit"
               + (f" (attempt {st['attempt']})" if st["attempt"] > 1 else ""))
         jid = self._submit()

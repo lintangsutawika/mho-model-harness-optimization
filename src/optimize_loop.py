@@ -12,6 +12,8 @@ kinds:
     harness-only  : harness candidates (fixed model)
     model-only    : model candidates (fixed harness)
     model-harness : --harness-proposals harness, then --model-proposals model, repeating
+    rsft-only     : RSFT phases only (weight-only rejection-sampling fine-tuning, no proposer)
+    harness-rsft  : --harness-proposals harness, then one RSFT phase, repeating (WHALE)
 
 Data: --train-data is the local train task dir (each iteration evaluates a fresh random
 --propose-sample subset of it: the proposer's evidence and the train gate), --val-data the
@@ -30,7 +32,7 @@ from pathlib import Path
 from mho.jobs import (AGENT_IMPORT, EVAL_SCRIPT, LOG_VERBOSE, POLL_SECONDS,  # noqa: F401
                       PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_hold,
                       submit_propose, submit_train)
-from mho.kinds import HarnessKind, ModelKind
+from mho.kinds import HarnessKind, ModelKind, RSFTKind
 from mho.loop import Loop
 from utils.gate import GateConfig
 
@@ -42,7 +44,9 @@ def schedule_for(args: argparse.Namespace) -> list[tuple[str, int]]:
     return {"harness-only": [("harness", 1)],
             "model-only": [("model", 1)],
             "model-harness": [("harness", max(1, args.harness_proposals)),
-                              ("model", max(1, args.model_proposals))]}[args.mode]
+                              ("model", max(1, args.model_proposals))],
+            "rsft-only": [("rsft", 1)],
+            "harness-rsft": [("harness", max(1, args.harness_proposals)), ("rsft", 1)]}[args.mode]
 
 
 class _Tee:
@@ -80,7 +84,8 @@ def _tee_driver_log(path: Path) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--mode", choices=["model-only", "harness-only", "model-harness"],
+    p.add_argument("--mode", choices=["model-only", "harness-only", "model-harness",
+                                      "rsft-only", "harness-rsft"],
                    default="model-harness")
 
     p.add_argument("--trainer", choices=["miles"], default="miles",
@@ -117,6 +122,18 @@ def main(argv: list[str] | None = None) -> None:
                         "parent, same train subset); the best one that passes the train gate "
                         "goes to val. Kinds that are not parallel (model) always use 1. "
                         "Env: MHO_PROPOSALS.", metavar="M")
+    p.add_argument("--rsft-steps", type=int, default=int(os.environ.get("MHO_RSFT_STEPS", 10)),
+                   help="rsft modes: RSFT steps per phase (one step = roll out a batch of train "
+                        "prompts with the current weights + harness, keep the successful "
+                        "trajectories, one SFT update). Batch shape and lr come from the env "
+                        "(TRAIN_BATCH_SIZE prompts x N_SAMPLES_PER_PROMPT, GLOBAL_BATCH_SIZE, "
+                        "MHO_TRAIN_LR [1e-7], MHO_RSFT_THRESHOLD [0.5]). Each phase is one "
+                        "--iterations unit and is evaluated on val. Env: MHO_RSFT_STEPS.")
+    p.add_argument("--rsft-accept", choices=["always", "gate"],
+                   default=os.environ.get("MHO_RSFT_ACCEPT", "always"),
+                   help="always (WHALE): every RSFT phase becomes the current model (its val score "
+                        "is still recorded); gate: it must pass the val gate like any candidate. "
+                        "Env: MHO_RSFT_ACCEPT.")
     p.add_argument("--ts-repropose-limit", type=int,
                    default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 2)),
                    help="Rounds on the same train subset with no sibling passing the train gate "
@@ -194,6 +211,9 @@ def main(argv: list[str] | None = None) -> None:
     _tee_driver_log(run_dir / "logs" / "run.out")
     try:
         kinds = {"harness": HarnessKind(),
+                 "rsft": RSFTKind(train_data=args.train_data, trainer=args.trainer,
+                                  submit_train=submit_train, steps=args.rsft_steps,
+                                  always_accept=args.rsft_accept == "always"),
                  "model": ModelKind(train_data=args.train_data, trainer=args.trainer,
                                     submit_train=submit_train)}
         Loop(args, run_dir, Scheduler(), kinds=kinds, schedule=schedule_for(args),

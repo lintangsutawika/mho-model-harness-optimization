@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mho.kinds import HarnessKind, ModelKind  # noqa: E402
+from mho.kinds import HarnessKind, ModelKind, RSFTKind  # noqa: E402
 from mho.loop import Loop, LoopAbort  # noqa: E402
 from utils.scores import metric_of  # noqa: E402
 
@@ -104,10 +104,11 @@ class Fake:
         return self._job()
 
     def submit_train(self, sched, trainer, *, model, harness, out_dir, logs, tag,
-                     sigma_reward=None, train_data=None):
+                     sigma_reward=None, train_data=None, objective=None, steps=None):
         ok = self.trains(tag)
         self.calls.append({"stage": "train", "tag": tag, "model": model, "harness": harness,
-                           "sigma": sigma_reward, "ok": ok, "log": logs})
+                           "sigma": sigma_reward, "ok": ok, "log": logs,
+                           "objective": objective, "steps": steps})
         if ok:
             ck = Path(out_dir) / "checkpoints" / "hf" / "step_7"
             ck.mkdir(parents=True, exist_ok=True)
@@ -130,7 +131,7 @@ def fake_realize(cand_dir, train_data):
 
 def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pending=0,
          fresh=False, fake=None, schedule=(("harness", 1),), trains=lambda t: True,
-         proposals=1):
+         proposals=1, rsft_accept=True):
     train = tmp_path / "train"
     for i in range(20):
         (train / f"p{i}").mkdir(parents=True, exist_ok=True)
@@ -142,7 +143,10 @@ def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pen
     fake = fake or Fake(run_dir, evals, proposes, pending, trains)
     kinds = {"harness": HarnessKind(),
              "model": ModelKind(train_data=str(train), trainer="miles",
-                                submit_train=fake.submit_train, realize=fake_realize)}
+                                submit_train=fake.submit_train, realize=fake_realize),
+             "rsft": RSFTKind(train_data=str(train), trainer="miles",
+                              submit_train=fake.submit_train, steps=5,
+                              always_accept=rsft_accept)}
     loop = Loop(args, run_dir, fake, kinds=kinds, schedule=list(schedule),
                 submit_eval=fake.submit_eval, submit_propose=fake.submit_propose,
                 submit_hold=fake.submit_hold,
@@ -647,3 +651,55 @@ def test_sibling_note_gives_each_sibling_its_own_focus():
     for k, n in enumerate(notes):
         assert f"proposal {k + 1} of 4" in n and SIBLING_FOCUS[k] in n
         assert f"candidate_1_0_1{'abcd'[k]}/" in n
+
+
+# --------------------------------------------------------------------------- rsft
+def test_rsft_only_chains_phases_without_proposer_or_eval_a(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.55, 0.52], a=[], b=[]), iterations=2,
+                      schedule=[("rsft", 1)])
+    loop.run()
+    assert [c["stage"] for c in fake.calls] == ["val", "train", "val", "train", "val"]
+    trains = [c for c in fake.calls if c["stage"] == "train"]
+    assert [(c["objective"], c["steps"]) for c in trains] == [("rsft", 5), ("rsft", 5)]
+    assert trains[0]["model"] == "m"
+    # phase 2 continues from phase 1's checkpoint
+    assert trains[1]["model"].endswith("candidate_1_0_1/train/checkpoints/hf/step_7")
+    rows = summary(loop)[1:]
+    assert [(r["candidate"], r["outcome"], r["path"]) for r in rows] == [
+        ("candidate_1_0_1", "accepted", "better"),
+        ("candidate_2_1_1", "accepted", "always")]     # 0.52 < 0.55: kept anyway (WHALE)
+    assert rows[0]["hypothesis"].startswith("# RSFT phase: 5")
+    assert loop.st["propose_count"] == 2
+    assert loop.st["pair"]["model"].endswith("candidate_2_1_1/train/checkpoints/hf/step_7")
+
+
+def test_rsft_gate_mode_rejects_a_worse_phase(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.45], a=[], b=[]), iterations=1,
+                      schedule=[("rsft", 1)], rsft_accept=False)
+    loop.run()
+    assert summary(loop)[-1]["outcome"] == "val_fail"
+    assert loop.st["pair"]["model"] is None
+
+
+def test_harness_rsft_alternates_and_trains_with_the_current_harness(tmp_path):
+    def plan(stage, harness, n):
+        return {"val": [0.5, 0.6, 0.55, 0.62], "eval_a": [0.3, 0.3],
+                "eval_b": [0.5, 0.5]}[stage][n]
+    loop, fake = make(tmp_path, plan, iterations=3, schedule=[("harness", 2), ("rsft", 1)])
+    loop.run()
+    seq = [(c["stage"], c.get("tag")) for c in fake.calls if c["stage"] in ("propose", "train")]
+    assert seq == [("propose", "candidate_1_0_1"), ("propose", "candidate_2_1_1"),
+                   ("train", "candidate_3_1_2")]
+    # 2_1_1 failed val, so the phase trains with the BEST harness (1_0_1)
+    train = next(c for c in fake.calls if c["stage"] == "train")
+    assert train["harness"].endswith("candidate_1_0_1/harness") and train["objective"] == "rsft"
+    # no eval_a for the rsft phase
+    assert [c["stage"] for c in fake.calls].count("eval_a") == 2
+
+
+def test_rsft_phase_that_fails_to_train_moves_on(tmp_path):
+    loop, fake = make(tmp_path, scripted(val=[0.5, 0.6], a=[], b=[]), iterations=2,
+                      schedule=[("rsft", 1)], trains=lambda t: t != "candidate_1_0_1")
+    loop.run()
+    rows = summary(loop)[1:]
+    assert [r["outcome"] for r in rows] == ["build_fail", "accepted"]

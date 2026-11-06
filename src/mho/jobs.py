@@ -203,8 +203,16 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
 
 def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: str | None,
                  out_dir: Path, logs: Path, tag: str,
-                 sigma_reward: str | None = None, train_data: str | None = None) -> str:
+                 sigma_reward: str | None = None, train_data: str | None = None,
+                 objective: str | None = None, steps: int | None = None) -> str:
+    """One training run (scripts/optimize/train.sh) from `model` with `harness`. `objective`
+    (MHO_TRAIN_OBJECTIVE: grpo | rsft) and `steps` (NUM_ROLLOUT: rollout+update steps) default
+    to the training script's own defaults when None."""
     extra = {"MHO_TRAINER": trainer, "MHO_OUT": str(out_dir)}
+    if objective:
+        extra["MHO_TRAIN_OBJECTIVE"] = objective
+    if steps:
+        extra["NUM_ROLLOUT"] = str(steps)
     if model:
         extra["MHO_MODEL"] = model
     if harness:
