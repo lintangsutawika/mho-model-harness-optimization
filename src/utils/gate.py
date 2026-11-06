@@ -45,8 +45,9 @@ def _env_float(name: str, default: float) -> float:
 
 @dataclass(frozen=True)
 class GateConfig:
-    train_z: float = 1.0           # better-path z on the train subset (a cheap screen)
-    val_z: float = 1.645           # better-path z on val (one-sided 95%)
+    # better-path z, the SAME on the train subset and on val (one-sided 95%). With M siblings
+    # the one selected is the max-t of M, so a looser train bar mostly passes lucky siblings.
+    z: float = 1.645
     cheaper_delta: float = 0.03    # max accuracy loss tolerated on the cheaper path; 0 = off
     cheaper_z: float = 1.0         # z for the cheaper path (non-inferiority + cost tests)
     cheaper_min_gain: float = 0.10  # min relative cost reduction on the cheaper path
@@ -56,7 +57,7 @@ class GateConfig:
     def from_args(cls, args: Any) -> "GateConfig":
         d = cls()
         return cls(**{f: getattr(args, f"gate_{f}", getattr(d, f)) for f in
-                      ("train_z", "val_z", "cheaper_delta", "cheaper_z", "cheaper_min_gain",
+                      ("z", "cheaper_delta", "cheaper_z", "cheaper_min_gain",
                        "cost_metric")})
 
     @classmethod
@@ -64,8 +65,7 @@ class GateConfig:
         """CLI defaults, overridable from the environment (MHO_GATE_*)."""
         d = cls()
         return {
-            "train_z": _env_float("MHO_GATE_TRAIN_Z", d.train_z),
-            "val_z": _env_float("MHO_GATE_VAL_Z", d.val_z),
+            "z": _env_float("MHO_GATE_Z", d.z),
             "cheaper_delta": _env_float("MHO_GATE_CHEAPER_DELTA", d.cheaper_delta),
             "cheaper_z": _env_float("MHO_GATE_CHEAPER_Z", d.cheaper_z),
             "cheaper_min_gain": _env_float("MHO_GATE_CHEAPER_MIN_GAIN", d.cheaper_min_gain),
@@ -139,6 +139,33 @@ def per_task(trials_dir: str | Path, cost_metric: str = "tokens") -> dict[str, d
             row["cost"] = sum(costs[t]) / len(costs[t])
         out[t] = row
     return out
+
+
+def per_task_dirs(dirs: list[str | Path], cost_metric: str = "tokens") -> dict[str, dict[str, float]]:
+    """per_task over several eval dirs of the SAME pair (e.g. an adaptive val eval's layers and
+    top-ups), merged per task: means weighted by each dir's trial count."""
+    acc: dict[str, dict[str, float]] = {}
+    for d in dirs:
+        for t, row in per_task(d, cost_metric).items():
+            a = acc.setdefault(t, {"rs": 0.0, "n": 0.0, "cs": 0.0, "nc": 0.0})
+            a["rs"] += row["reward"] * row["n"]
+            a["n"] += row["n"]
+            if "cost" in row:                   # weighted by the dir's trial count
+                a["cs"] += row["cost"] * row["n"]
+                a["nc"] += row["n"]
+    out: dict[str, dict[str, float]] = {}
+    for t, a in acc.items():
+        row = {"reward": a["rs"] / a["n"], "n": a["n"]}
+        if a["nc"]:
+            row["cost"] = a["cs"] / a["nc"]
+        out[t] = row
+    return out
+
+
+def task_mean(pt: dict[str, dict[str, float]]) -> float:
+    """Accuracy as the mean over tasks of per-task means (= the trial mean when every task has
+    the same number of trials; the right one when they do not)."""
+    return sum(r["reward"] for r in pt.values()) / len(pt) if pt else 0.0
 
 
 # --------------------------------------------------------------------------- statistics

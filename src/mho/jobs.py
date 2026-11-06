@@ -220,7 +220,7 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
 
 
 def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
-                   kind: str = "harness") -> str | None:
+                   kind: str = "harness", sibling: tuple[int, int] = (1, 1)) -> str | None:
     import os as _os
     if _os.environ.get("MHO_LOOP_DEBUG"):
         print(f"  [DBG submit_propose] tag={tag} kind={kind} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
@@ -237,6 +237,9 @@ def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
         "MHO_RUN_DIR": str(run_root),
         "MHO_TAG": tag,
         "MHO_PROPOSE_KIND": kind,
+        # k/M: this is proposal k of M written in parallel from the same evidence
+        # (mho.optimizer.agent steers each sibling to a different idea).
+        "MHO_PROPOSE_SIBLING": f"{sibling[0]}/{sibling[1]}",
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))

@@ -222,11 +222,40 @@ def _emit_diffs(dst: Path, paths: dict[str, Path]) -> None:
     _write_diff(paths["parent"], dst, diff_dir / "diff_from_parent.patch")
 
 
-def _build_instructions(instructions_md: Path) -> str:
+def _build_instructions(instructions_md: Path, sibling_note: str = "") -> str:
     """The full proposer message, read verbatim from the kind's instructions.md. Prior results
     are MOUNTED under eval_prior/ in the workspace (see _stage_prior_results), so the message
     only points the agent at them -- nothing is inlined here."""
-    return instructions_md.read_text() if instructions_md.exists() else ""
+    text = instructions_md.read_text() if instructions_md.exists() else ""
+    return text + sibling_note
+
+
+# One direction per sibling (the loop runs --proposals siblings from the same evidence; without
+# this they tend to make the same edit). Cycled when there are more siblings than directions.
+SIBLING_FOCUS = (
+    "the single most frequent failure mode in the trials",
+    "a failure mode OTHER than the most frequent one (the obvious fix is covered by a sibling)",
+    "efficiency: the same accuracy with fewer wasted turns / output tokens (e.g. stop earlier "
+    "when the answer is settled, avoid repeated or redundant steps)",
+    "a larger change to the scaffold's strategy (how it plans, checks its work, or decides "
+    "when it is done) rather than a local fix",
+)
+
+
+def sibling_note(tag: str, sibling: str) -> str:
+    """Extra instructions for sibling k of M (MHO_PROPOSE_SIBLING="k/M"); "" when M == 1."""
+    try:
+        k, m = (int(x) for x in sibling.split("/"))
+    except ValueError:
+        return ""
+    if m <= 1:
+        return ""
+    focus = SIBLING_FOCUS[(k - 1) % len(SIBLING_FOCUS)]
+    return (f"\n\n## Parallel proposals\nThis is proposal {k} of {m} written at the same time "
+            f"from the same evidence; the best one that improves on the train sample is kept. "
+            f"Make yours DIFFERENT from what the others are likely to try. Your focus: {focus}.\n"
+            f"The sibling candidates (same tag with another letter) are being written right now: "
+            f"do not read or copy them. Write only under {tag}/.\n")
 
 
 def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
@@ -318,7 +347,11 @@ def main() -> int:
     cand_unit.mkdir(parents=True, exist_ok=True)
     if kind == "harness":
         _materialize_from(parent, harness_dst)    # accumulate: build on the frontier-best
-    _run_openhands(cand_root, _build_instructions(_instructions_md(kind)), _skill_dir(kind))
+    note = sibling_note(tag, os.environ.get("MHO_PROPOSE_SIBLING", "1/1"))
+    if note:
+        print(f"[propose] sibling {os.environ.get('MHO_PROPOSE_SIBLING')}: "
+              f"{note.split('Your focus: ')[1].splitlines()[0]}", flush=True)
+    _run_openhands(cand_root, _build_instructions(_instructions_md(kind), note), _skill_dir(kind))
 
     if kind == "model":
         from mho.optimizer import model_spec

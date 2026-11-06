@@ -27,9 +27,10 @@ The harness snapshot (`harness/`) is read-only reference for you; do not edit it
 ## Prior results
 Prior eval results are mounted under `eval_prior/` -- read them directly with the file editor
 (trajectories first) to identify the single most promising model-side failure mode.
-NOTE: you see only the training-sample eval (eval_prior/trials). The validation set is
-deliberately NOT shown to you -- it is the held-out accept/reject gate. Do NOT attempt to
-reconstruct or infer val results.
+NOTE on val: you see each candidate's val SCORE (summary / status / frontier) -- that is the
+signal of which ideas actually held up and were accepted. You do NOT see val tasks or traces:
+the only execution traces are the train-sample ones. Do not look for val traces outside your
+workspace, and do not tune toward the val split; specify capabilities that help on unseen tasks.
 
 Now: analyze the trajectories, identify the single most-predictive model-side failure
 mode, state ONE falsifiable hypothesis, and write exactly ONE model spec under `model_specs/`

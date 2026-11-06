@@ -42,12 +42,15 @@ class Kind(ABC):
     # Run eval_b + the train gate on the train subset before val? Off for kinds whose candidate
     # has seen the train data (a model trained on it), where that comparison is meaningless.
     train_gate: bool = True
+    # May the loop run several sibling candidates of this kind at once (--proposals)? Off for
+    # kinds whose build is heavy (model: a training run per sibling).
+    parallel: bool = True
 
     @abstractmethod
     def proposal_ok(self, cand_dir: Path) -> tuple[bool, str]:
         """After the propose job: did it produce a usable proposal? (ok, reason-if-not)."""
 
-    def submit_build(self, loop: Any, cand_dir: Path, current: Pair) -> str:
+    def submit_build(self, loop: Any, cand_dir: Path, current: Pair, logs: Path) -> str:
         raise NotImplementedError(f"{self.name} has no build stage")
 
     def build_ok(self, cand_dir: Path) -> tuple[bool, str]:
