@@ -73,6 +73,13 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 # AGENT_MODEL_NAME and defaults to a bogus "model"; without this the trial's agent config has
 # model_name="openai/model" and the agent makes zero model calls (No model calls recorded).
 export AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-${MODEL_KEY}}"
+# RSFT defaults follow WHALE: 256 prompts x 8 rollouts per step, SFT minibatches of 64 kept
+# trajectories (GLOBAL_BATCH_SIZE). Explicit env values win for either objective.
+if [ "${MHO_TRAIN_OBJECTIVE:-grpo}" = "rsft" ]; then
+  TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+  N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+  GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+fi
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-500}"
 N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"

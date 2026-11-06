@@ -19,7 +19,7 @@ from typing import Literal
 import typer
 from launch_common import agentic_pythonpath_dirs, agentic_train_args, harbor_env_vars
 # per-objective loss / filter flags (mho is on PYTHONPATH: train.sh adds <repo>/src)
-from mho.train.objectives import objective_group_filter, objective_train_args
+from mho.train.objectives import objective_group_filter, objective_train_args, rollout_temperature
 
 import miles.utils.external_utils.command_utils as U
 
@@ -126,7 +126,7 @@ def execute(args: ScriptArgs):
         f"--num-rollout {args.num_rollout} "
         f"--rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        "--rollout-temperature 0.8 "
+        f"--rollout-temperature {rollout_temperature(args.objective)} "
         "--rollout-max-response-len 8192 "
         f"--max-seq-len {args.max_seq_len} "
         f"--global-batch-size {args.global_batch_size} "
@@ -210,7 +210,8 @@ def execute(args: ScriptArgs):
     for var in ("MHO_RSFT_THRESHOLD", "MHO_RSFT_GROUP_FILTER"):
         if os.environ.get(var):
             extra_env_vars[var] = os.environ[var]
-    print(f"[run_training] objective={args.objective} lr={lr}", flush=True)
+    print(f"[run_training] objective={args.objective} lr={lr} "
+          f"temperature={rollout_temperature(args.objective)}", flush=True)
 
     U.execute_train(
         train_args=train_args,
