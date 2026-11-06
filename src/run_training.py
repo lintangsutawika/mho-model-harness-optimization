@@ -18,8 +18,8 @@ from typing import Literal
 
 import typer
 from launch_common import agentic_pythonpath_dirs, agentic_train_args, harbor_env_vars
-# objective flags live with the RSFT filters (mho is on PYTHONPATH: train.sh adds <repo>/src)
-from mho.train.rsft import objective_group_filter, objective_train_args
+# per-objective loss / filter flags (mho is on PYTHONPATH: train.sh adds <repo>/src)
+from mho.train.objectives import objective_group_filter, objective_train_args
 
 import miles.utils.external_utils.command_utils as U
 
@@ -56,7 +56,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Training objective (MHO_TRAIN_OBJECTIVE). grpo: policy gradient with group-relative
     # advantages (the sigma-reward model candidates). rsft: rejection-sampling fine-tuning
     # (WHALE): keep the successful rollouts of each step and take an SFT step on them; see
-    # mho/train/rsft.py for the filters.
+    # mho/train/objectives.py.
     objective: Literal["grpo", "rsft"] = os.environ.get("MHO_TRAIN_OBJECTIVE", "grpo")  # type: ignore[assignment]
     # 0 = the objective's default (grpo 1e-6; rsft 1e-7, WHALE's).
     lr: float = float(os.environ.get("MHO_TRAIN_LR", "0") or 0)

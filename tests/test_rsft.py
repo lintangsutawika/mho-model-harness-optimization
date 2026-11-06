@@ -1,4 +1,4 @@
-"""mho.train.rsft: the RSFT filters Miles calls, and the objective flags for the launcher."""
+"""mho.train.rsft (the RSFT filters Miles calls) and mho.train.objectives (the launcher flags)."""
 from __future__ import annotations
 
 import sys
@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mho.train import rsft  # noqa: E402
+from mho.train import objectives, rsft  # noqa: E402
 
 
 class S:
@@ -43,23 +43,23 @@ def test_reward_dicts_and_plain_rewards():
 
 
 AGENT = ("--custom-rm-path generate.reward_func --dynamic-sampling-filter-path "
-         f"{rsft.GRPO_GROUP_FILTER} --tito-model qwen35 ")
+         f"{objectives.GRPO_GROUP_FILTER} --tito-model qwen35 ")
 
 
 def test_objective_flags():
-    g = rsft.objective_train_args("grpo")
+    g = objectives.objective_train_args("grpo")
     assert "--advantage-estimator grpo" in g and "--use-kl-loss" in g
-    r = rsft.objective_train_args("rsft")
+    r = objectives.objective_train_args("rsft")
     assert "--loss-type sft_loss" in r and "--disable-compute-advantages-and-returns" in r
-    assert f"--rollout-sample-filter-path {rsft.RSFT_SAMPLE_FILTER}" in r and "kl" not in r
+    assert f"--rollout-sample-filter-path {objectives.RSFT_SAMPLE_FILTER}" in r and "kl" not in r
     with pytest.raises(ValueError):
-        rsft.objective_train_args("ppo")
+        objectives.objective_train_args("ppo")
 
 
 def test_group_filter_swap(monkeypatch):
-    assert rsft.objective_group_filter(AGENT, "grpo") == AGENT
-    out = rsft.objective_group_filter(AGENT, "rsft")
-    assert rsft.GRPO_GROUP_FILTER not in out and rsft.RSFT_GROUP_FILTER in out
+    assert objectives.objective_group_filter(AGENT, "grpo") == AGENT
+    out = objectives.objective_group_filter(AGENT, "rsft")
+    assert objectives.GRPO_GROUP_FILTER not in out and objectives.RSFT_GROUP_FILTER in out
     monkeypatch.setenv("MHO_RSFT_GROUP_FILTER", "none")
-    out = rsft.objective_group_filter(AGENT, "rsft")
+    out = objectives.objective_group_filter(AGENT, "rsft")
     assert "--dynamic-sampling-filter-path" not in out and "--tito-model qwen35" in out
