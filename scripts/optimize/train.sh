@@ -73,10 +73,21 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 # AGENT_MODEL_NAME and defaults to a bogus "model"; without this the trial's agent config has
 # model_name="openai/model" and the agent makes zero model calls (No model calls recorded).
 export AGENT_MODEL_NAME="${AGENT_MODEL_NAME:-${MODEL_KEY}}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+# Batch shape follows WHALE's verl script for both objectives, so they compare at matched
+# rollouts: 8 rollouts per prompt, updates in minibatches of 64 trajectories
+# (GLOBAL_BATCH_SIZE), lr 1e-6, temperature 1.0 (mho/train/objectives.py).
+#   rsft: 256 prompts per step (WHALE's RSFT batch); SFT on the kept ones only.
+#   grpo:  64 prompts per step (WHALE's GRPO script default); groups without reward variance
+#          are resampled, so a step can generate more than 64 x 8 rollouts.
+# A 0.2-epoch phase on a ~2.4k-task train split is then ~2 rsft steps or ~8 grpo steps
+# (~4k rollouts each). Explicit env values win.
+if [ "${MHO_TRAIN_OBJECTIVE:-grpo}" = "rsft" ]; then
+  TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+fi
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-500}"
-N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-32}"
+N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 EPOCHS="${EPOCHS:-1}"
 LR="${LR:-1e-6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-4096}"

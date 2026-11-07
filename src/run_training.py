@@ -18,6 +18,8 @@ from typing import Literal
 
 import typer
 from launch_common import agentic_pythonpath_dirs, agentic_train_args, harbor_env_vars
+# per-objective loss / filter flags (mho is on PYTHONPATH: train.sh adds <repo>/src)
+from mho.train.objectives import objective_group_filter, objective_train_args, rollout_temperature
 
 import miles.utils.external_utils.command_utils as U
 
@@ -50,6 +52,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # the rollout id, e.g. ".../hf/step_{}" -> .../hf/step_100. Empty = no HF save.
     save_hf: str = os.environ.get("MILES_SAVE_HF", "")
     save_traces_dir: str = ""
+
+    # Training objective (MHO_TRAIN_OBJECTIVE). grpo: policy gradient with group-relative
+    # advantages (the sigma-reward model candidates). rsft: rejection-sampling fine-tuning
+    # (WHALE): keep the successful rollouts of each step and take an SFT step on them; see
+    # mho/train/objectives.py.
+    objective: Literal["grpo", "rsft"] = os.environ.get("MHO_TRAIN_OBJECTIVE", "grpo")  # type: ignore[assignment]
+    # 0 = the default, 1e-6 for both objectives (WHALE trains RSFT with its GRPO optimizer, lr 1e-6).
+    lr: float = float(os.environ.get("MHO_TRAIN_LR", "0") or 0)
 
     # Harbor settings (see harbor_agent_function.py for what each does)
     harbor_env_type: str = os.environ.get("HARBOR_ENV_TYPE", "")
@@ -116,7 +126,7 @@ def execute(args: ScriptArgs):
         f"--num-rollout {args.num_rollout} "
         f"--rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
-        "--rollout-temperature 0.8 "
+        f"--rollout-temperature {rollout_temperature(args.objective)} "
         "--rollout-max-response-len 8192 "
         f"--max-seq-len {args.max_seq_len} "
         f"--global-batch-size {args.global_batch_size} "
@@ -136,18 +146,11 @@ def execute(args: ScriptArgs):
         "--overlap-cpu-optimizer-d2h-h2d "
         "--use-precision-aware-optimizer "
     )
-    grpo_args = (
-        "--advantage-estimator grpo "
-        "--use-kl-loss "
-        "--kl-loss-coef 0.01 "
-        "--kl-loss-type low_var_kl "
-        "--entropy-coef 0.0 "
-        "--eps-clip 0.2 "
-        "--eps-clip-high 0.28 "
-    )
+    objective_args = objective_train_args(args.objective)
+    lr = args.lr or 1e-6
     optimizer_args = (
         "--optimizer adam "
-        "--lr 1e-6 "
+        f"--lr {lr} "
         "--lr-decay-style constant "
         "--weight-decay 0.1 "
         "--adam-beta1 0.9 "
@@ -173,6 +176,7 @@ def execute(args: ScriptArgs):
         "--custom-agent-function-path harbor_agent_function.run",
         "--custom-agent-function-path mho.backends.local_singularity.backend.run",
     )
+    agent_args = objective_group_filter(agent_args, args.objective)
     misc_args = (
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
@@ -192,7 +196,7 @@ def execute(args: ScriptArgs):
             wandb_args += f"--wandb-team {args.wandb_team} "
 
     train_args = (
-        f"{ckpt_args}{rollout_args}{optimizer_args}{grpo_args}{wandb_args}{trace_args}"
+        f"{ckpt_args}{rollout_args}{optimizer_args}{objective_args}{wandb_args}{trace_args}"
         f"{perf_args}{sglang_args}{agent_args}{misc_args}{debug_args}"
     )
 
@@ -202,6 +206,12 @@ def execute(args: ScriptArgs):
     }
     if args.miles_host_ip:
         extra_env_vars["MILES_HOST_IP"] = args.miles_host_ip
+    # the RSFT filters run in the rollout workers and read their knobs from the env
+    for var in ("MHO_RSFT_THRESHOLD", "MHO_RSFT_GROUP_FILTER"):
+        if os.environ.get(var):
+            extra_env_vars[var] = os.environ[var]
+    print(f"[run_training] objective={args.objective} lr={lr} "
+          f"temperature={rollout_temperature(args.objective)}", flush=True)
 
     U.execute_train(
         train_args=train_args,

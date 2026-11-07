@@ -13,6 +13,11 @@ kinds:
     model-only    : model candidates (fixed harness)
     model-harness : --harness-proposals harness, then --model-proposals model, repeating
 
+Model candidates are configured by --model-source (propose: the sigma proposer | sample: the
+task reward, no proposer) x --model-objective (grpo | rsft), plus --model-accept and
+--model-steps (mho/kinds/model.py). E.g. WHALE = --mode model-harness --model-source sample
+--model-objective rsft --model-accept always.
+
 Data: --train-data is the local train task dir (each iteration evaluates a fresh random
 --propose-sample subset of it: the proposer's evidence and the train gate), --val-data the
 held-out val split (the accept gate).
@@ -117,6 +122,29 @@ def main(argv: list[str] | None = None) -> None:
                         "parent, same train subset); the best one that passes the train gate "
                         "goes to val. Kinds that are not parallel (model) always use 1. "
                         "Env: MHO_PROPOSALS.", metavar="M")
+    p.add_argument("--model-source", choices=["propose", "sample"],
+                   default=os.environ.get("MHO_MODEL_SOURCE", "propose"),
+                   help="model candidates' training signal. propose: the proposer writes model "
+                        "specs, realized into sigma rewards for the train tasks. sample: no "
+                        "proposer; the train tasks' own verifier reward (WHALE). "
+                        "Env: MHO_MODEL_SOURCE.")
+    p.add_argument("--model-objective", choices=["grpo", "rsft"],
+                   default=os.environ.get("MHO_MODEL_OBJECTIVE", "grpo"),
+                   help="how a model candidate's rollouts update the weights. grpo: policy "
+                        "gradient. rsft: rejection-sampling fine-tuning, an SFT step on the "
+                        "successful rollouts only (MHO_RSFT_THRESHOLD [0.5]). lr: MHO_TRAIN_LR "
+                        "[1e-6, as in WHALE]. Env: MHO_MODEL_OBJECTIVE.")
+    p.add_argument("--model-accept", choices=["gate", "always"],
+                   default=os.environ.get("MHO_MODEL_ACCEPT", "gate"),
+                   help="gate: a model candidate must pass the val gate. always (WHALE): every "
+                        "candidate that produces a checkpoint becomes the current model (its val "
+                        "score is still recorded). Env: MHO_MODEL_ACCEPT.")
+    p.add_argument("--model-steps", type=int,
+                   default=int(os.environ.get("MHO_MODEL_STEPS", 0)) or None,
+                   help="rollout+update steps per model candidate (NUM_ROLLOUT; one step = a "
+                        "batch of TRAIN_BATCH_SIZE prompts x N_SAMPLES_PER_PROMPT rollouts, "
+                        "GLOBAL_BATCH_SIZE per update). Default: train.sh's. Each candidate is "
+                        "one --iterations unit and is evaluated on val. Env: MHO_MODEL_STEPS.")
     p.add_argument("--ts-repropose-limit", type=int,
                    default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 2)),
                    help="Rounds on the same train subset with no sibling passing the train gate "
@@ -195,7 +223,11 @@ def main(argv: list[str] | None = None) -> None:
     try:
         kinds = {"harness": HarnessKind(),
                  "model": ModelKind(train_data=args.train_data, trainer=args.trainer,
-                                    submit_train=submit_train)}
+                                    submit_train=submit_train, source=args.model_source,
+                                    objective=args.model_objective, accept=args.model_accept,
+                                    steps=args.model_steps)}
+        if args.mode != "harness-only":
+            print(f"model candidates: {kinds['model'].describe()}", flush=True)
         Loop(args, run_dir, Scheduler(), kinds=kinds, schedule=schedule_for(args),
              submit_eval=submit_eval, submit_propose=submit_propose, submit_hold=submit_hold,
              poll_seconds=POLL_SECONDS).run()
