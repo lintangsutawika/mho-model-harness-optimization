@@ -104,14 +104,14 @@ relay (`src/harness/relay/`). `eval.sh` delegates its serving to it.
 
 Auto-detected PBS/SLURM (`MHO_SCHEDULER=pbs|slurm`); per-scheduler wrappers in `scripts/hpc/`.
 Resources are per phase: `MHO_{EVAL,TRAIN,PROPOSE}_{QUEUE,NGPUS,WALLTIME}`, plus
-`MHO_EVAL_CPUS` and `MHO_ACCOUNT`. `MHO_*_SELECT` and `MHO_*_RTYPE` are PBS-only. See
-`.env.example`.
+`MHO_EVAL_CPUS` and `MHO_ACCOUNT`. `MHO_*_SELECT` and `MHO_*_RTYPE` are PBS-only,
+`MHO_*_QOS` and `MHO_*_MEM` SLURM-only. See `.env.example`.
 
 ### SLURM
 
-`QUEUE` is the partition (`-p`), `MHO_ACCOUNT` is `-A`. `SBATCH_QOS` and
-`SBATCH_MEM_PER_NODE` are read by `sbatch` itself rather than by the loop, so they belong
-in `.env` as well.
+`QUEUE` is the partition (`-p`), `MHO_ACCOUNT` is `-A`, `QOS` is `--qos` and `MEM` is
+`--mem` (e.g. `MHO_QOS=preempt_cpu_qos MHO_EVAL_MEM=16G` for CPU-only phases when the
+partition's default QoS needs a GPU). `SBATCH_*` variables are not passed to child jobs.
 
 ```bash
 tmux new -d -s harness "scripts/run/harness-only.sh --model Qwen/Qwen3.5-4B \
