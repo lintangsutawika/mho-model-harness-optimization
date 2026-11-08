@@ -258,6 +258,48 @@ def sibling_note(tag: str, sibling: str) -> str:
             f"do not read or copy them. Write only under {tag}/.\n")
 
 
+def target_note(tag: str) -> str:
+    """Which candidate this session writes (instructions.md only says `<tag>`)."""
+    return (f"\n\n## Your candidate\nThis session's candidate is `{tag}`: edit only "
+            f"`./{tag}/harness/` (it already holds a copy of the current best harness) and "
+            f"write its rationale to `./{tag}/harness/CANDIDATE.md`.\n")
+
+
+def joint_note(base: str, tags: list[str]) -> str:
+    """Instructions for ONE session that writes every sibling of a round (MHO_PROPOSE_TAGS).
+    The point of a joint session over independent ones: it can choose M ideas that differ on
+    purpose, instead of M sessions converging on the same obvious fix."""
+    n = len(tags)
+    dirs = "\n".join(f"  - `./{t}/harness/`  (rationale: `./{t}/harness/CANDIDATE.md`)"
+                     for t in tags)
+    menu = "\n".join(f"  - {f}" for f in SIBLING_FOCUS)
+    return f"""
+
+## This session writes {n} candidates
+This round evaluates {n} candidates side by side on the same train sample; the one with the
+strongest train-gate evidence goes to val. You write ALL {n} in this one session. This
+overrides "exactly one improved scaffold" in the skill: produce one per directory below, and
+each one is still exactly ONE mechanism with its own CANDIDATE.md. Every directory already
+holds a copy of the current best harness:
+{dirs}
+
+1. Analyze first (summary.json, frontier.json, the traces), as the skill describes.
+2. Write `./{base}.ROUND_PLAN.md` BEFORE editing any harness: {n} hypotheses, one per
+   directory, each naming (a) the failure mode it targets, with evidence from the traces,
+   (b) the part of the scaffold it changes (prompt / agent loop / tools / context handling /
+   answer extraction / verification / ...), and (c) why it is not a repeat of an earlier
+   candidate in summary.json. The {n} must differ in failure mode or in mechanism, not be
+   variants of one idea: if two would be judged by the same trace evidence, replace one.
+   Directions to spread over (not assignments):
+{menu}
+3. Implement each hypothesis in its own directory, independently: no candidate may depend on
+   another's change, and do not copy one candidate's edit into another.
+4. Check every directory still imports, and write each CANDIDATE.md.
+A directory you leave unchanged or broken is re-proposed by a separate session, so finish all
+{n}. Do not edit anything outside these {n} harness directories and the plan file.
+"""
+
+
 def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
@@ -344,6 +386,11 @@ def main() -> int:
     # output; it should treat other candidates + summary/frontier as read-only reference
     # (enforced soft by instructions; the proposal diff only counts harness/ or model_specs/).
     cand_root.mkdir(parents=True, exist_ok=True)
+    tags = [t for t in os.environ.get("MHO_PROPOSE_TAGS", "").split(",") if t.strip()]
+    if len(tags) > 1:
+        if kind != "harness":
+            sys.exit("[propose] a joint session (MHO_PROPOSE_TAGS) is harness-only")
+        return _main_joint(cand_root, tag, tags)
     cand_unit.mkdir(parents=True, exist_ok=True)
     if kind == "harness":
         _materialize_from(parent, harness_dst)    # accumulate: build on the frontier-best
@@ -351,6 +398,8 @@ def main() -> int:
     if note:
         print(f"[propose] sibling {os.environ.get('MHO_PROPOSE_SIBLING')}: "
               f"{note.split('Your focus: ')[1].splitlines()[0]}", flush=True)
+    if kind == "harness":
+        note = target_note(tag) + note
     _run_openhands(cand_root, _build_instructions(_instructions_md(kind), note), _skill_dir(kind))
 
     if kind == "model":
@@ -372,18 +421,57 @@ def main() -> int:
         return 0
 
     # kind == harness
+    ok, code, _ = _check_harness(cand_unit, parent, paths)
+    return 0 if ok else code
+
+
+def _check_harness(cand_unit: Path, parent: Path, paths: dict[str, Path]) -> tuple[bool, int, str]:
+    """Validate one harness candidate, emit its diffs, and record the verdict in
+    <cand>/propose.json (the loop's HarnessKind.proposal_ok reads it). (ok, exit code, reason)."""
+    harness_dst = cand_unit / "harness"
     ok, reason = _validate_candidate(harness_dst, parent)
     _emit_diffs(harness_dst, paths)   # always emit diffs -- useful to inspect even a rejected candidate
+    code = 0
     if not ok:
-        print(f"[propose] ERROR: candidate invalid -- {reason} (diffs in the candidate diff dir)", file=sys.stderr)
-        return 1
-    if _diff_only_vcs(parent, harness_dst):
-        print("[propose] ERROR: candidate is identical to the parent (agent made no code change)", file=sys.stderr)
-        return 2
+        reason, code = f"candidate invalid -- {reason}", 1
+    elif _diff_only_vcs(parent, harness_dst):
+        ok, reason, code = False, "candidate is identical to the parent (no code change)", 2
+    (cand_unit / "propose.json").write_text(json.dumps({"ok": ok, "reason": reason}))
+    if not ok:
+        print(f"[propose] ERROR: {cand_unit.name}: {reason} (diffs in the candidate diff dir)",
+              file=sys.stderr)
+        return ok, code, reason
     rationale = harness_dst / "CANDIDATE.md"
     print(f"[propose] candidate ready at {harness_dst} ({reason})"
           + (f"; rationale: {rationale}" if rationale.exists() else "; no CANDIDATE.md written"))
-    return 0
+    return ok, code, reason
+
+
+def _main_joint(cand_root: Path, base: str, tags: list[str]) -> int:
+    """ONE session writes every candidate in `tags`; each is then validated on its own.
+    Exit 0 if at least one is valid (the loop re-proposes the others on their own)."""
+    units = [cand_root / t for t in tags]
+    paths = {t: _derive_paths(u / "harness") for t, u in zip(tags, units)}
+    parent = paths[tags[0]]["parent"]
+    for u in units:
+        (u / "propose.json").unlink(missing_ok=True)
+        _materialize_from(parent, u / "harness")
+    print(f"[propose] joint session: {len(tags)} candidates {', '.join(tags)} from {parent}",
+          flush=True)
+    try:
+        _run_openhands(cand_root, _build_instructions(_instructions_md("harness"),
+                                                      joint_note(base, tags)),
+                       _skill_dir("harness"))
+    except Exception as e:   # a crash part way still keeps the candidates already written
+        import traceback
+        traceback.print_exc()
+        print(f"[propose] joint session ended with an error ({e!r}); checking what it wrote",
+              file=sys.stderr, flush=True)
+    results = {t: _check_harness(u, parent, paths[t]) for t, u in zip(tags, units)}
+    good = [t for t, (ok, _, _) in results.items() if ok]
+    print(f"[propose] joint session: {len(good)}/{len(tags)} valid"
+          + (f" ({', '.join(good)})" if good else ""), flush=True)
+    return 0 if good else 1
 
 
 if __name__ == "__main__":

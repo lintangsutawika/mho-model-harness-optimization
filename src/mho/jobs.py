@@ -220,14 +220,16 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
 
 
 def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
-                   kind: str = "harness", sibling: tuple[int, int] = (1, 1)) -> str | None:
+                   kind: str = "harness", sibling: tuple[int, int] = (1, 1),
+                   tags: list[str] | None = None) -> str | None:
+    """Submit the HARNESS-mutation or MODEL-proposal job (MHO_PROPOSE_JOB). The proposer derives
+    the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
+    writes either a harness edit (candidates/<tag>/harness) or model specs
+    (candidates/<tag>/model_specs/). `tags` (joint mode): ONE session writes every listed
+    candidate (MHO_PROPOSE_TAGS); `tag` is then the round's base tag. None if unconfigured."""
     import os as _os
     if _os.environ.get("MHO_LOOP_DEBUG"):
         print(f"  [DBG submit_propose] tag={tag} kind={kind} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
-    """Submit the HARNNES-mutation or MODEL-proposal job (MHO_PROPOSE_JOB). The proposer derives
-    the parent scaffold + candidate dest from MHO_RUN_DIR/MHO_TAG, and -- per MHO_PROPOSE_KIND --
-    writes either a harness edit (candidates/<tag>/harness) or a model sigma-reward config
-    (candidates/<tag>/model/sigma_rewards/<sigma>.json). None if unconfigured."""
     if LOG_VERBOSE:
         print(f"  [TRACE submit_propose] tag={tag} PROPOSE_JOB={PROPOSE_JOB!r}", flush=True)
     if not PROPOSE_JOB:
@@ -240,6 +242,7 @@ def submit_propose(sched: Scheduler, *, run_root: Path, logs: Path, tag: str,
         # k/M: this is proposal k of M written in parallel from the same evidence
         # (mho.optimizer.agent steers each sibling to a different idea).
         "MHO_PROPOSE_SIBLING": f"{sibling[0]}/{sibling[1]}",
+        **({"MHO_PROPOSE_TAGS": ",".join(tags)} if tags else {}),
     }, None)
     return sched.submit(Path(PROPOSE_JOB), env, name=f"mho-propose-{tag}",
                         account=_ACCOUNT, out_dir=logs, **_phase_res("PROPOSE"))

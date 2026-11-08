@@ -117,6 +117,13 @@ def main(argv: list[str] | None = None) -> None:
                         "parent, same train subset); the best one that passes the train gate "
                         "goes to val. Kinds that are not parallel (model) always use 1. "
                         "Env: MHO_PROPOSALS.", metavar="M")
+    p.add_argument("--propose-mode", choices=["joint", "independent"],
+                   default=os.environ.get("MHO_PROPOSE_MODE", "independent"),
+                   help="how a round's M siblings are proposed. independent (default): M "
+                        "sessions in parallel, each steered by a focus note. joint: ONE proposer session "
+                        "plans and writes all M (so it can make them differ on purpose); a "
+                        "sibling it leaves invalid is re-proposed on its own. "
+                        "Env: MHO_PROPOSE_MODE.")
     p.add_argument("--ts-repropose-limit", type=int,
                    default=int(os.environ.get("MHO_TS_REPROPOSE_LIMIT", 2)),
                    help="Rounds on the same train subset with no sibling passing the train gate "
