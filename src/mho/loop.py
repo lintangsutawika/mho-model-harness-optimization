@@ -10,8 +10,11 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
     eval_a  : evaluate the CURRENT pair on S                             -> ts_A
     round   : M sibling candidates (--proposals; 1 for kinds that are not `parallel`), each
               independently and concurrently, tags candidate_<i>_<v>_<t>{a,b,c,...}:
-      propose : the proposer writes candidates/<tag>/ (harness/ or model_specs/); sibling k of
-                M is told so (MHO_PROPOSE_SIBLING=k/M) to steer it to a different idea
+      propose : the proposer writes candidates/<tag>/ (harness/ or model_specs/).
+                --propose-mode independent (default): M sessions, sibling k of M told so
+                (MHO_PROPOSE_SIBLING=k/M) and given a different focus. joint: ONE session
+                plans and writes all M, so it can make them differ on purpose
+                (MHO_PROPOSE_TAGS); a sibling it leaves invalid is re-proposed on its own
       build   : the kind's job, if any (model: train the current model) [kind.build_stage]
       eval_b  : evaluate the candidate pair on the SAME S                -> ts_B
                 train gate: utils.gate, B vs A paired per task (--gate-z)
@@ -399,18 +402,21 @@ class Loop:
                               out_dir=self.tag_dir(st["subset"]["a_tag"]), job_name="eval_before")
         raise AssertionError(f"no submit for stage {stage!r}")
 
+    def _link_a_traces(self, tag: str) -> None:
+        """Each sibling is its own candidate dir; give it the subset's A traces so every
+        candidate is self-contained for the proposer (eval_before + eval_after)."""
+        a_tag = self.st["subset"]["a_tag"]
+        link = self.tag_dir(tag) / "eval_before"
+        if a_tag != tag and not (link.is_symlink() or link.exists()):
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(Path("..") / a_tag / "eval_before")
+
     def _submit_member(self, m: dict) -> str:
         """Submit the current stage of round sibling `m`."""
         st, stage, tag = self.st, m["stage"], m["tag"]
         logs = self.log_path(tag, stage, m["attempt"])
         if stage == "propose":
-            # Each sibling is its own candidate dir; give it the subset's A traces so every
-            # candidate is self-contained for the proposer (eval_before + eval_after).
-            a_tag = st["subset"]["a_tag"]
-            link = self.tag_dir(tag) / "eval_before"
-            if a_tag != tag and not (link.is_symlink() or link.exists()):
-                link.parent.mkdir(parents=True, exist_ok=True)
-                link.symlink_to(Path("..") / a_tag / "eval_before")
+            self._link_a_traces(tag)
             st["propose_count"] += 1
             print(f"  [propose {st['propose_count']}/{self.args.iterations}] {tag} "
                   f"({st['kind']})", flush=True)
@@ -551,8 +557,71 @@ class Loop:
             {"tag": t, "i": k, "n": n, "stage": "propose", "job": None, "attempt": 1,
              "ts_B": None, "train_gate": None, "status": "running"}
             for k, t in enumerate(tags)]}
+        if self._joint(n):
+            # ONE proposer session writes every sibling; members it leaves invalid go `solo`
+            st["round"]["joint"] = {"base": base, "job": None, "done": False}
         if n > 1:
-            print(f"  round of {n} {st['kind']} proposals: {', '.join(tags)}")
+            print(f"  round of {n} {st['kind']} proposals ({self._mode(n)}): {', '.join(tags)}")
+
+    def _joint(self, n: int) -> bool:
+        return n > 1 and getattr(self.args, "propose_mode", "independent") == "joint"
+
+    def _mode(self, n: int) -> str:
+        return "one joint session" if self._joint(n) else "independent sessions"
+
+    def _joint_members(self) -> list[dict]:
+        """Siblings still waiting on the round's joint propose session."""
+        r = self.st["round"]
+        if not r.get("joint") or r["joint"]["done"]:
+            return []
+        return [m for m in r["members"] if m["status"] == "running" and m["stage"] == "propose"
+                and not m.get("solo")]
+
+    def _step_joint(self) -> bool:
+        """Submit / poll the round's joint propose job. True if something happened."""
+        st, j = self.st, self.st["round"]["joint"]
+        pm = self._joint_members()
+        if not pm:
+            return False
+        if j["job"] is None:
+            print(f"{_now()} iter {st['iteration']} propose {j['base']} "
+                  f"({len(pm)} candidates, one session) -> submit")
+            for m in pm:
+                self._link_a_traces(m["tag"])
+                st["propose_count"] += 1
+                print(f"  [propose {st['propose_count']}/{self.args.iterations}] {m['tag']} "
+                      f"({st['kind']})", flush=True)
+            j["job"] = self._submit_propose(
+                self.sched, run_root=self.run_dir, logs=self.log_path(j["base"], "propose", 1),
+                tag=j["base"], kind=st["kind"], tags=[m["tag"] for m in pm])
+            if j["job"] is None:
+                raise LoopAbort("propose job not configured (MHO_PROPOSE_JOB unset)")
+            self._save()
+            return True
+        norm, rc = self.sched.state(j["job"])
+        if norm != "DONE":
+            return False
+        rc = 0 if rc is None else rc
+        print(f"{_now()} [propose] {j['base']} job {j['job']} done (rc={rc})")
+        j["done"] = True
+        for m in pm:
+            ok, why = self._job_ok("propose", rc, m["tag"])
+            if ok:
+                self._member_done(m, rc)
+                continue
+            # the joint session did not deliver this sibling: re-propose it on its own (the
+            # budget was charged at the joint submit and is charged again at the solo submit)
+            st["propose_count"] -= 1
+            m.update(solo=True, job=None)
+            # drop the joint session's verdict and its untouched copy of the parent, so only
+            # the solo session's own output can count as a proposal
+            (self.tag_dir(m["tag"]) / "propose.json").unlink(missing_ok=True)
+            shutil.rmtree(self.tag_dir(m["tag"]) / "harness", ignore_errors=True)
+            self._event(stage="propose_joint", tag=m["tag"], rc=rc, ok=False, why=why)
+            print(f"  joint session left {m['tag']} without a valid candidate ({why}); "
+                  f"re-proposing it on its own")
+        self._save()
+        return True
 
     def _step_round(self) -> bool:
         """Advance every running sibling by at most one job event; select when all are done."""
@@ -562,9 +631,10 @@ class Loop:
                 return False
             self._start_round()
             self._save()
-        progressed = False
+        progressed = self._step_joint() if st["round"].get("joint") else False
+        waiting = {m["tag"] for m in self._joint_members()}
         for m in st["round"]["members"]:
-            if m["status"] != "running":
+            if m["status"] != "running" or m["tag"] in waiting:
                 continue
             if m["job"] is None:
                 print(f"{_now()} iter {st['iteration']} {m['stage']} {m['tag']} -> submit"

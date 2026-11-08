@@ -86,7 +86,20 @@ class Fake:
             (Path(out_dir) / job_name / "fake_score.json").write_text(json.dumps(score))
         return self._job()
 
-    def submit_propose(self, sched, *, run_root, logs, tag, kind, sibling=(1, 1)):
+    def submit_propose(self, sched, *, run_root, logs, tag, kind, sibling=(1, 1), tags=None):
+        if tags:                             # joint: one session writes every sibling
+            self.calls.append({"stage": "propose_joint", "tag": tag, "tags": list(tags),
+                               "log": logs, "kind": kind})
+            for t in tags:
+                ok = self.proposes(t)
+                c = run_root / "candidates" / t
+                (c / "harness").mkdir(parents=True, exist_ok=True)
+                (c / "harness" / "pyproject.toml").write_text("")    # pre-created copy
+                if ok:
+                    (c / "harness" / "CANDIDATE.md").write_text(f"# CANDIDATE.md\nidea for {t}\n")
+                (c / "propose.json").write_text(json.dumps(
+                    {"ok": ok, "reason": "" if ok else "identical to the parent"}))
+            return self._job()
         ok = self.proposes(tag)
         self.calls.append({"stage": "propose", "tag": tag, "ok": ok, "log": logs,
                            "sibling": sibling})
@@ -130,14 +143,14 @@ def fake_realize(cand_dir, train_data):
 
 def make(tmp_path, evals, *, iterations=3, limit=3, proposes=lambda t: True, pending=0,
          fresh=False, fake=None, schedule=(("harness", 1),), trains=lambda t: True,
-         proposals=1):
+         proposals=1, propose_mode="independent"):
     train = tmp_path / "train"
     for i in range(20):
         (train / f"p{i}").mkdir(parents=True, exist_ok=True)
     args = SimpleNamespace(model="m", trials=1, concurrent=1, train_data=str(train),
                            val_data="VAL", propose_sample=4, iterations=iterations,
                            ts_repropose_limit=limit, fresh=fresh, skip_baseline=False,
-                           proposals=proposals)
+                           proposals=proposals, propose_mode=propose_mode)
     run_dir = tmp_path / "run"
     fake = fake or Fake(run_dir, evals, proposes, pending, trains)
     kinds = {"harness": HarnessKind(),
@@ -647,3 +660,80 @@ def test_sibling_note_gives_each_sibling_its_own_focus():
     for k, n in enumerate(notes):
         assert f"proposal {k + 1} of 4" in n and SIBLING_FOCUS[k] in n
         assert f"candidate_1_0_1{'abcd'[k]}/" in n
+
+
+# --------------------------------------------------------------------------- joint proposals
+def test_joint_round_is_one_propose_job_for_all_siblings(tmp_path):
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [0.3],
+        "b": {"candidate_1_0_1a": 0.4, "candidate_1_0_1b": 0.6,
+              "candidate_1_0_1c": 0.2, "candidate_1_0_1d": 0.5}}),
+        iterations=4, proposals=4, propose_mode="joint")
+    loop.run()
+    joint = [c for c in fake.calls if c["stage"] == "propose_joint"]
+    assert len(joint) == 1 and not [c for c in fake.calls if c["stage"] == "propose"]
+    assert joint[0]["tag"] == "candidate_1_0_1"
+    assert joint[0]["tags"] == [f"candidate_1_0_1{x}" for x in "abcd"]
+    assert Path(joint[0]["log"]).name == "candidate_1_0_1-propose.out"
+    stages = [c["stage"] for c in fake.calls]
+    assert stages == ["val", "eval_a", "propose_joint"] + ["eval_b"] * 4 + ["val"]
+    rows = {r["candidate"]: r["outcome"] for r in summary(loop)[1:]}
+    assert rows == {"candidate_1_0_1a": "not_selected", "candidate_1_0_1b": "accepted",
+                    "candidate_1_0_1c": "train_fail", "candidate_1_0_1d": "not_selected"}
+    assert loop.st["propose_count"] == 4
+    assert (loop.cands / "candidate_1_0_1d" / "eval_before" / "t0" / "result.json").exists()
+
+
+def test_joint_sibling_left_invalid_is_reproposed_on_its_own(tmp_path):
+    tries = {}
+
+    def proposes(tag):
+        tries[tag] = tries.get(tag, 0) + 1
+        return not (tag == "candidate_1_0_1c" and tries[tag] == 1)    # c fails only in the joint
+
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [0.3],
+        "b": {"candidate_1_0_1a": 0.5, "candidate_1_0_1c": 0.6}}),
+        iterations=3, proposals=3, propose_mode="joint", proposes=proposes)
+    loop.run()
+    props = [(c["stage"], c["tag"], c.get("sibling")) for c in fake.calls
+             if c["stage"].startswith("propose")]
+    assert props == [("propose_joint", "candidate_1_0_1", None),
+                     ("propose", "candidate_1_0_1c", (3, 3))]
+    rows = {r["candidate"]: r["outcome"] for r in summary(loop)[1:]}
+    assert rows == {"candidate_1_0_1a": "not_selected", "candidate_1_0_1b": "train_fail",
+                    "candidate_1_0_1c": "accepted"}
+    assert loop.st["propose_count"] == 3                  # c is charged once, not twice
+
+
+def test_joint_sibling_that_fails_again_is_no_proposal(tmp_path):
+    loop, fake = make(tmp_path, by_tag({
+        "val": [0.5, 0.6], "eval_a": [0.3, 0.3],
+        "b": {"candidate_1_0_1a": 0.5}}),
+        iterations=2, proposals=2, propose_mode="joint",
+        proposes=lambda t: t != "candidate_1_0_1b")
+    loop.run()
+    rows = {r["candidate"]: r["outcome"] for r in summary(loop)[1:3]}
+    assert rows == {"candidate_1_0_1b": "no_proposal", "candidate_1_0_1a": "accepted"}
+
+
+def test_resume_while_the_joint_job_runs(tmp_path):
+    plan = by_tag({"val": [0.5, 0.6], "eval_a": [0.3],
+                   "b": {"candidate_1_0_1a": 0.5, "candidate_1_0_1b": 0.4}})
+    loop, fake = make(tmp_path, plan, iterations=2, proposals=2, propose_mode="joint", pending=2)
+    while not (loop.st["stage"] == "round" and loop.st["round"]
+               and loop.st["round"]["joint"]["job"]):
+        loop.step()
+    loop2, _ = make(tmp_path, None, iterations=2, proposals=2, propose_mode="joint", fake=fake)
+    loop2.run()
+    assert len([c for c in fake.calls if c["stage"] == "propose_joint"]) == 1   # not resubmitted
+    assert {r["candidate"]: r["outcome"] for r in summary(loop2)[1:]} == {
+        "candidate_1_0_1a": "accepted", "candidate_1_0_1b": "not_selected"}
+
+
+def test_joint_note_lists_every_directory_and_the_plan():
+    from mho.optimizer.agent import joint_note, target_note
+    note = joint_note("candidate_2_1_1", ["candidate_2_1_1a", "candidate_2_1_1b"])
+    assert "./candidate_2_1_1a/harness/" in note and "./candidate_2_1_1b/harness/" in note
+    assert "./candidate_2_1_1.ROUND_PLAN.md" in note and "writes 2 candidates" in note
+    assert "./candidate_3_0_1/harness/" in target_note("candidate_3_0_1")
