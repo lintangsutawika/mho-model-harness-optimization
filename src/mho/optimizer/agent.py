@@ -265,6 +265,15 @@ def target_note(tag: str) -> str:
             f"write its rationale to `./{tag}/harness/CANDIDATE.md`.\n")
 
 
+
+def model_target_note(tag: str) -> str:
+    """Where a model proposal goes (instructions.md only says `<tag>`)."""
+    return (f"\n\n## Your candidate\nThis session's candidate is `{tag}`: write the spec to "
+            f"`./{tag}/model_specs/<name>.md` and its check functions to "
+            f"`./{tag}/model_specs/<name>.py`. Screen the checks with\n"
+            f"`python -m mho.data.reward_synthesis screen --spec ./{tag}/model_specs/<name>.md "
+            f"--traces .`\n")
+
 def joint_note(base: str, tags: list[str]) -> str:
     """Instructions for ONE session that writes every sibling of a round (MHO_PROPOSE_TAGS).
     The point of a joint session over independent ones: it can choose M ideas that differ on
@@ -398,8 +407,7 @@ def main() -> int:
     if note:
         print(f"[propose] sibling {os.environ.get('MHO_PROPOSE_SIBLING')}: "
               f"{note.split('Your focus: ')[1].splitlines()[0]}", flush=True)
-    if kind == "harness":
-        note = target_note(tag) + note
+    note = (target_note(tag) if kind == "harness" else model_target_note(tag)) + note
     _run_openhands(cand_root, _build_instructions(_instructions_md(kind), note), _skill_dir(kind))
 
     if kind == "model":
