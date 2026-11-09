@@ -1,220 +1,199 @@
 """Reward synthesis f: turn a model spec sigma into a sigma reward on the train tasks.
 
+The proposer writes two files per capability:
+  model_specs/<name>.md   the spec (YAML frontmatter); `checks:` lists function NAMES
+  model_specs/<name>.py   those functions: def <check>(traj: dict) -> bool | float in [0, 1]
+                          (helpers: `from sigma_checklib import *`, see sigma_checklib.py)
+
 Two steps:
-  1. realize (per candidate): spec -> <cand>/model/sigma_rewards/<sigma>.json = {sigma, checks}.
-     Task-independent: the same checks apply to every train task.
+  1. realize (per candidate): validate the spec and its checks module, SCREEN the checks on the
+     train-sample trajectories already in the run (reject a check that crashes or returns the
+     same value on every trajectory: it can't change any advantage), then write
+       <cand>/model/sigma_rewards/<name>.json   {sigma, checks}
+       <cand>/model/sigma_rewards/<name>.py     the checks module
+       <cand>/model/sigma_rewards/screen/<name>.json   the screen report
   2. stage (per training run, scripts/optimize/train.sh when MHO_SIGMA_REWARD is set): copy the
-     train split to a fresh dir and, in every task's tests/ (the only part of a task harbor
-     uploads to the sandbox, at /tests):
-       tests/base_test.sh      the task's original test.sh, unchanged
-       tests/test.sh           wrapper: run base_test.sh, then reward_rule.py
-       tests/reward_rule.py    RULE_TEMPLATE below
-       tests/sigma_reward.json {sigma, checks, expected_answer: THIS task's answer}
+     train split to a fresh dir and, in every task's tests/ (what harbor uploads to /tests):
+       tests/base_test.sh       the task's original test.sh, unchanged
+       tests/test.sh            wrapper: run base_test.sh, then reward_rule.py
+       tests/reward_rule.py     sigma_rule.py (fixed: the combination formula is ours)
+       tests/sigma_checks.py    the proposer's checks module
+       tests/sigma_checklib.py  trajectory helpers
+       tests/sigma_reward.json  {sigma, checks, expected_answer: THIS task's answer}
      The base split is never modified.
 
-In the sandbox, reward_rule.py takes answer correctness from the task's own verifier (the
-reward.txt base_test.sh just wrote; falls back to comparing against expected_answer when there
-is none) and computes
-    reward = max(0, min(1, 0.5 * correctness + 0.5 * checks_passed_fraction))
-into /logs/verifier/reward.txt (float [0,1]); harbor parses it via float().
+In the sandbox: reward = max(0, min(1, 0.5 * correctness + 0.5 * mean(checks))), correctness
+from the task's own verifier. See sigma_rule.py.
 
 Usage:
-  python -m mho.data.reward_synthesis --spec <model_spec.md> --candidate-dir <RUN>/candidates/<tag>
+  python -m mho.data.reward_synthesis screen --spec model_specs/<name>.md [--traces DIR ...]
+  python -m mho.data.reward_synthesis --spec <spec.md> --candidate-dir <RUN>/candidates/<tag>
   python -m mho.data.reward_synthesis stage --train-dir <split> --sigma <sigma.json> --out <dir>
 """
 from __future__ import annotations
 
 import argparse
-import json
-import re
-import shutil
-import sys
-from pathlib import Path
-
-# The SHARED, generic executable reward rule. It reads its config (expected answer + sigma-checks)
-# from a sigma_reward.json passed as an arg, and takes the artifact paths as arguments, so it can
-# be used by ANY harbor task whose test.sh injects a config.
-RULE_TEMPLATE = r'''#!/usr/bin/env python3
-"""Generic executable reward rule (shared across sigma realizations).
-
-Usage: reward_rule.py <sigma_reward.json> <output_path> <trajectory_path>
-Reads expected answer + sigma-checks from the JSON config, scores answer correctness and the
-checks over the output/trajectory, and writes /logs/verifier/reward.txt (float [0,1]).
-Answer correctness comes from the task's own verifier when it already ran (the staged test.sh
-runs base_test.sh first, which writes reward.txt); else from comparing to expected_answer.
-"""
+import ast
 import json
 import os
-import re
+import shutil
+import statistics
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-VERIFIER_DIR = Path(os.environ.get("MHO_VERIFIER_DIR", "/logs/verifier"))
+HERE = Path(__file__).resolve().parent
+RULE_PY = HERE / "sigma_rule.py"          # -> tests/reward_rule.py
+CHECKLIB_PY = HERE / "sigma_checklib.py"  # -> tests/sigma_checklib.py
+TRAJ = "agent/mini-swe-agent.trajectory.json"
 
-ANSWER_RE = re.compile(r"(?:^|\n)\s*Answer:\s*(.+?)\s*$\s*", re.MULTILINE)
+# Screening thresholds. Below MIN_TRACES the checks can't be judged and pass unscreened (first
+# iteration of a run); above it a check must vary and must not raise on more than MAX_ERR_FRAC.
+MIN_TRACES = int(os.environ.get("MHO_SIGMA_MIN_TRACES", "8"))
+MAX_TRACES = int(os.environ.get("MHO_SIGMA_MAX_TRACES", "64"))
+MAX_ERR_FRAC = 0.1
+SCREEN_TIMEOUT_S = 900
 
 
-def _read(path: str) -> str:
+# --------------------------------------------------------------------------- the checks module
+def checks_module(spec_md: Path) -> Path:
+    """The checks module that belongs to a spec: model_specs/<name>.py beside <name>.md."""
+    return Path(spec_md).with_suffix(".py")
+
+
+def defined_functions(py: Path) -> set[str]:
+    """Top-level function names in a module, by parsing it (never importing it)."""
     try:
-        return Path(path).read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
+        tree = ast.parse(Path(py).read_text(encoding="utf-8"), filename=str(py))
+    except SyntaxError as e:
+        raise ValueError(f"{py}: does not parse: {e}") from e
+    return {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
 
 
-def _load_config(manifest: str) -> tuple[str, str, list]:
-    data = json.loads(_read(manifest) or "{}")
-    return (str(data.get("sigma", "")), str(data.get("expected_answer", "")),
-            list(data.get("checks", [])))
+def produce_config(spec, checks_py: Path) -> dict:
+    """f(sigma) -> {sigma, checks}: every name in spec.checks must be a top-level function in
+    checks_py. Task-independent; stage_tasks adds each task's expected_answer. Raises ValueError."""
+    if not spec.checks:
+        raise ValueError(f"sigma '{spec.name}': `checks` is empty; list the check functions "
+                         f"defined in {Path(checks_py).name}")
+    if not Path(checks_py).is_file():
+        raise ValueError(f"sigma '{spec.name}': checks module {checks_py} not found")
+    missing = [c for c in spec.checks if c not in defined_functions(checks_py)]
+    if missing:
+        raise ValueError(f"sigma '{spec.name}': {missing} not defined in {Path(checks_py).name}")
+    return {"sigma": spec.name, "checks": list(spec.checks)}
 
 
-def _extract_answer(text: str) -> str:
-    matches = ANSWER_RE.findall(text)
-    return matches[-1].lstrip("$").strip() if matches else ""
+# --------------------------------------------------------------------------- screening
+def find_traces(roots, limit: int = MAX_TRACES) -> list[Path]:
+    """Train-sample trajectories under each root, newest first: a candidates/ dir
+    (<tag>/eval_before|eval_after/<trial>/...) or a dir of trial dirs (<trial>/...). Val-split
+    evals are never used (they must stay hidden from the optimizer)."""
+    found: dict[Path, float] = {}
+    for root in roots:
+        root = Path(root)
+        for pat in (f"*/{TRAJ}", f"*/eval_before/*/{TRAJ}", f"*/eval_after/*/{TRAJ}"):
+            for p in root.glob(pat):
+                if "eval-val" in p.parts or "evaluation" in p.parts:
+                    continue
+                try:
+                    found[p.resolve()] = p.stat().st_mtime
+                except OSError:
+                    pass
+    return sorted(found, key=lambda p: -found[p])[:limit]
 
 
-def _norm(text: str) -> str:
-    return " ".join(str(text).strip().lower().split())
-
-
-def _correctness(cand: str, exp: str) -> float:
-    if not cand or not exp:
-        return 0.0
+def _trial_reward(traj: Path) -> float | None:
     try:
-        from math_verify import parse, verify
-        if verify(parse(exp), parse(cand)):
-            return 1.0
-    except Exception:
-        pass
-    try:
-        import sympy as sp
-        from sympy.parsing.latex import parse_latex
-        if sp.simplify(parse_latex(exp) - parse_latex(cand)) == 0:
-            return 1.0
-    except Exception:
-        pass
-    return float(_norm(cand) == _norm(exp))
-
-# --- standard sigma-check predicate library -------------------------------
-# The proposer emits named trajectory/output predicates in a sigma spec's `checks`.
-# These are the IMPLEMENTED vocabulary; reward_rule evaluates checks against it. A check
-# with an unknown name -> NameError in the eval below -> that check fails (as before), but
-# anything listed here resolves. Each predicate takes (traj: str) and/or (output: str).
-
-def _msgs(traj: str) -> list:
-    try:
-        d = json.loads(traj)
-    except Exception:
-        return []
-    m = d.get("messages") if isinstance(d, dict) else d
-    return m if isinstance(m, list) else []
-
-def _has_answer_line(text: str) -> bool:
-    return bool(ANSWER_RE.search(str(text)))
-
-def has_final_agent_answer_line(traj: str) -> bool:
-    """An assistant turn in the trajectory carries an 'Answer:' line (the agent committed
-    a final answer to the graded artifact / its own reply)."""
-    return any(
-        isinstance(m, dict) and m.get("role") == "assistant"
-        and _has_answer_line(m.get("content", ""))
-        for m in _msgs(traj)
-    )
-
-def final_agent_answer_present_independent_of_tool_output(traj: str) -> bool:
-    """A final-answer line exists in an assistant turn regardless of what tool outputs
-    echoed -- i.e. the answer is the agent's own, not merely a tool reflect."""
-    return has_final_agent_answer_line(traj)
-
-def traj_has_text(traj: str, needle: str) -> bool:
-    """Generic: the raw trajectory text contains `needle` (substring search)."""
-    return needle in traj
-
-CHECK_NS = {
-    "has_final_agent_answer_line": has_final_agent_answer_line,
-    "final_agent_answer_present_independent_of_tool_output": final_agent_answer_present_independent_of_tool_output,
-    "traj_has_text": traj_has_text,
-}
-
-
-def _base_correctness():
-    """The base verifier's reward (reward.txt it wrote before us), or None if it wrote none."""
-    try:
-        return max(0.0, min(1.0, float(_read(str(VERIFIER_DIR / "reward.txt")).strip())))
-    except ValueError:
+        d = json.loads((traj.parents[1] / "result.json").read_text())
+        return float(((d.get("verifier_result") or {}).get("rewards") or {}).get("reward"))
+    except (OSError, ValueError, TypeError):
         return None
 
 
-def run(manifest: str, output_path: str, traj_path: str) -> int:
-    sigma, expected, checks = _load_config(manifest)
-    output = _read(output_path)
-    traj = _read(traj_path)
-    corr, source = _base_correctness(), "base_verifier"
-    if corr is None:
-        corr, source = _correctness(_extract_answer(output) or output.strip(), expected), "expected_answer"
-    results = []
-    for i, expr in enumerate(checks):
+def _corr(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 3 or len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    try:
+        return round(statistics.correlation(xs, ys), 3)
+    except (AttributeError, statistics.StatisticsError):    # py < 3.10 / degenerate
+        return None
+
+
+def screen(checks_py: Path, names: list[str], traces: list[Path]) -> tuple[bool, dict]:
+    """Run each check over `traces` in a subprocess (the sandbox's own code path, sigma_rule.py)
+    and judge it. Returns (ok, report); ok is False if any check is rejected."""
+    report: dict = {"n_traces": len(traces), "checks": {}}
+    if len(traces) < MIN_TRACES:
+        report["status"] = f"unscreened: {len(traces)} trajectories < {MIN_TRACES}"
+        return True, report
+    with tempfile.TemporaryDirectory() as td:
+        lst = Path(td) / "traces.txt"
+        lst.write_text("\n".join(str(t) for t in traces) + "\n")
         try:
-            # The standard predicate namespace (CHECK_NS) is exposed alongside the raw
-            # `output`/`traj` strings, so named sigma-checks resolve to real implementations.
-            ok = bool(eval(expr, {"__builtins__": {}, **CHECK_NS},
-                           {"output": output, "traj": traj}))  # noqa: S307
-        except Exception as e:
-            ok = False
-            expr = f"{expr}  # ERROR: {e}"
-        results.append({"i": i, "check": expr, "passed": ok})
-    frac = (sum(1 for c in results if c["passed"]) / len(results)) if results else 0.0
-    reward = max(0.0, min(1.0, 0.5 * corr + 0.5 * frac))
-    info = {"sigma": sigma, "correct": corr, "correct_from": source, "checks_passed": frac,
-            "checks": results, "reward": reward,
-            # what the rule could see: 0 chars means the checks ran against nothing
-            "traj_path": traj_path, "traj_chars": len(traj),
-            "output_path": output_path, "output_chars": len(output)}
-    out_dir = VERIFIER_DIR
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "reward.txt").write_text(f"{reward:.4f}\n")
-    (out_dir / "sigma_info.json").write_text(json.dumps(info, indent=2))
-    print(json.dumps(info, indent=2))
-    return 0 if reward >= 0.5 else 1
+            r = subprocess.run([sys.executable, "-I", str(RULE_PY), "screen", str(checks_py),
+                                ",".join(names), str(lst)],
+                               cwd=td, capture_output=True, text=True, timeout=SCREEN_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            report["status"] = f"rejected: screening took over {SCREEN_TIMEOUT_S}s"
+            return False, report
+    if r.returncode != 0:
+        report["status"] = "rejected: the checks module failed to load: " + r.stderr.strip()[-600:]
+        return False, report
+    raw = json.loads(r.stdout.strip().splitlines()[-1])
+    rewards = [_trial_reward(t) for t in traces]
+    ok = True
+    for name in names:
+        rows = raw[name]                       # one [value, error] per trace, in trace order
+        vals = [v for v, e in rows if e is None]
+        errs = [e for v, e in rows if e is not None]
+        n = len(rows)
+        rep = {"n": n, "n_errors": len(errs),
+               "mean": round(statistics.fmean(vals), 4) if vals else None,
+               "distinct_values": sorted(set(vals))[:10]}
+        if errs:
+            rep["first_error"] = errs[0]
+        # Informational, not gated: does the check agree with the trial's recorded reward?
+        pairs = [(v, w) for (v, e), w in zip(rows, rewards) if e is None and w is not None]
+        rep["corr_with_reward"] = _corr([p[0] for p in pairs], [p[1] for p in pairs])
+        if n and len(errs) / n > MAX_ERR_FRAC:
+            rep["verdict"] = f"rejected: raises on {len(errs)}/{n} trajectories"
+        elif len(set(vals)) < 2:
+            const = vals[0] if vals else None
+            rep["verdict"] = (f"rejected: constant ({const}) on all {len(vals)} trajectories, "
+                              "so it adds the same reward to every rollout and changes no advantage")
+        else:
+            rep["verdict"] = "ok"
+        ok &= rep["verdict"] == "ok"
+        report["checks"][name] = rep
+    report["status"] = "ok" if ok else "rejected"
+    return ok, report
 
 
-if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("usage: reward_rule.py <sigma_reward.json> <output_path> <trajectory_path>", file=sys.stderr)
-        raise SystemExit(2)
-    raise SystemExit(run(sys.argv[1], sys.argv[2], sys.argv[3]))
-'''
+# --------------------------------------------------------------------------- realize
+def realize(spec_md: Path, out_dir: Path, traces: list[Path]) -> tuple[bool, dict]:
+    """Realize one spec into out_dir (<cand>/model/sigma_rewards): validate, screen, and only if
+    every check passes write <name>.json + <name>.py. The screen report is always written to
+    out_dir/screen/<name>.json. Returns (ok, report)."""
+    from mho.optimizer import model_spec
+    spec, _ = model_spec.parse_spec(Path(spec_md))
+    py = checks_module(spec_md)
+    cfg = produce_config(spec, py)
+    ok, report = screen(py, cfg["checks"], traces)
+    (out_dir / "screen").mkdir(parents=True, exist_ok=True)
+    (out_dir / "screen" / f"{spec.name}.json").write_text(json.dumps(report, indent=2) + "\n")
+    if ok:
+        shutil.copy2(py, out_dir / f"{spec.name}.py")
+        (out_dir / f"{spec.name}.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    return ok, report
 
 
-# --- realized-check vocabulary + validation ---------------------------------
-# The reward runtime (reward_rule.py, rendered from RULE_TEMPLATE above) evaluates a sigma
-# config's `checks` against a FIXED namespace of implemented predicates (its CHECK_NS). For the
-# realization to emit only RUNNABLE checks, this module mirrors that same vocabulary and
-# validates the proposer's checks against it at realization time. These names MUST stay in sync
-# with the CHECK_NS emitted in RULE_TEMPLATE.
-CHECK_NS = {
-    "has_final_agent_answer_line",
-    "final_agent_answer_present_independent_of_tool_output",
-    "traj_has_text",
-}
-_FUNC_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-
-
-def unsupported_checks(checks: list[str]) -> list[str]:
-    """Return the checks whose leading function name is not in the implemented CHECK_NS."""
-    bad = []
-    for c in checks:
-        m = _FUNC_RE.match(str(c))
-        name = m.group(1) if m else ""
-        if not name or name not in CHECK_NS:
-            bad.append(str(c))
-    return bad
-
-
+# --------------------------------------------------------------------------- stage
 def _extract_expected_answer(task: Path) -> str:
     """The task's expected answer: task.toml [metadata] answer, else test.py EXPECTED_ANSWER.
     Both are parsed (TOML / Python literal), not regexed: LaTeX answers are escaped in the files
     ("\\\\frac{1}{3}") and must come back unescaped (\\frac{1}{3})."""
-    import ast
     try:
         import tomllib
     except ModuleNotFoundError:          # py < 3.11
@@ -239,28 +218,12 @@ def _extract_expected_answer(task: Path) -> str:
     return ""
 
 
-def produce_config(spec) -> dict:
-    """f(sigma) -> the candidate's sigma config {sigma, checks}. Task-independent; stage_tasks
-    adds each task's own expected_answer when it injects the config.
-
-    The checks are validated against the implemented CHECK_NS: an unsupported check name is
-    rejected (ValueError), so realization never emits a config the reward runtime cannot run.
-    """
-    bad = unsupported_checks(spec.checks)
-    if bad:
-        raise ValueError(
-            f"sigma '{spec.name}': unsupported check(s) -> {bad}. Implement the predicate in "
-            f"reward_synthesis.CHECK_NS (and the reward_rule template) or constrain the "
-            f"proposer to the supported vocabulary: {sorted(CHECK_NS)}")
-    return {"sigma": spec.name, "checks": list(spec.checks)}
-
-
 # The staged tests/test.sh. No `set -e`: the base verifier exits 1 on a wrong answer, and the
 # sigma rule must still run. Harbor reads the reward.txt reward_rule.py writes last.
 WRAPPER_TEST_SH = """#!/bin/bash
 # sigma-reward wrapper (generated by mho.data.reward_synthesis stage). The task's own verifier is
 # base_test.sh; it writes /logs/verifier/reward.txt (= answer correctness), then reward_rule.py
-# combines that with the sigma checks and overwrites reward.txt.
+# combines that with the sigma checks (sigma_checks.py) and overwrites reward.txt.
 # The agent writes its trajectory to the agent logs dir (micro-swe-agent:
 # /logs/agent/mini-swe-agent.trajectory.json), not /workspace. sigma_info.json records how much
 # of it the rule actually saw (traj_chars), so an empty trajectory is visible, not silent.
@@ -274,10 +237,14 @@ exec python3 /tests/reward_rule.py /tests/sigma_reward.json \\
 
 def stage_tasks(train_dir: Path, sigma_json: Path, out_dir: Path) -> int:
     """Copy the train split `train_dir` to a fresh `out_dir` with the sigma reward injected into
-    every task's tests/ (see the module docstring). Top-level files (seed.jsonl) are copied as-is.
-    Returns the number of tasks staged; raises ValueError if any task has no tests/test.sh."""
-    train_dir, out_dir = Path(train_dir), Path(out_dir)
-    cfg = json.loads(Path(sigma_json).read_text())
+    every task's tests/ (see the module docstring). The checks module is the .py beside
+    sigma_json. Top-level files (seed.jsonl) are copied as-is. Returns the number of tasks staged;
+    raises ValueError if the checks module is missing or any task has no tests/test.sh."""
+    train_dir, out_dir, sigma_json = Path(train_dir), Path(out_dir), Path(sigma_json)
+    cfg = json.loads(sigma_json.read_text())
+    checks_py = sigma_json.with_suffix(".py")
+    if not checks_py.is_file():
+        raise ValueError(f"checks module {checks_py} not found (realize writes it beside {sigma_json.name})")
     tasks = sorted(p for p in train_dir.iterdir() if p.is_dir())
     missing = [p.name for p in tasks if not (p / "tests" / "test.sh").is_file()]
     if missing:
@@ -295,11 +262,23 @@ def stage_tasks(train_dir: Path, sigma_json: Path, out_dir: Path) -> int:
         (tests / "test.sh").rename(tests / "base_test.sh")
         (tests / "test.sh").write_text(WRAPPER_TEST_SH)
         (tests / "test.sh").chmod(0o755)
-        (tests / "reward_rule.py").write_text(RULE_TEMPLATE, encoding="utf-8")
+        shutil.copyfile(RULE_PY, tests / "reward_rule.py")
+        shutil.copyfile(CHECKLIB_PY, tests / "sigma_checklib.py")
+        shutil.copyfile(checks_py, tests / "sigma_checks.py")
         task_cfg = {"sigma": cfg.get("sigma", ""), "checks": list(cfg.get("checks", [])),
                     "expected_answer": _extract_expected_answer(task)}
         (tests / "sigma_reward.json").write_text(json.dumps(task_cfg, indent=2) + "\n")
     return len(tasks)
+
+
+# --------------------------------------------------------------------------- CLI
+def _print_report(report: dict) -> None:
+    print(f"[screen] {report['status']}  ({report['n_traces']} trajectories)")
+    for name, rep in report["checks"].items():
+        print(f"  {name}: {rep['verdict']}  mean={rep['mean']} distinct={rep['distinct_values']}"
+              f" errors={rep['n_errors']}/{rep['n']} corr_with_reward={rep.get('corr_with_reward')}")
+        if rep.get("first_error"):
+            print(f"    first error: {rep['first_error']}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -315,18 +294,34 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[reward_synthesis] staged {n} task(s) with sigma {a.sigma.name} -> {a.out}")
         return 0
     from mho.optimizer import model_spec
+    if argv[:1] == ["screen"]:
+        p = argparse.ArgumentParser(prog="reward_synthesis screen",
+                                    description="run a spec's checks over existing trajectories")
+        p.add_argument("--spec", required=True, type=Path, help="model_specs/<name>.md")
+        p.add_argument("--traces", nargs="*", type=Path, default=[Path(".")],
+                       help="candidates/ dir(s) or dir(s) of trial dirs (default: cwd)")
+        a = p.parse_args(argv[1:])
+        try:
+            spec, _ = model_spec.parse_spec(a.spec)
+            cfg = produce_config(spec, checks_module(a.spec))
+        except ValueError as e:
+            print(f"[screen] INVALID: {e}", file=sys.stderr)
+            return 2
+        ok, report = screen(checks_module(a.spec), cfg["checks"], find_traces(a.traces))
+        _print_report(report)
+        return 0 if ok else 2
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--spec", required=True, type=Path, help="model spec (model_specs/<name>.md)")
     p.add_argument("--candidate-dir", required=True, type=Path,
-                   help="candidate unit dir (<RUN>/candidates/<tag>/); writes the sigma config to "
-                        "<candidate>/model/sigma_rewards/<sigma>.json")
-    args = p.parse_args(argv)
-    spec, _body = model_spec.parse_spec(args.spec)  # validate + load
-    dest = args.candidate_dir / "model" / "sigma_rewards" / f"{spec.name}.json"
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(produce_config(spec), indent=2) + "\n", encoding="utf-8")
-    print(f"[reward_synthesis] sigma config -> {dest}")
-    return 0
+                   help="candidate unit dir (<RUN>/candidates/<tag>/); writes the sigma reward to "
+                        "<candidate>/model/sigma_rewards/; screens on <RUN>/candidates/")
+    p.add_argument("--traces", nargs="*", type=Path, default=None,
+                   help="where to find trajectories to screen on (default: the candidate's parent)")
+    a = p.parse_args(argv)
+    ok, report = realize(a.spec, a.candidate_dir / "model" / "sigma_rewards",
+                         find_traces(a.traces or [a.candidate_dir.parent]))
+    _print_report(report)
+    return 0 if ok else 2
 
 
 if __name__ == "__main__":
