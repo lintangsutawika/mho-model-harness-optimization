@@ -1,31 +1,33 @@
-"""Reward synthesis f: given a train sample x and a model spec sigma, produce the sigma config.
+"""Reward synthesis f: turn a model spec sigma into a sigma reward on the train tasks.
 
-The realized artifact is a single small `sigma_reward.json` (the sigma config: expected answer +
-checks) designed to be INJECTED into a base task's verifier just-in-time. The base task's verifier
-is the shared generic `reward_rule.py`, which reads this config and applies the sigma reward.
-Each sigma-sample = one small config file (keyed by task dir name); the base data is reused
-untouched.
+Two steps:
+  1. realize (per candidate): spec -> <cand>/model/sigma_rewards/<sigma>.json = {sigma, checks}.
+     Task-independent: the same checks apply to every train task.
+  2. stage (per training run, scripts/optimize/train.sh when MHO_SIGMA_REWARD is set): copy the
+     train split to a fresh dir and, in every task's tests/ (the only part of a task harbor
+     uploads to the sandbox, at /tests):
+       tests/base_test.sh      the task's original test.sh, unchanged
+       tests/test.sh           wrapper: run base_test.sh, then reward_rule.py
+       tests/reward_rule.py    RULE_TEMPLATE below
+       tests/sigma_reward.json {sigma, checks, expected_answer: THIS task's answer}
+     The base split is never modified.
 
-  reward_rule.py (shared, generic)  +  sigma_reward.json (per-sigma config)  ->  sigma reward
-
-reward_rule.py (tests/reward_rule.py, generic) reads sigma_reward.json:
-  - expected_answer  (to score answer correctness)
-  - checks           (the explicit, checkable sigma conditions over output + trajectory)
-and computes:  reward = max(0, min(1, 0.5 * answer_correctness + 0.5 * checks_passed_fraction))
-writing /logs/verifier/reward.txt (float [0,1]); harbor parses it via float().
+In the sandbox, reward_rule.py takes answer correctness from the task's own verifier (the
+reward.txt base_test.sh just wrote; falls back to comparing against expected_answer when there
+is none) and computes
+    reward = max(0, min(1, 0.5 * correctness + 0.5 * checks_passed_fraction))
+into /logs/verifier/reward.txt (float [0,1]); harbor parses it via float().
 
 Usage:
-  # emit the sigma config into a candidate unit's sigma_rewards map (for JIT injection):
-  python -m mho.data.reward_synthesis --task <x dir> --spec <model_spec.md> --candidate-dir <RUN>/candidates/<tag>
-  #   -> writes <candidate>/sigma_rewards/<task dir name>.json
-  # or emit a single config to a dir:
-  python -m mho.data.reward_synthesis --task <x dir> --spec <model_spec.md> --out <dir>
+  python -m mho.data.reward_synthesis --spec <model_spec.md> --candidate-dir <RUN>/candidates/<tag>
+  python -m mho.data.reward_synthesis stage --train-dir <split> --sigma <sigma.json> --out <dir>
 """
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -38,11 +40,16 @@ RULE_TEMPLATE = r'''#!/usr/bin/env python3
 Usage: reward_rule.py <sigma_reward.json> <output_path> <trajectory_path>
 Reads expected answer + sigma-checks from the JSON config, scores answer correctness and the
 checks over the output/trajectory, and writes /logs/verifier/reward.txt (float [0,1]).
+Answer correctness comes from the task's own verifier when it already ran (the staged test.sh
+runs base_test.sh first, which writes reward.txt); else from comparing to expected_answer.
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
+
+VERIFIER_DIR = Path(os.environ.get("MHO_VERIFIER_DIR", "/logs/verifier"))
 
 ANSWER_RE = re.compile(r"(?:^|\n)\s*Answer:\s*(.+?)\s*$\s*", re.MULTILINE)
 
@@ -129,12 +136,21 @@ CHECK_NS = {
 }
 
 
+def _base_correctness():
+    """The base verifier's reward (reward.txt it wrote before us), or None if it wrote none."""
+    try:
+        return max(0.0, min(1.0, float(_read(str(VERIFIER_DIR / "reward.txt")).strip())))
+    except ValueError:
+        return None
+
+
 def run(manifest: str, output_path: str, traj_path: str) -> int:
     sigma, expected, checks = _load_config(manifest)
     output = _read(output_path)
     traj = _read(traj_path)
-    cand = _extract_answer(output)
-    corr = _correctness(cand, expected)
+    corr, source = _base_correctness(), "base_verifier"
+    if corr is None:
+        corr, source = _correctness(_extract_answer(output) or output.strip(), expected), "expected_answer"
     results = []
     for i, expr in enumerate(checks):
         try:
@@ -148,8 +164,9 @@ def run(manifest: str, output_path: str, traj_path: str) -> int:
         results.append({"i": i, "check": expr, "passed": ok})
     frac = (sum(1 for c in results if c["passed"]) / len(results)) if results else 0.0
     reward = max(0.0, min(1.0, 0.5 * corr + 0.5 * frac))
-    info = {"sigma": sigma, "correct": corr, "checks_passed": frac, "checks": results, "reward": reward}
-    out_dir = Path("/logs/verifier")
+    info = {"sigma": sigma, "correct": corr, "correct_from": source, "checks_passed": frac,
+            "checks": results, "reward": reward}
+    out_dir = VERIFIER_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "reward.txt").write_text(f"{reward:.4f}\n")
     (out_dir / "sigma_info.json").write_text(json.dumps(info, indent=2))
@@ -191,22 +208,37 @@ def unsupported_checks(checks: list[str]) -> list[str]:
 
 
 def _extract_expected_answer(task: Path) -> str:
-    """Grab the expected answer from x: task.toml [metadata] answer, else test.py EXPECTED_ANSWER."""
+    """The task's expected answer: task.toml [metadata] answer, else test.py EXPECTED_ANSWER.
+    Both are parsed (TOML / Python literal), not regexed: LaTeX answers are escaped in the files
+    ("\\\\frac{1}{3}") and must come back unescaped (\\frac{1}{3})."""
+    import ast
+    try:
+        import tomllib
+    except ModuleNotFoundError:          # py < 3.11
+        import tomli as tomllib
     toml = task / "task.toml"
     if toml.exists():
-        m = re.search(r"answer\s*=\s*[\"']?([^\"'\\n]+)", toml.read_text())
-        if m:
-            return m.group(1).strip()
+        try:
+            ans = (tomllib.loads(toml.read_text()).get("metadata") or {}).get("answer")
+        except tomllib.TOMLDecodeError:
+            ans = None
+        if ans is not None:
+            return str(ans).strip()
     testpy = task / "tests" / "test.py"
     if testpy.exists():
-        m = re.search(r"EXPECTED_ANSWER\s*=\s*[\"']([^\"']*)", testpy.read_text())
-        if m:
-            return m.group(1)
+        try:
+            for node in ast.parse(testpy.read_text()).body:
+                if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                        and getattr(node.targets[0], "id", None) == "EXPECTED_ANSWER"):
+                    return str(ast.literal_eval(node.value))
+        except (SyntaxError, ValueError):
+            pass
     return ""
 
 
-def produce_config(task: Path, spec) -> dict:
-    """f(x, sigma) -> the sigma config (sigma_reward.json dict) to inject into a base task.
+def produce_config(spec) -> dict:
+    """f(sigma) -> the candidate's sigma config {sigma, checks}. Task-independent; stage_tasks
+    adds each task's own expected_answer when it injects the config.
 
     The checks are validated against the implemented CHECK_NS: an unsupported check name is
     rejected (ValueError), so realization never emits a config the reward runtime cannot run.
@@ -217,46 +249,76 @@ def produce_config(task: Path, spec) -> dict:
             f"sigma '{spec.name}': unsupported check(s) -> {bad}. Implement the predicate in "
             f"reward_synthesis.CHECK_NS (and the reward_rule template) or constrain the "
             f"proposer to the supported vocabulary: {sorted(CHECK_NS)}")
-    return {"sigma": spec.name,
-            "from_task": str(task),
-            "expected_answer": _extract_expected_answer(task),
-            "checks": spec.checks}
+    return {"sigma": spec.name, "checks": list(spec.checks)}
 
 
-def materialize_rule(out: Path) -> Path:
-    """Write the shared generic reward rule (tests/reward_rule.py) if not present."""
-    tests = out / "tests"
-    tests.mkdir(parents=True, exist_ok=True)
-    rule_path = tests / "reward_rule.py"
-    if not rule_path.exists():
-        rule_path.write_text(RULE_TEMPLATE, encoding="utf-8")
-    return rule_path
+# The staged tests/test.sh. No `set -e`: the base verifier exits 1 on a wrong answer, and the
+# sigma rule must still run. Harbor reads the reward.txt reward_rule.py writes last.
+WRAPPER_TEST_SH = """#!/bin/bash
+# sigma-reward wrapper (generated by mho.data.reward_synthesis stage). The task's own verifier is
+# base_test.sh; it writes /logs/verifier/reward.txt (= answer correctness), then reward_rule.py
+# combines that with the sigma checks and overwrites reward.txt.
+mkdir -p /logs/verifier
+bash /tests/base_test.sh
+echo "=== base verifier exit $? ; sigma reward rule ==="
+exec python3 /tests/reward_rule.py /tests/sigma_reward.json \\
+    "${OUTPUT_ARTIFACT:-/workspace/output.txt}" "${TRAJ_ARTIFACT:-/workspace/trajectory.json}"
+"""
+
+
+def stage_tasks(train_dir: Path, sigma_json: Path, out_dir: Path) -> int:
+    """Copy the train split `train_dir` to a fresh `out_dir` with the sigma reward injected into
+    every task's tests/ (see the module docstring). Top-level files (seed.jsonl) are copied as-is.
+    Returns the number of tasks staged; raises ValueError if any task has no tests/test.sh."""
+    train_dir, out_dir = Path(train_dir), Path(out_dir)
+    cfg = json.loads(Path(sigma_json).read_text())
+    tasks = sorted(p for p in train_dir.iterdir() if p.is_dir())
+    missing = [p.name for p in tasks if not (p / "tests" / "test.sh").is_file()]
+    if missing:
+        raise ValueError(f"{len(missing)} task(s) without tests/test.sh, e.g. {missing[:3]}")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)          # always from the base split: never stack wrappers
+    out_dir.mkdir(parents=True)
+    for p in train_dir.iterdir():
+        if p.is_file():
+            shutil.copy2(p, out_dir / p.name)
+    for task in tasks:
+        dst = out_dir / task.name
+        shutil.copytree(task, dst, symlinks=True)
+        tests = dst / "tests"
+        (tests / "test.sh").rename(tests / "base_test.sh")
+        (tests / "test.sh").write_text(WRAPPER_TEST_SH)
+        (tests / "test.sh").chmod(0o755)
+        (tests / "reward_rule.py").write_text(RULE_TEMPLATE, encoding="utf-8")
+        task_cfg = {"sigma": cfg.get("sigma", ""), "checks": list(cfg.get("checks", [])),
+                    "expected_answer": _extract_expected_answer(task)}
+        (tests / "sigma_reward.json").write_text(json.dumps(task_cfg, indent=2) + "\n")
+    return len(tasks)
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["stage"]:
+        p = argparse.ArgumentParser(prog="reward_synthesis stage",
+                                    description="stage a train split with a sigma reward injected")
+        p.add_argument("--train-dir", required=True, type=Path)
+        p.add_argument("--sigma", required=True, type=Path, help="<cand>/model/sigma_rewards/<s>.json")
+        p.add_argument("--out", required=True, type=Path)
+        a = p.parse_args(argv[1:])
+        n = stage_tasks(a.train_dir, a.sigma, a.out)
+        print(f"[reward_synthesis] staged {n} task(s) with sigma {a.sigma.name} -> {a.out}")
+        return 0
     from mho.optimizer import model_spec
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--task", required=True, type=Path, help="source task dir x (instruction.md + task.toml)")
     p.add_argument("--spec", required=True, type=Path, help="model spec (model_specs/<name>.md)")
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--out", type=Path, help="output dir (writes sigma_reward.json into it)")
-    g.add_argument("--candidate-dir", type=Path,
+    p.add_argument("--candidate-dir", required=True, type=Path,
                    help="candidate unit dir (<RUN>/candidates/<tag>/); writes the sigma config to "
                         "<candidate>/model/sigma_rewards/<sigma>.json")
     args = p.parse_args(argv)
     spec, _body = model_spec.parse_spec(args.spec)  # validate + load
-    config = produce_config(args.task, spec)
-    if args.candidate_dir:
-        # One sigma config per candidate, keyed by the sigma (check) name, co-located with the
-        # model's training artifacts: candidates/<tag>/model/sigma_rewards/<sigma>.json
-        dest_dir = args.candidate_dir / "model" / "sigma_rewards"
-        dest = dest_dir / f"{spec.name}.json"
-    else:
-        out = args.out or (args.task / "tests")
-        dest_dir = out if out.is_dir() else out.parent
-        dest = dest_dir / "sigma_reward.json"
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    dest = args.candidate_dir / "model" / "sigma_rewards" / f"{spec.name}.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(produce_config(spec), indent=2) + "\n", encoding="utf-8")
     print(f"[reward_synthesis] sigma config -> {dest}")
     return 0
 

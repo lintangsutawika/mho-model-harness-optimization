@@ -56,6 +56,21 @@ if [ -n "$RUN_LOG" ]; then
   rm -f "$RUN_LOG"
   exec > >(tee "$RUN_LOG") 2>&1
 fi
+
+# --- sigma reward (model candidates) ----------------------------------------------
+# MHO_SIGMA_REWARD = <cand>/model/sigma_rewards/<sigma>.json (set by optimize_loop for a model
+# candidate). Stage a copy of the train split whose tests/ run the task's own verifier and then
+# the sigma rule (mho.data.reward_synthesis stage), and train on that copy. The base split is
+# never modified. Unset -> train on the plain split (correctness reward).
+if [ -n "${MHO_SIGMA_REWARD:-}" ]; then
+  [ -f "$MHO_SIGMA_REWARD" ] || { echo "ERROR: MHO_SIGMA_REWARD=$MHO_SIGMA_REWARD not found" >&2; exit 2; }
+  SIGMA_TASKS_DIR="${RUN_DIR}/sigma_tasks"
+  _PY="${REPO_DIR}/.venv/bin/python"; [ -x "$_PY" ] || _PY=python3
+  PYTHONPATH="${REPO_DIR}/src" "$_PY" -m mho.data.reward_synthesis stage \
+    --train-dir "$MATH_TRAIN_DIR" --sigma "$MHO_SIGMA_REWARD" --out "$SIGMA_TASKS_DIR"
+  MATH_TRAIN_DIR="$SIGMA_TASKS_DIR"
+  HARBOR_TASKS_DIR="$SIGMA_TASKS_DIR"
+fi
 SAVE_DIR="${SAVE_DIR:-${RUN_DIR}/checkpoints}"
 mkdir -p "$SAVE_DIR"
 # HF-format checkpoint export. "{}" is filled with the rollout id (e.g. .../hf/step_100).

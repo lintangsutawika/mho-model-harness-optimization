@@ -29,8 +29,6 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
         return False, None
     from mho.data import reward_synthesis
     from mho.optimizer import model_spec as _ms
-    train_root = Path(train_data)
-    src_task = next((p for p in sorted(train_root.iterdir()) if p.is_dir()), None)
     sr_dir.mkdir(parents=True, exist_ok=True)
     n = 0
     for md in sorted(spec_dir.glob("*.md")):
@@ -41,8 +39,9 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
             continue
         try:
             spec, _ = _ms.parse_spec(md)
-            cfg = reward_synthesis.produce_config(src_task, spec) if src_task else \
-                {"sigma": spec.name, "expected_answer": "", "checks": spec.checks}
+            # {sigma, checks}; each train task's own expected answer is added when train.sh
+            # stages the split (reward_synthesis.stage_tasks).
+            cfg = reward_synthesis.produce_config(spec)
             out.write_text(json.dumps(cfg, indent=2) + "\n")
             n += 1
         except Exception as e:
