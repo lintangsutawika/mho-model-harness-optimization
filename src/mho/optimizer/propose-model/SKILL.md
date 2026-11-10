@@ -32,12 +32,12 @@ spec into verifiable training data and trains the model; you only specify what t
   trajectories/metrics, then specify the capability that targets it. No speculative specs.
 - **One capability per spec.** Each spec targets a single failure mode / hypothesis. If
   tempted to add "and also…", that's a separate spec — split it.
-- **Do NOT edit anything under `eval_prior/`** (read-only reference). Write ONLY under
-  `model_specs/`; do not touch the harness snapshot (`harness/`).
+- **Write ONLY under your own `<tag>/model_specs/`.** Other candidates, their traces and
+  every `harness/` are read-only reference.
 
 ### Anti-overfitting (critical)
-- The current eval task is **math** (DAPO-Math-17k), but the model must stay
-  **general-purpose**. **Do NOT hardcode math knowledge or task-specific hints** — no
+- Whatever the current task family is, the model must stay **general-purpose**.
+  **Do NOT hardcode domain knowledge or task-specific hints** — no
   answer-format special-casing beyond what's already in the harness, no "if the problem
   mentions…" behaviors, no dataset-specific heuristics.
 - **Never reference task names / families, datasets, or specific prompts** in the specs.
@@ -53,20 +53,20 @@ The model is RL-trained on verified rollouts produced by (model, harness); the h
 improved in the same loop. Your job is to specify the *capabilities* (behaviors) the model
 should gain so the system gets more reward on tasks the harness's failures expose.
 
-**The search space is model behavior, not code.** You do not edit source; you write
-capability specifications. Each spec is a concise, testable statement of a behavior the
-model must learn — precise enough that a downstream realization map `f` can turn it into
-verifiable training tasks (select matching ones from the dataset or synthesize new ones).
+**The search space is model behavior.** You do not edit the harness; you write a capability
+specification plus the **check functions** that make it a training reward. The model is then
+RL-trained on the train tasks with reward = 0.5 × answer correctness + 0.5 × mean(your checks),
+so your checks decide which behavior the update reinforces. See instructions.md for the check
+contract (`def <check>(traj: dict) -> bool | float`, helpers in `sigma_checklib`).
 
 **Key things to read first (use the file editor / terminal in your workspace):**
-- `eval_prior/aggregated.jsonl` and `evolution_summary.jsonl` — which trials failed.
-- `eval_prior/trials/*/agent/mini-swe-agent.txt` and `trajectory.json` — **why** they failed
-  (the actual turn-by-turn model behavior).
-- `eval_prior/frontier.json` — the incumbent score to beat.
+- `../frontier.json`, `../evolution_summary.jsonl` — the incumbent and the history.
+- `*/eval_before/*/agent/mini-swe-agent.txt` and `*/eval_after/*/...` — **why** trials failed
+  (the actual turn-by-turn model behavior); `result.json` has each trial's reward, and
+  `mini-swe-agent.trajectory.json` is the exact object your checks receive.
 
 ## WORKFLOW
-1. **Analyze.** Read the prior-results context mounted under `eval_prior/` (frontier +
-   recent iteration summaries + trial trajectories/metrics). Identify the most promising
+1. **Analyze.** Read the frontier, the iteration summaries and the train-sample trials. Identify the most promising
    **model-side** failure mode: e.g. the model stops prematurely and never reaches the answer;
    emits a malformed tool call and never retries; floods context by repeating commands; loses
    the goal mid-trail; formats the final answer so the verifier rejects it; loops without
@@ -74,20 +74,20 @@ verifiable training tasks (select matching ones from the dataset or synthesize n
    capability) versus a harness artifact — you propose what the model should learn.
 2. **State a falsifiable hypothesis** — one sentence per capability on what behavior change
    will raise verified reward and why.
-3. **Write the spec** — exactly one `.md` file under `model_specs/` in your
-   workspace. Each file: `name`, `hypothesis`, `evidence` (which trajectories support it),
-   `spec` (the precise capability σ the model must learn, written so a realization map can
-   turn it into training tasks), and `counterexample` (an input the current model gets wrong).
-4. **Validate** — run the spec validator on the file you wrote and fix anything it rejects:
-   `python -m mho.optimizer.model_spec validate model_specs/<name>.md`
-   (or `... check model_specs/` for the whole dir). This enforces the schema: YAML frontmatter
-   with `name`/`hypothesis`/`evidence`/`spec`/`counterexample`/`realization`, `name` matching the
-   file stem, and a non-empty capability spec. Also confirm it is standalone and
-   general-purpose (no task/dataset references).
-5. **Record** — keep the spec self-contained; the single spec file IS the proposal.
+3. **Write the spec** — `<tag>/model_specs/<name>.md`: `name`, `hypothesis`, `evidence`
+   (which trajectories support it), `spec` (the precise capability σ), `counterexample` (an
+   input the current model gets wrong), `realization`, and `checks` (function names).
+4. **Write the checks** — `<tag>/model_specs/<name>.py`, one function per name in `checks`,
+   each reading ONE rollout's trajectory and returning bool or a float in [0, 1]. A check must
+   separate rollouts that show the behavior from ones that don't; prefer what the agent did
+   (`commands`, `tool_results`) over what it said.
+5. **Validate** — `python -m mho.optimizer.model_spec validate ./<tag>/model_specs/<name>.md`.
+6. **Screen** — `python -m mho.data.reward_synthesis screen --spec ./<tag>/model_specs/<name>.md --traces .`
+   runs the checks on this run's trajectories exactly as training will. It rejects a check that
+   raises or returns the same value everywhere (such a check changes no advantage). Read the
+   mean and the correlation with reward; fix and re-screen until it passes.
 
 ## OUTPUT CONTRACT
-When you finish, the single spec file in `model_specs/` **is** the proposal: one standalone
-capability specification (name / hypothesis / evidence / spec / counterexample / realization).
-There is no separate submission file — the realization step reads `model_specs/` directly to
-build the model's next training data.
+When you finish, `<tag>/model_specs/<name>.md` and `<tag>/model_specs/<name>.py` **are** the
+proposal. The loop re-runs the validation and the screen; a spec that fails either is not
+trained. There is no separate submission file.

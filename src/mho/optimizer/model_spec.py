@@ -13,6 +13,11 @@ structured fields; the body is free-form elaboration (optional). The frontmatter
   spec:            the precise capability the model must learn (the sigma)
   counterexample:  an input the current model gets wrong (concrete)
   realization:     select | synthesize   (how f turns spec into training data; default synthesize)
+  checks:          names of the check functions that score a rollout for this capability. They
+                   are defined in model_specs/<name>.py beside the spec:
+                       def <check>(traj: dict) -> bool | float   (float in [0, 1])
+                   See mho.data.sigma_checklib for the trajectory helpers and
+                   mho.data.reward_synthesis for how they become the training reward.
 
 Usage (agent-invoked, gives write-time feedback):
   python -m mho.optimizer.model_spec validate <spec.md>...
@@ -27,7 +32,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
 
@@ -39,10 +44,20 @@ class ModelSpec(BaseModel):
     spec: str
     counterexample: str
     realization: str = Field(default="synthesize")
-    # Explicit, objectively-checkable conditions the reward verifier can assert. Each is a
-    # boolean expression over `output` (the model's final answer) and `traj` (trajectory text).
-    # f (mho.data.reward_synthesis) compiles these into verifier assertions; reward = fraction met.
-    checks: list[str] = Field(default_factory=list)
+    # Names of the check functions (in model_specs/<name>.py) that score each rollout's
+    # trajectory for this capability. The training reward is 0.5 * correctness + 0.5 * their mean
+    # (mho.data.reward_synthesis / sigma_rule).
+    checks: list[str] = Field(min_length=1)
+
+    @field_validator("checks")
+    @classmethod
+    def _identifiers(cls, v: list[str]) -> list[str]:
+        bad = [c for c in v if not str(c).isidentifier()]
+        if bad:
+            raise ValueError(f"checks must be function names (identifiers), not expressions: {bad}")
+        if len(set(v)) != len(v):
+            raise ValueError("checks must not repeat a name")
+        return v
 
 
 def parse_spec(path: Path) -> tuple[ModelSpec, str]:
@@ -75,7 +90,12 @@ def parse_spec(path: Path) -> tuple[ModelSpec, str]:
 
 
 def validate_file(path: Path) -> None:
-    parse_spec(path)  # raises on any violation
+    """Schema + the checks module: model_specs/<name>.py must define every listed check.
+    Raises ValueError on any violation. (Whether the checks run and vary is the screen's job:
+    python -m mho.data.reward_synthesis screen --spec <spec.md>.)"""
+    from mho.data import reward_synthesis
+    spec, _ = parse_spec(path)
+    reward_synthesis.produce_config(spec, reward_synthesis.checks_module(path))
 
 
 def check_dir(d: Path) -> list[Path]:

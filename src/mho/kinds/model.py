@@ -7,7 +7,6 @@ under candidates/<tag>/train/checkpoints/hf/ is the candidate model. It is train
 """
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 from typing import Any, Callable
@@ -18,7 +17,10 @@ from .base import Kind, Pair
 
 
 def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, Path | None]:
-    """Realize a MODEL proposal's model_specs/*.md into model/sigma_rewards/<name>.json.
+    """Realize a MODEL proposal's model_specs/<name>.md + <name>.py into
+    model/sigma_rewards/<name>.json + <name>.py, after screening the checks on the run's
+    train-sample trajectories (candidates/*/eval_before|eval_after/); a spec whose checks crash or
+    never vary is not realized (report in model/sigma_rewards/screen/<name>.json).
     Idempotent + re-runnable: on resume we call this again for any spec file that has no
     realized config yet, so a crash between "specs written" and "sigma_rewards written" is
     recovered instead of re-running the whole propose job.
@@ -29,24 +31,29 @@ def realize_model_specs(cand_dir: Path, train_data: str | Path) -> tuple[bool, P
         return False, None
     from mho.data import reward_synthesis
     from mho.optimizer import model_spec as _ms
-    train_root = Path(train_data)
-    src_task = next((p for p in sorted(train_root.iterdir()) if p.is_dir()), None)
     sr_dir.mkdir(parents=True, exist_ok=True)
-    n = 0
+    n, traces = 0, None
     for md in sorted(spec_dir.glob("*.md")):
         if md.name.startswith("eval_prior") or md.name == "harness.md":
             continue
-        out = sr_dir / f"{md.stem}.json"
-        if out.exists():           # already realized -> skip, don't clobber
+        if (sr_dir / f"{md.stem}.json").exists():   # already realized -> skip, don't clobber
             continue
+        if traces is None:
+            traces = reward_synthesis.find_traces([cand_dir.parent])
         try:
-            spec, _ = _ms.parse_spec(md)
-            cfg = reward_synthesis.produce_config(src_task, spec) if src_task else \
-                {"sigma": spec.name, "expected_answer": "", "checks": spec.checks}
-            out.write_text(json.dumps(cfg, indent=2) + "\n")
-            n += 1
+            # {sigma, checks} + the checks module; each train task's own expected answer is
+            # added when train.sh stages the split (reward_synthesis.stage_tasks).
+            ok, report = reward_synthesis.realize(md, sr_dir, traces)
         except Exception as e:
             print(f"  [realize] {md.name} failed: {e}")
+            continue
+        if ok:
+            n += 1
+            print(f"  [realize] {md.stem}: screen {report['status']} ({report['n_traces']} trajectories)")
+        else:
+            why = "; ".join(f"{k}: {v['verdict']}" for k, v in report["checks"].items()
+                            if v["verdict"] != "ok") or report["status"]
+            print(f"  [realize] {md.stem} rejected by the screen: {why}")
     if n:
         print(f"  [realize] realized {n} sigma-reward config(s) -> {sr_dir}")
     # Uniform candidate record: a MODEL proposal gets a CANDIDATE.md too (synthesized from its
