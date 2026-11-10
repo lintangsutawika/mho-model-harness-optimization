@@ -10,7 +10,9 @@ from . import REPO_DIR
 # Submits export the driver's env (qsub -V / sbatch --export=ALL); when the driver itself runs
 # inside a batch job these would leak into every child (e.g. RTYPE=rt_HC put GPU evals on
 # CPU nodes). The scheduler sets the child's own values for these at job start.
-_JOB_LOCAL_PREFIXES = ("PBS_", "SLURM_", "TMUX")
+# SBATCH_*/SALLOC_* are sbatch/salloc INPUT variables (e.g. SBATCH_PARTITION = default -p): a
+# driver launched with them would push its own partition/account onto every child job.
+_JOB_LOCAL_PREFIXES = ("PBS_", "SLURM_", "SBATCH_", "SALLOC_", "TMUX")
 _JOB_LOCAL_VARS = frozenset({
     "RTYPE", "JOB_NAME",                                     # submit_pbs.sh knobs
     "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES",
@@ -55,15 +57,19 @@ def _phase_res(phase: str) -> dict[str, str]:
     them, so the same MHO_<PHASE>_NGPUS/CPUS works on either backend. QUEUE/ACCOUNT/WALLTIME
     are already neutral (PBS -q/-P/-l walltime vs SLURM -p/-A/-t). SELECT (raw PBS
     ``-l select=`` for full-node/reservation shapes) and RTYPE (PBS ``-v RTYPE=``, ABCI RESERVE
-    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. Per-phase
+    queues) are PBS-only escape hatches; the Scheduler ignores both on SLURM. QOS/MEM are the
+    SLURM-only counterparts (--qos / --mem), e.g. a CPU-only QoS when the default one needs
+    a GPU; PBS ignores them. Per-phase
     MHO_<PHASE>_<VAR> overrides the shared base MHO_<VAR>; unset falls back to phase defaults.
     """
-    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS")}
+    base = {k: os.environ.get(f"MHO_{k}") for k in ("QUEUE", "RTYPE", "SELECT", "WALLTIME", "NGPUS", "QOS", "MEM")}
     get = lambda k: os.environ.get(f"MHO_{phase}_{k}", base[k])
     return {
         "queue": get("QUEUE") or "",
         "select": get("SELECT") or "",
         "resource_type": get("RTYPE") or "",
+        "qos": get("QOS") or "",
+        "mem": get("MEM") or "",
         "walltime": get("WALLTIME") or ("08:00:00" if phase == "EVAL" else "24:00:00" if phase == "TRAIN" else "02:00:00"),
         "ngpus": int(get("NGPUS") or (1 if phase == "EVAL" else 8 if phase == "TRAIN" else 0)),
         "cpus": int(os.environ.get(f"MHO_{phase}_CPUS", 0) or 0),
