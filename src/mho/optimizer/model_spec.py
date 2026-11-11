@@ -18,6 +18,13 @@ structured fields; the body is free-form elaboration (optional). The frontmatter
                        def <check>(traj: dict) -> bool | float   (float in [0, 1])
                    See mho.data.sigma_checklib for the trajectory helpers and
                    mho.data.reward_synthesis for how they become the training reward.
+  rubric:          (required for realization: select) the criteria a train task must meet to
+                   exercise this capability, each with keywords looked for in its instruction:
+                       - criterion: reads and cleans a CSV
+                         keywords: [csv, read_csv, missing values]
+                         weight: 1        # optional, default 1
+                   A task's score is the weighted share of criteria with a keyword hit; tasks
+                   scoring >= the threshold (0.5) are kept. See mho.data.task_select.
 
 Usage (agent-invoked, gives write-time feedback):
   python -m mho.optimizer.model_spec validate <spec.md>...
@@ -32,9 +39,23 @@ import sys
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.DOTALL)
+
+
+class RubricItem(BaseModel):
+    criterion: str
+    keywords: list[str] = Field(min_length=1)
+    weight: float = Field(default=1.0, gt=0)
+
+    @field_validator("keywords")
+    @classmethod
+    def _nonblank(cls, v: list[str]) -> list[str]:
+        v = [str(k).strip() for k in v]
+        if not all(v):
+            raise ValueError("keywords must not be blank")
+        return v
 
 
 class ModelSpec(BaseModel):
@@ -48,6 +69,16 @@ class ModelSpec(BaseModel):
     # trajectory for this capability. The training reward is 0.5 * correctness + 0.5 * their mean
     # (mho.data.reward_synthesis / sigma_rule).
     checks: list[str] = Field(min_length=1)
+    # Which train tasks to keep (realization: select); scored by mho.data.task_select.
+    rubric: list[RubricItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _realization(self) -> "ModelSpec":
+        if self.realization not in ("select", "synthesize"):
+            raise ValueError(f"realization must be select or synthesize, not {self.realization!r}")
+        if self.realization == "select" and not self.rubric:
+            raise ValueError("realization: select needs a `rubric` (criteria + keywords)")
+        return self
 
     @field_validator("checks")
     @classmethod

@@ -76,7 +76,9 @@ contract (`def <check>(traj: dict) -> bool | float`, helpers in `sigma_checklib`
    will raise verified reward and why.
 3. **Write the spec** — `<tag>/model_specs/<name>.md`: `name`, `hypothesis`, `evidence`
    (which trajectories support it), `spec` (the precise capability σ), `counterexample` (an
-   input the current model gets wrong), `realization`, and `checks` (function names).
+   input the current model gets wrong), `realization: select`, `checks` (function names), and
+   `rubric` (criteria + keywords that pick the train tasks exercising the capability; see
+   instructions.md).
 4. **Write the checks** — `<tag>/model_specs/<name>.py`, one function per name in `checks`,
    each reading ONE rollout's trajectory and returning bool or a float in [0, 1]. A check must
    separate rollouts that show the behavior from ones that don't; prefer what the agent did
@@ -86,6 +88,9 @@ contract (`def <check>(traj: dict) -> bool | float`, helpers in `sigma_checklib`
    runs the checks on this run's trajectories exactly as training will. It rejects a check that
    raises or returns the same value everywhere (such a check changes no advantage). Read the
    mean and the correlation with reward; fix and re-screen until it passes.
+7. **Screen the rubric** — `python -m mho.data.task_select screen --spec ./<tag>/model_specs/<name>.md --traces .`
+   scores the train-sample tasks and rejects a rubric that keeps none or all of them. Aim for a
+   kept set with fewer always-failed (all_0) and always-solved (all_1) tasks than the dropped set.
 
 ## OUTPUT CONTRACT
 When you finish, `<tag>/model_specs/<name>.md` and `<tag>/model_specs/<name>.py` **are** the

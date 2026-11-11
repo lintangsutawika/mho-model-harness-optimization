@@ -16,7 +16,8 @@ This is the run's candidate archive (`candidates/`). Your own candidate dir is n
 
 ## What you write (two files, same name)
 1. `<tag>/model_specs/<name>.md`: YAML frontmatter with `name` (= `<name>`), `hypothesis`,
-   `evidence`, `spec`, `counterexample`, `realization`, and `checks` (a list of function names).
+   `evidence`, `spec`, `counterexample`, `realization` (`select`), `checks` (a list of function
+   names), and `rubric` (which train tasks to practise on, below).
 2. `<tag>/model_specs/<name>.py`: those functions. Each scores ONE rollout's trajectory:
    ```python
    from sigma_checklib import *   # messages, assistant_texts, reasoning_texts, commands,
@@ -31,6 +32,32 @@ This is the run's candidate archive (`candidates/`). Your own candidate dir is n
 Training reward per rollout = 0.5 × answer correctness (the task's own verifier) + 0.5 × the
 mean of your checks. The weights are fixed: your checks can move at most half the reward, and
 they cannot make a wrong answer look right.
+
+## Which train tasks to practise on (`realization: select` + `rubric`)
+The same spec also picks the train tasks the model trains on. Set `realization: select` and
+add a `rubric`: the criteria a task must meet to exercise this capability, each with keywords
+looked for in the task's instruction:
+```yaml
+realization: select
+rubric:
+  - criterion: the task gives a file to transform     # what the task asks for, not the answer
+    keywords: [input file, read, parse]
+  - criterion: the result must match an exact format
+    keywords: [exact format, must match, schema]
+    weight: 2                                          # optional, default 1
+```
+A task's score is the weighted share of criteria with at least one keyword in its instruction
+(case-insensitive, whole words); tasks scoring >= 0.5 are kept. Write keywords that appear in
+the tasks where the failure shows up and are absent elsewhere: a word every instruction
+contains keeps everything and selects nothing. Quote keywords YAML would read as something
+else (`"null"`, `"yes"`, `"no"`, `"true"`).
+**Screen the rubric too:**
+`python -m mho.data.task_select screen --spec ./<tag>/model_specs/<name>.md --traces .`
+scores the tasks of this run's train-sample trials and rejects a rubric that keeps none or all
+of them. For kept vs dropped tasks it reports the mean reward and the share of tasks whose
+trials all failed (all_0) or all passed (all_1). Tasks the model always fails or always solves
+teach it nothing under RL, so aim for a kept set with lower all_0 and all_1 than the dropped
+set.
 
 ## What makes a good check
 - It measures the behavior your spec names, read from what the agent actually did (commands,
@@ -58,5 +85,5 @@ ideas held up. You do NOT see val tasks or traces; the only traces are the train
 Do not look for val traces, and do not tune toward the val split.
 
 Now: analyze the trajectories, identify the single most-predictive model-side failure mode,
-write the spec and its checks, validate, screen, and fix until both pass. Write each YAML field
+write the spec, its checks and its rubric, validate, screen both, and fix until all pass. Write each YAML field
 as a block scalar (`key: |`) or quoted when it contains `:` or spans lines.

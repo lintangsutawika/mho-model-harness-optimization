@@ -62,14 +62,28 @@ fi
 # candidate). Stage a copy of the train split whose tests/ run the task's own verifier and then
 # the sigma rule (mho.data.reward_synthesis stage), and train on that copy. The base split is
 # never modified. Unset -> train on the plain split (correctness reward).
+# MHO_SIGMA_USE picks what the sigma changes: reward (default) | select (keep only the train
+# tasks its rubric selects, mho.data.task_select; plain reward) | both (select, then reward).
 if [ -n "${MHO_SIGMA_REWARD:-}" ]; then
   [ -f "$MHO_SIGMA_REWARD" ] || { echo "ERROR: MHO_SIGMA_REWARD=$MHO_SIGMA_REWARD not found" >&2; exit 2; }
-  SIGMA_TASKS_DIR="${RUN_DIR}/sigma_tasks"
+  MHO_SIGMA_USE="${MHO_SIGMA_USE:-reward}"
+  case "$MHO_SIGMA_USE" in reward|select|both) ;; *)
+    echo "ERROR: MHO_SIGMA_USE=$MHO_SIGMA_USE (want reward|select|both)" >&2; exit 2;; esac
   _PY="${REPO_DIR}/.venv/bin/python"; [ -x "$_PY" ] || _PY=python3
-  PYTHONPATH="${REPO_DIR}/src" "$_PY" -m mho.data.reward_synthesis stage \
-    --train-dir "$MATH_TRAIN_DIR" --sigma "$MHO_SIGMA_REWARD" --out "$SIGMA_TASKS_DIR"
-  MATH_TRAIN_DIR="$SIGMA_TASKS_DIR"
-  HARBOR_TASKS_DIR="$SIGMA_TASKS_DIR"
+  if [ "$MHO_SIGMA_USE" != reward ]; then
+    SELECTED_TASKS_DIR="${RUN_DIR}/selected_tasks"
+    PYTHONPATH="${REPO_DIR}/src" "$_PY" -m mho.data.task_select \
+      --train-dir "$MATH_TRAIN_DIR" --sigma "$MHO_SIGMA_REWARD" --out "$SELECTED_TASKS_DIR"
+    MATH_TRAIN_DIR="$SELECTED_TASKS_DIR"
+    HARBOR_TASKS_DIR="$SELECTED_TASKS_DIR"
+  fi
+  if [ "$MHO_SIGMA_USE" != select ]; then
+    SIGMA_TASKS_DIR="${RUN_DIR}/sigma_tasks"
+    PYTHONPATH="${REPO_DIR}/src" "$_PY" -m mho.data.reward_synthesis stage \
+      --train-dir "$MATH_TRAIN_DIR" --sigma "$MHO_SIGMA_REWARD" --out "$SIGMA_TASKS_DIR"
+    MATH_TRAIN_DIR="$SIGMA_TASKS_DIR"
+    HARBOR_TASKS_DIR="$SIGMA_TASKS_DIR"
+  fi
 fi
 SAVE_DIR="${SAVE_DIR:-${RUN_DIR}/checkpoints}"
 mkdir -p "$SAVE_DIR"

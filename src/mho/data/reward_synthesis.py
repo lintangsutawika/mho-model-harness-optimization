@@ -82,7 +82,10 @@ def produce_config(spec, checks_py: Path) -> dict:
     missing = [c for c in spec.checks if c not in defined_functions(checks_py)]
     if missing:
         raise ValueError(f"sigma '{spec.name}': {missing} not defined in {Path(checks_py).name}")
-    return {"sigma": spec.name, "checks": list(spec.checks)}
+    cfg = {"sigma": spec.name, "checks": list(spec.checks)}
+    if spec.rubric:     # read by mho.data.task_select (MHO_SIGMA_USE=select|both)
+        cfg["rubric"] = [r.model_dump() for r in spec.rubric]
+    return cfg
 
 
 # --------------------------------------------------------------------------- screening
@@ -181,6 +184,12 @@ def realize(spec_md: Path, out_dir: Path, traces: list[Path]) -> tuple[bool, dic
     py = checks_module(spec_md)
     cfg = produce_config(spec, py)
     ok, report = screen(py, cfg["checks"], traces)
+    if spec.rubric:     # realization: select -- the rubric must also separate tasks
+        from mho.data import task_select
+        r_ok, report["rubric"] = task_select.screen_rubric(cfg["rubric"], traces)
+        # Gate only when training will select on it (MHO_SIGMA_USE, see train.sh).
+        if not r_ok and os.environ.get("MHO_SIGMA_USE", "reward") != "reward":
+            ok, report["status"] = False, "rubric " + report["rubric"]["status"]
     (out_dir / "screen").mkdir(parents=True, exist_ok=True)
     (out_dir / "screen" / f"{spec.name}.json").write_text(json.dumps(report, indent=2) + "\n")
     if ok:
