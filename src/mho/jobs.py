@@ -213,6 +213,9 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
         # The training script realizes this sigma-reward over the train cohort (injects it into
         # the staged train tasks just-in-time) so the model trains on sigma-shaped rewards.
         extra["MHO_SIGMA_REWARD"] = sigma_reward
+        # reward | select | both: which variant train.sh trains on (curation vs reward ablation).
+        if os.environ.get("MHO_SIGMA_USE"):
+            extra["MHO_SIGMA_USE"] = os.environ["MHO_SIGMA_USE"]
     if train_data:
         extra["MHO_TRAIN_DATA"] = train_data
     return sched.submit(TRAIN_SCRIPT, _phase_env(extra, None), name=f"mho-train-{tag}",
