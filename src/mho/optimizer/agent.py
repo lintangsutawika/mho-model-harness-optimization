@@ -309,7 +309,7 @@ A directory you leave unchanged or broken is re-proposed by a separate session, 
 """
 
 
-def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
+def _run_openhands(workspace: Path, instructions: str, skill_dir: Path):
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
     from openhands.sdk.skills.skill import Skill
@@ -344,6 +344,7 @@ def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     conversation = Conversation(agent=agent, workspace=LocalWorkspace(working_dir=str(workspace)))
     conversation.send_message(instructions)
     conversation.run()
+    return llm   # its .metrics hold the session's tokens and cost
 
 
 def _py_files(root: Path) -> list[Path]:
