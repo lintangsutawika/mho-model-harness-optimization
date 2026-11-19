@@ -191,6 +191,9 @@ class RolloutReader:
         for key in ("reason", "failure_kind"):
             if outcome.get(key):
                 extra[key] = outcome[key]
+        outcome_meta = outcome.get("metadata")  # kept only by a patched platoon (patches/platoon-outcome-metadata.patch)
+        if isinstance(outcome_meta, Mapping) and outcome_meta.get("verifier_exit_code") is not None:
+            extra["verifier_exit_code"] = outcome_meta["verifier_exit_code"]
         if isinstance(harness, Mapping):
             extra["exit_code"] = harness.get("exit_code")
             extra["timed_out"] = harness.get("timed_out")

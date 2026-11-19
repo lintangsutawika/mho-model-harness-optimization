@@ -12,7 +12,8 @@ candidates on Harbor tasks, plus a `FakeBackend` for other workstreams' tests.
 | `dataset` | copies the requested tasks, giving Dockerfile-only tasks their `FROM` image | stdlib |
 | `fake` | `FakeBackend`: scripted rewards, simulated clock, task-major, stop | stdlib |
 | `jobs` | `eval_node_job`: the PBS job an evaluation runs in (`contracts.JobSpec`) | stdlib |
-| `__main__` | `python -m harnessforge.evals run REQUEST.json` / `stage-images` | stdlib |
+| `harbor_export` | platoon run dirs -> harbor-compatible trial dirs (result.json, agent/, verifier/) for harbor-era readers | stdlib |
+| `__main__` | `python -m harnessforge.evals run REQUEST.json [--harbor-export DIR]` / `export` / `stage-images` | stdlib |
 
 ## How a candidate runs
 
@@ -219,6 +220,146 @@ fields plus `platoon` and `site`; options are listed in `backend.py`'s docstring
 with `request.concurrency` per candidate, `stop()` ends a candidate's in-flight trials as `env_failed` `"stopped"`,
 `env_failures` scripts sandbox failures, rewards are deterministic per seed.
 
+## Harbor-compatible export (`harbor_export`)
+
+The old optimizer loop, the proposer, `utils/gate.py` / `utils/seq.py`, `scripts/optimize/aggregate_results.py` and
+the ad-hoc analysis scripts (`tb21cmp.py`, `speed.py`) read harbor's per-trial layout. `harbor_export` writes that
+layout from a platoon run, so they read platoon runs unchanged:
+
+```bash
+python -m harnessforge.evals run request.json --harbor-export DIR    # incremental: every --poll, plus a final pass
+python -m harnessforge.evals export <out_dir>/<run_id> DIR            # once, over an existing run dir
+```
+
+`DIR/<candidate>/` is a harbor job dir (what `eval.sh`'s `<cand>/eval/` was; point the loop's `eval_before/` /
+`eval_after/`, `gate.per_task` or a `*/result.json` glob at it):
+
+```
+DIR/<candidate>/config.json, result.json      job level (n_attempts, agents, datasets / n_total_trials, stats.evals)
+DIR/<candidate>/<task>__r<kkk>/                one trial; kkk = platoon's rollout index (= TrialRecord.index)
+    config.json                                task.path, trial_name, agent; its mtime is the launch time
+    result.json                                harbor's TrialResult (below); written last, once the trial finished
+    agent/mini-swe-agent.trajectory.json       the agent's own trajectory (collected), else rebuilt from platoon's
+    agent/mini-swe-agent.txt                   a readable transcript of that trajectory
+    agent/platoon-harness.log                  platoon's harness log (install output, the agent's stdout/stderr)
+    verifier/test-stdout.txt                   the tests' output, when known (collected, else platoon's 4 KB tail)
+    verifier/reward.txt                        a scored trial's reward
+    harnessforge.json                          the TrialRecord the trial was exported from
+```
+
+In-flight trials get `config.json` only (as harbor's running trials have no finished `result.json`), so
+`seq.launched` sees them; once a stopped candidate's process has exited (or the export is `--final`, or the run's
+`status.json` says done) its unfinished trials are written as env-failed `stopped`, like the TrialRecords. Trials are
+exported once; a restarted exporter skips trials whose `result.json` exists.
+
+**`result.json`** carries what the readers use: `task_name` (task.toml `[task].name`, else the task id: harbor's
+name, so platoon and harbor runs of a dataset pair by task), `trial_name`, `config.task.path`,
+`verifier_result.rewards.reward` (scored trials only; the readers count a missing one as 0, as they did for
+harbor), `agent_result.n_input_tokens` / `n_output_tokens` / `n_cache_tokens` / `cost_usd`, `exception_info`
+(`exception_type`, `exception_message`), `started_at` / `finished_at` and the phases `environment_setup`,
+`agent_setup`, `agent_execution`, `verifier`, plus a `harnessforge` block (candidate, index, env_failed, error,
+outcome status, failure kind, which sources the trajectory and the test output came from).
+
+**Exceptions** are chosen so harbor's rules give the TrialRecord's answers: `gate.env_failed(result)` (an exception
+and no `agent_setup`) == `TrialRecord.env_failed`, the readers' reward == `TrialRecord.reward or 0`, and a script that
+drops harbor's two "never started" types (`tb21cmp.py`'s `INFRA`) drops exactly the env-failed trials. The message
+starts with `[platoon <TrialRecord.error>]`, so the real cause is never lost.
+
+| TrialRecord (`error`) | `exception_type` | `agent_setup` |
+|---|---|---|
+| scored, no reason | none | yes |
+| `scored:agent_timeout` (or harness timed out) | `AgentTimeoutError` | yes |
+| `scored:harness_crash` / nonzero harness exit | `NonZeroAgentExitCodeError` ("Command failed (exit N)") | yes |
+| `*context_overflow` | `NonZeroAgentExitCodeError` (message names `ContextWindowExceededError`) | yes |
+| `<status>:verifier_timeout` | `VerifierTimeoutError` | yes |
+| `<status>:verifier_no_reward`, `verifier_output` | `RewardFileNotFoundError` | yes |
+| other post-agent failure (reward 0) | `PlatoonError` | yes |
+| env_failed: `error:harness_setup`, `harness_config` | `AgentSetupTimeoutError` | **no** |
+| env_failed: every other (sandbox/env start, gateway, `backend_unavailable`, `cancelled`, `stopped`, no outcome) | `EnvironmentStartTimeoutError` | **no** |
+
+**Phase times are estimates.** platoon records a trial's start (`created_at - wall_time_seconds`) and end, and each
+model call's `perf_counter` span. The calls are put on the wall clock by the agent's own message timestamps (collected
+trajectory), else by the harness log's last write (= the agent's end), else by the trial's end minus the tests' time;
+`agent_execution` = first call start .. last call end, `environment_setup` ends when the sandbox was up (collect hook)
+or where the agent starts (then `agent_setup` has zero length), `verifier` = agent end .. trial end. Totals
+(`started_at`..`finished_at`) are exact; use `agent_execution` as "about how long the agent ran". Env-failed trials
+have only `environment_setup`.
+
+### Test output and the agent's trajectory
+
+platoon's rollout directory holds neither. Three sources, best first:
+
+1. **Collect hook** (no platoon change; on by default, backend option `collect`). `PodSingularityProvider`'s sandboxes
+   copy, just before they stop, `/logs/verifier/test-stdout.txt` (last 4 MB) and the agent's own trajectory
+   (`/tmp/platoon-harness/<agent>/trajectory.json`, which `render_spec`'s `--output` writes; micro-swe-agent rewrites
+   it after every step, so a timed-out trial's is there too) to `<run>/<candidate>/collected/<rollout id>/`, with a
+   `sandbox.json` of start/stop times. The rollout id is the sandbox's `platoon.rollout_id` label and the id of the
+   rollout's `trajectory_collection.json`. Best effort: bounded (60 s), logged, never fails the stop.
+2. **Patched platoon** (`src/harnessforge/evals/patches/platoon-outcome-metadata.patch`): keeps the outcome's metadata
+   in `misc.outcome.metadata` (`test_output`, the tests' 4 KB tail; `verifier_exit_code`; `verifier_seconds`; ...),
+   so the 0 of a trial whose sandbox was lost before the hook ran can still be explained. The reader puts
+   `verifier_exit_code` in `TrialRecord.extra`.
+3. **Rebuilt** from `trajectory_collection.json`: the task text and every model reply (content, tool calls, usage).
+
+**Trajectory parity** (harbor pilot p3 vs platoon p3, base, task_000663): harbor's
+`agent/mini-swe-agent.trajectory.json` is micro-swe-agent's own `save()` (system prompt, templated task, every
+assistant message with its raw response and timestamp, every tool output, the exit message with `exit_status`,
+`info.config`), `agent/mini-swe-agent.txt` is the agent's stdout (empty under `--exit-immediately`), `agent/trajectory.json`
+is harbor's ATIF conversion. The proposer stages `result.json`, `agent/mini-swe-agent.txt` and
+`agent/mini-swe-agent.trajectory.json`; the harness proposer also browses the trial dirs (`verifier/test-stdout.txt`).
+
+| | harbor | platoon rollout dir (rebuilt) | collected |
+|---|---|---|---|
+| assistant replies, tool calls, per-call usage | yes | yes | yes |
+| tool outputs (what the commands printed) | yes | **no** | yes |
+| system prompt, templated instance prompt | yes | no (raw task text only) | yes |
+| exit status / submission | yes | from the harness exit (`Submitted`, `AgentTimeout`, `ExitCode<n>`) | yes |
+| per-message wall-clock timestamps | yes | no (call spans only) | yes |
+| agent/model config (`info.config`) | yes | no | yes |
+| tests' output | `verifier/test-stdout.txt` | no (patched platoon: 4 KB tail) | full (last 4 MB) |
+| ATIF `agent/trajectory.json` | yes | not written (nothing here reads it) | not written |
+
+So with the collect hook the proposer sees what it saw under harbor (plus a rendered transcript where harbor's was
+empty). Exports of runs made before the hook have rebuilt trajectories without tool outputs and no test output.
+
+### Validation on ABCI
+
+Exports of existing platoon runs (made before the hook and the patch): pilot p3 (2 candidates x 32 tasks x 2), the
+race pilot `race1-A` (439 trials, 55 env-failed, stopped mid-run) and `race1-B` (426, 57), and `bench2` (2 x 10).
+For every candidate: one `result.json` per finished trial; `gate.env_failed` == `TrialRecord.env_failed` on every
+trial; `gate.env_failures` and `gate.per_task` (reward, n, token cost per task) equal the records'; `seq.launched`
+sees every launched trial in index order and `seq.look_pt` at the last full look agrees with `gate.per_task`; the
+`tb21cmp.py` reader drops exactly the env-failed trials and gets the same accuracy; `aggregate_results.aggregate`
+runs; the proposer's `_stage_prior_results` stages `result.json` + both agent files. tb21cmp-style pairing of the
+harbor pilot p3 against the platoon p3 export matches all 32 task names (base: harbor 0.438, platoon 0.469, d +0.031
+SE 0.059; cand: 0.578 vs 0.531, d -0.047 SE 0.052, as in "Pilot" above).
+
+End to end with the hook and the patched platoon (`~/hf-dev/harbor-export/venv`): a real `platoon eval` (3 pilot tasks
+x 2 trials, pods on rt_HC) against a scripted OpenAI-compatible stand-in for the model, run with `--harbor-export`:
+6/6 trials exported while running, each with the agent's own trajectory (system, user, assistant, tool and exit
+messages) and the full `verifier/test-stdout.txt`, `misc.outcome.metadata` holding `test_output` /
+`verifier_exit_code` / `verifier_seconds`; the same consumer checks pass.
+
+### The platoon patch
+
+`patches/platoon-outcome-metadata.patch` (to `platoon/gateway/trace.py`, platoon 0.6.0): `_OutcomeFields.of` adds
+the outcome's JSON-valued metadata to the summary it records as `misc["outcome"]`. Apply with `patch -p1` in the
+site-packages dir. On ABCI it is applied only in a separate venv, `~/hf-dev/harbor-export/venv` (same package set as
+`~/hf-dev/evals/venv`, from its `uv pip freeze`); `~/hf-dev/evals/venv` (used by the evals and the live GRPO run) is
+unchanged. Point a request's `platoon` at `~/hf-dev/harbor-export/venv/bin/platoon` to use it.
+
+Draft upstream PR (not opened):
+
+> **gateway/trace: keep the outcome's metadata in the trajectory's `misc["outcome"]`**
+>
+> An env's `Outcome.metadata` (for Harbor tasks: `test_output`, the tail of the tests' output; `verifier_exit_code`;
+> `verifier_seconds`; `artifacts`) is built on every rollout but dropped when the gateway records the outcome as
+> `misc["outcome"]`, so it never reaches `trajectory_collection.json`, the rollout events or the reports. A 0 from a
+> Harbor task then cannot be explained from the eval output (Harbor's own runs keep `verifier/test-stdout.txt`).
+> This adds `misc["outcome"]["metadata"]`: the metadata's JSON-serializable entries (others are skipped, so the
+> record stays JSON). Readers that look up `status` / `rewards` / `reason` / `failure_kind` are unaffected; the size
+> cost is the 4 KB output tail per rollout. Alternative: a `test_output` key only, if the full metadata is too broad.
+
 ## Running the gold-harness benchmark (`harnessforge.bench`)
 
 The bench tasks and harnesses go through this backend unchanged (`test_bench_tasks_and_harnesses_fit_the_platoon_backend`;
@@ -280,9 +421,14 @@ backend calls they make are the ones in "Running it".
 
 ## Known gaps
 
-- **Verifier output is not kept.** platoon puts the tests' output tail in the outcome's metadata but does not write it
-  to the rollout directory (`trajectory_collection.json` has status and reward only), so a platoon 0 cannot be explained
-  from disk the way harbor's `verifier/test-stdout.txt` can. Needs a platoon change or a collect hook.
+- **Verifier output and tool outputs need the collect hook (or the patch).** platoon itself keeps neither the tests'
+  output nor the agent's tool outputs in the rollout dir. The pod provider's collect hook (default on) copies both;
+  the platoon patch keeps the 4 KB test-output tail in `misc.outcome.metadata`; runs made before either have
+  rebuilt trajectories (no tool outputs) and no `verifier/test-stdout.txt` in their harbor export. The hook only
+  exists in `PodSingularityProvider` (another provider collects nothing). See "Harbor-compatible export".
+- **Harbor export approximations.** Phase times are estimates (totals are exact); `agent/trajectory.json` (ATIF) is
+  not written; `task_checksum` is null; `agent_result.metadata` is null (as in our harbor runs, so
+  `aggregate_results.py`'s `n_turns` is null on both).
 - **Grading guard off.** Parity keeps the agent's processes alive through grading (both kills off), so a process the
   agent left behind could rewrite the reward files; harbor had the same exposure. Turn `harbor_keep_processes` off
   for tasks that do not need a running service once we no longer compare with harbor.

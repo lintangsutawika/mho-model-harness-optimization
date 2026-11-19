@@ -32,6 +32,14 @@ Two options keep per-trial setup cheap on a 32-core node running ~100 trials:
   `sandbox_start_budget_s` (600 s) per start, and a slot is held for seconds, so with 96 trials and 16 slots the
   longest wait is about six starts.
 
+`collect_dir` (set by `PlatoonBackend` unless its option `collect` is false): before a sandbox stops, copy what platoon
+does not keep out of it into `<collect_dir>/<rollout id>/` (the rollout id is the sandbox's `platoon.rollout_id` label,
+which is also the id of the rollout's trajectory_collection.json): the tests' output (`/logs/verifier/test-stdout.txt`,
+its last 4 MB), the agent's own trajectory (`/tmp/platoon-harness/<agent>/trajectory.json`, which our harness spec
+writes) as `agent/<agent>.trajectory.json`, and `sandbox.json` (labels; when its start was asked for, when it was up,
+when it was stopped). `harnessforge.evals.harbor_export` reads them. Collection is best effort: it is bounded by
+`COLLECT_TIMEOUT_S`, never fails the stop, and logs what it could not read.
+
 Select it in a Harbor entry: `provider: harnessforge.evals.pods:PodSingularityProvider`, with the usual singularity
 `provider_options` (image_cache, scratch_root, fakeroot, ...) plus `pod_users` and `keep_agent_processes`.
 """
@@ -40,7 +48,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import os
+import posixpath
+import time
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +62,71 @@ from platoon.sandbox.singularity import SingularityProvider
 from platoon.utils.stopping import let_finish
 
 from harnessforge.evals.start_gate import DEFAULT_MAX_STARTING, StartGate
+
+
+logger = logging.getLogger(__name__)
+
+#: What the collect hook copies (see the module docstring).
+TEST_STDOUT_PATH = "/logs/verifier/test-stdout.txt"
+AGENT_STATE_ROOT = "/tmp/platoon-harness"  # platoon.harness.runner.SANDBOX_STATE_ROOT
+AGENT_TRAJECTORY = "trajectory.json"       # harness.render_spec: --output={state_dir}/trajectory.json
+COLLECT_MAX_BYTES = 4 * 1024 * 1024
+COLLECT_TIMEOUT_S = 60.0
+ROLLOUT_LABEL = "platoon.rollout_id"
+
+
+def _safe_name(text: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in text)[:200] or "_"
+
+
+def _write_atomic(path: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
+async def collect(sandbox: Any) -> Path | None:
+    """Copy the tests' output and the agent's trajectory out of `sandbox` into its provider's `collect_dir` (see the
+    module docstring); returns the rollout's collect dir, or None when there is nothing to collect into. Never
+    raises (but for cancellation)."""
+    root = getattr(getattr(sandbox, "_provider", None), "collect_dir", None)
+    labels = getattr(sandbox, "_hf_labels", None) or {}
+    rollout = labels.get(ROLLOUT_LABEL)
+    if not root or not rollout:
+        return None
+    dest = Path(root) / _safe_name(str(rollout))
+    try:
+        await asyncio.wait_for(_collect(sandbox, dest, labels), COLLECT_TIMEOUT_S)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:  # a dead sandbox, a timeout: the trial's other files still count
+        logger.warning("collecting from sandbox %s (rollout %s) failed: %r", getattr(sandbox, "id", "?"), rollout, exc)
+    return dest
+
+
+async def _collect(sandbox: Any, dest: Path, labels: dict[str, str]) -> None:
+    verifier = labels.get("platoon.role") == "verifier"
+    times = dict(getattr(sandbox, "_hf_times", None) or {})
+    times["stop_requested"] = time.time()
+    _write_atomic(dest / ("sandbox-verifier.json" if verifier else "sandbox.json"),
+                  json.dumps({"id": getattr(sandbox, "id", None), "labels": labels, **times}, indent=1))
+    out = await sandbox.exec(["sh", "-c", f'[ -f "$1" ] && tail -c {COLLECT_MAX_BYTES} "$1"', "collect",
+                              TEST_STDOUT_PATH], cwd="/", timeout_s=COLLECT_TIMEOUT_S)
+    if out.exit_code == 0 and not out.timed_out:
+        _write_atomic(dest / "test-stdout.txt", out.stdout)
+    if verifier:
+        return
+    listing = await sandbox.exec(["sh", "-c", 'for f in "$1"/*/"$2"; do [ -f "$f" ] && echo "$f"; done; true',
+                                  "collect", AGENT_STATE_ROOT, AGENT_TRAJECTORY], cwd="/", timeout_s=COLLECT_TIMEOUT_S)
+    for path in (listing.stdout or "").splitlines():
+        path = path.strip()
+        if not path:
+            continue
+        got = await sandbox.exec(["cat", path], cwd="/", timeout_s=COLLECT_TIMEOUT_S)
+        if got.exit_code == 0 and not got.timed_out and got.stdout:
+            agent = _safe_name(posixpath.basename(posixpath.dirname(path)))
+            _write_atomic(dest / "agent" / f"{agent}.{AGENT_TRAJECTORY}", got.stdout)
 
 
 def load_image_map(path: str | os.PathLike | None) -> dict[str, str]:
@@ -89,6 +165,12 @@ class _KeepingSandbox(HpcSandbox):
         if not getattr(self._provider, "keep_agent_processes", False):
             await super().kill_processes()
 
+    async def stop(self) -> None:
+        try:
+            await collect(self)
+        finally:
+            await super().stop()
+
 
 class PodSandbox(_KeepingSandbox):
     """The `main` service of a one-service pod; stopping it stops the pod."""
@@ -99,6 +181,7 @@ class PodSandbox(_KeepingSandbox):
 
     async def stop(self) -> None:
         try:
+            await collect(self)
             await self._pod.stop()
         finally:
             cleanup.unregister(self._token)
@@ -107,7 +190,8 @@ class PodSandbox(_KeepingSandbox):
 
 class PodSingularityProvider(SingularityProvider):
     def __init__(self, *, pod_users: str = "subids", keep_agent_processes: bool = False,
-                 image_map: str | None = None, max_starting: int | None = None, **options: Any) -> None:
+                 image_map: str | None = None, max_starting: int | None = None, collect_dir: str | None = None,
+                 **options: Any) -> None:
         if pod_users not in ("subids", "single"):
             raise ValueError(f"pod_users must be subids or single, not {pod_users!r}")
         super().__init__(**options)
@@ -118,9 +202,10 @@ class PodSingularityProvider(SingularityProvider):
             raw = os.environ.get("HPCSB_MAX_STARTING", "").strip()
             max_starting = int(raw) if raw else DEFAULT_MAX_STARTING
         self.start_gate = StartGate(max_starting)
+        self.collect_dir = str(collect_dir) if collect_dir else None
         # what a reap rebuilds the provider from
         self.options = {**self.options, "pod_users": pod_users, "keep_agent_processes": self.keep_agent_processes,
-                        "image_map": image_map, "max_starting": max_starting}
+                        "image_map": image_map, "max_starting": max_starting, "collect_dir": self.collect_dir}
         # Its sandboxes do not share this host's network: the harness reaches the gateway through the pod's route.
         self.capabilities = frozenset(self.capabilities - {"host_loopback"})
 
@@ -128,12 +213,17 @@ class PodSingularityProvider(SingularityProvider):
         return _KeepingSandbox(self, inner, routes=routes)  # no-network tasks' single sandboxes
 
     async def start(self, spec: Any) -> HpcSandbox:
+        requested = time.time()
         if mapped := mapped_image(self.image_map, spec.image or ""):
             spec = dataclasses.replace(spec, image=mapped)
         async with self.start_gate.slot():
             if spec.network == "none":
-                return await super().start(spec)
-            return await self._start_pod(spec)
+                sandbox = await super().start(spec)
+            else:
+                sandbox = await self._start_pod(spec)
+        sandbox._hf_labels = dict(spec.labels or {})  # what collect() files it under
+        sandbox._hf_times = {"start_requested": requested, "started": time.time()}
+        return sandbox
 
     async def _start_pod(self, spec: Any) -> HpcSandbox:
         hs = self.hpc_sandbox
