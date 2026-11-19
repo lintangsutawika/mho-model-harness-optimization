@@ -270,3 +270,8 @@ def test_local_pool_end_to_end(tmp_path):
         os.environ.pop("HF_LAUNCHER", None)
         p.stop(wait=20)
     assert not (tmp_path / "state" / "e2e").exists()
+
+
+def test_cli_missing_pool_is_a_clean_error(tmp_path, capsys):
+    assert cli(["status", "--pool-id", "nope", "--state-root", str(tmp_path)]) == 2
+    assert "no pool state" in capsys.readouterr().err

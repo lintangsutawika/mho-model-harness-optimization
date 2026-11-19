@@ -3,6 +3,7 @@
     python -m harnessforge.pool start   --spec pool.yaml [--no-wait]
     python -m harnessforge.pool status  --spec pool.yaml [--json]
     python -m harnessforge.pool endpoint --spec pool.yaml
+    python -m harnessforge.pool wait    --spec pool.yaml [--timeout S]   # until all engines routed
     python -m harnessforge.pool load    --spec pool.yaml --id step200 --path /ckpt/step200 \\
                                         [--base-model Qwen/Qwen3.5-4B] [--no-drain]
     python -m harnessforge.pool repair  --spec pool.yaml
@@ -55,7 +56,7 @@ def _summary(h: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m harnessforge.pool", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["start", "status", "endpoint", "load", "repair",
+    ap.add_argument("cmd", choices=["start", "status", "endpoint", "wait", "load", "repair",
                                     "restart-node", "stop"])
     ap.add_argument("--spec")
     ap.add_argument("--pool-id")
@@ -81,6 +82,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(h, indent=1) if a.json else _summary(h))
         elif a.cmd == "endpoint":
             print(p.endpoint())
+        elif a.cmd == "wait":
+            p.wait_ready(timeout=a.timeout)
+            print(p.endpoint())
         elif a.cmd == "load":
             if not (a.id and a.path):
                 sys.exit("load needs --id and --path")
@@ -93,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "stop":
             p.stop()
             print("stopped")
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     except PoolError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
