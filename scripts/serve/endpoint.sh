@@ -100,6 +100,16 @@ DEPLOY_OUT="$(RELAY_APP_NAME="$RELAY_APP" RELAY_SECRET="$RELAY_SECRET" \
 RELAY_URL="$(printf '%s' "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9._-]+\.modal\.run' | head -1)"
 [ -n "$RELAY_URL" ] || { echo "$DEPLOY_OUT"; log "could not parse relay URL"; exit 1; }
 log "relay deployed: ${RELAY_URL}"
+# Connect the bridge only once the NEW deployment answers. The relay is max_containers=1 and a
+# redeploy drains the old container, which stays alive as long as it holds a bridge WebSocket
+# (a 24 h input). A bridge that connects before the cutover lands on the old container and pins
+# it, so the new version never gets a container and every request hangs (no HTTP response).
+for _ in $(seq 1 90); do
+  curl -sf --max-time 20 "${RELAY_URL}/health" >/dev/null 2>&1 && break
+  sleep 10
+done
+curl -sf --max-time 20 "${RELAY_URL}/health" >/dev/null 2>&1 \
+  && log "relay /health ok" || log "WARNING: relay /health not answering after 15 min; starting bridge anyway"
 
 # 3. Bridge: dials out to the relay and proxies to SGLang.
 start_bridge() {

@@ -55,5 +55,10 @@ Tool calls come back as structured `tool_calls` (qwen3_coder parser); thinking i
 The relay container asks Modal for `RELAY_CPU` CPUs (default 1). With 4 it sometimes waited
 minutes for capacity after a redeploy, and every request hung meanwhile.
 
+Redeploying a running app is safe only while no old bridge is connected. A bridge connected to the
+old container keeps it alive (`max_containers=1`, and the WebSocket is a 24 h input), so the new
+version never gets scheduled and requests hang. `endpoint.sh` therefore waits for the new
+deployment's `/health` before starting the bridge. Never run two jobs against one app.
+
 Stop: `qdel <job>` ends SGLang and the bridge; the relay apps stay (503 until a bridge connects)
 until `modal app stop hf-serve-qwen35-9b` / `modal app stop hf-serve-qwen35-4b`.
