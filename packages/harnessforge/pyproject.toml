@@ -11,6 +11,8 @@ dependencies = []          # the core (records, contracts, statistics) is stdlib
 platoon = ["platoon[tinker,hpc]>=0.6,<0.7"]
 # Model pool client/launcher helpers
 pool = ["httpx>=0.27"]
+# Faster Monte Carlo for `python -m harnessforge.stats.calibrate --backend numpy` (optional)
+calibrate = ["numpy>=1.24"]
 dev = ["pytest>=8"]
 
 [build-system]
