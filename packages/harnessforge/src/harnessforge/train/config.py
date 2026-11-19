@@ -208,9 +208,9 @@ OLD_RUN_MAPPING: list[tuple[str, str, str, str]] = [
      "differs: platoon/miles-tinker have no reference-KL term (only logged); needs work, see docs/train.md"),
     ("--entropy-coef", "0", "none", "same (no entropy bonus)"),
     ("dynamic filter apply_reward_nonzero_std_filter", "drop all-0/all-1 groups, resample",
-     "train.workflow_config.filter_zero_advantage_datums = true; train.group_admission = all",
-     "mapped: zero-advantage groups contribute nothing; platoon does not resample to refill 8 informative groups "
-     "(group_admission: informative + refill would)"),
+     "train.group_admission = informative, train.refill.max_groups_per_step = 8",
+     "mapped: rejected (uniform-reward) groups are refilled until 8 informative groups, capped at 64 groups/step "
+     "(old: uncapped resampling)"),
     ("--fully-async --max-weight-staleness 4", "async, staleness <= 4", "train.max_staleness = 4", "mapped"),
     ("--async-max-concurrent-samples", "256", "train.max_concurrent_rollouts", "mapped (limited by sandbox cores)"),
     ("--rollout-temperature", "1.0", "rollout_config.inference_params.temperature = 1.0 (miles-tinker requires 1.0)", "same"),
