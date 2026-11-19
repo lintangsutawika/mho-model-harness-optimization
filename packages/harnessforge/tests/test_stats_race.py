@@ -55,7 +55,8 @@ def test_loser_stops_at_look1_winner_passes_early_borderline_goes_to_end():
 
 
 def test_borderline_passes_only_at_the_final_look():
-    race = Race("A", ["b"], schedule())
+    from harnessforge.stats import Design
+    race = Race("A", ["b"], schedule(), Design.attempt_major(5, c=1.72))   # t=1.78 > 1.72
     st = race.update(trials("A", ref_reward) + trials("b", flip(3)))   # all looks ready at once
     s = st.states["b"]
     assert s.verdict is Verdict.PASS and s.look == 5 and s.efficacy == 1.72
@@ -166,3 +167,16 @@ def test_val_gate():
     assert s.alive and s.look == 1                          # 25%: no efficacy look yet
     s = gate.update(best + trials("new", flip(20), 2))
     assert s.verdict is Verdict.PASS and s.look == 2
+
+
+def test_default_c_depends_on_pairing_and_order():
+    from harnessforge.contracts import Order
+    from harnessforge.stats import LookSchedule
+    from harnessforge.stats.race import Race, ReferenceMode, recommended_c
+    att = LookSchedule(Order.ATTEMPT_MAJOR, ["t1", "t2"], 5)
+    tm = LookSchedule(Order.TASK_MAJOR, [f"t{i}" for i in range(8)], 2)
+    assert recommended_c(att, ReferenceMode.ALL_TRIALS) == 1.72
+    assert recommended_c(att, ReferenceMode.SAME_UNITS) == 1.77
+    assert recommended_c(tm, ReferenceMode.ALL_TRIALS) == 1.77
+    assert Race("A", ["B"], att).design.c == 1.77                       # default: same units
+    assert Race("A", ["B"], att, reference_mode="all").design.c == 1.72

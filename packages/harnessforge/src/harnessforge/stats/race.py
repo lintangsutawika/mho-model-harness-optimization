@@ -62,12 +62,27 @@ from harnessforge.stats.boundaries import Design, Verdict
 from harnessforge.stats.looks import LookData, LookSchedule, UnitIndex, collect
 from harnessforge.stats.paired import Decision, GateConfig, Paired, decide, paired
 
-__all__ = ["CandidateState", "Race", "RaceStatus", "ReferenceMode"]
+__all__ = ["CandidateState", "Race", "RaceStatus", "ReferenceMode", "recommended_c"]
 
 
 class ReferenceMode(str, enum.Enum):
     SAME_UNITS = "same"
     ALL_TRIALS = "all"
+
+
+# Default c per pairing mode and launch order, from `calibrate` on the bundled 128-task tmax
+# sample (alpha 0.05 one-sided, futility ignored): attempt-major with the reference's ALL trials
+# needs 1.71-1.74; same-unit pairing and task-major looks need 1.73-1.78.
+C_ATTEMPT_ALL = 1.72
+C_CONSERVATIVE = 1.77
+
+
+def recommended_c(schedule: LookSchedule, mode: "ReferenceMode | str") -> float:
+    """The default efficacy constant for a schedule and pairing mode (see calibrate)."""
+    from harnessforge.contracts import Order
+    if schedule.order is Order.ATTEMPT_MAJOR and ReferenceMode(mode) is ReferenceMode.ALL_TRIALS:
+        return C_ATTEMPT_ALL
+    return C_CONSERVATIVE
 
 
 def _r(x: float | None) -> float | None:
@@ -163,11 +178,11 @@ class Race:
         self.reference = reference
         self.candidates = tuple(cands)
         self.schedule = schedule
-        self.design = design or Design.for_schedule(schedule)
+        self.reference_mode = ReferenceMode(reference_mode)
+        self.design = design or Design.for_schedule(schedule, c=recommended_c(schedule, self.reference_mode))
         if self.design.n_looks != len(schedule.looks):
             raise ValueError(f"design has {self.design.n_looks} looks, schedule "
                              f"{len(schedule.looks)}")
-        self.reference_mode = ReferenceMode(reference_mode)
         self.max_env_fail = max_env_fail
         self.cheaper = cheaper if cheaper is not None and cheaper.cheaper_enabled else None
         self._tracks = {c: _Track(state=CandidateState(c, Verdict.CONTINUE)) for c in cands}

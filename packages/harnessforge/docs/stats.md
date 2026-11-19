@@ -95,9 +95,10 @@ gain +1.4 points: power 0.15 (fixed test 0.16), 3.1 of 5 trials per task; +2.9 p
 uses 1.6 trials per task. Futility costs 1-2 points of power and halves the trials of null
 candidates, as on the old loop.
 
-`DEFAULT_C` stays 1.72 (the validated reference). For a race with `ReferenceMode.SAME_UNITS` or a
-`TASK_MAJOR` schedule, use c ~= 1.77 if you need alpha <= 0.05 without relying on futility, or
-recalibrate on your own pass rates.
+`Race` and `ValGate` pick c by default with `race.recommended_c(schedule, mode)`: 1.72 for
+ATTEMPT_MAJOR with `ReferenceMode.ALL_TRIALS` (the validated reference, `DEFAULT_C`), and 1.77
+for `ReferenceMode.SAME_UNITS` or a `TASK_MAJOR` schedule, so alpha <= 0.05 holds without relying
+on futility. Pass an explicit `Design` to override, or recalibrate on your own pass rates.
 
 ## 5. Racing
 
