@@ -28,6 +28,11 @@ from typing import Any
 from harnessforge.train.config import TrainRun
 from harnessforge.train.gateway import _write_json, container_argv
 
+#: marker files in the run dir: KEEP_GATEWAY = the gateway outlives this driver (restarts it when
+#: the driver runs on its head node); DRIVER_STOP = ask the driver (any placement) to stop
+KEEP_GATEWAY = "KEEP_GATEWAY"
+DRIVER_STOP = "DRIVER_STOP"
+
 TINKER_API_KEY = "tml-local"          # miles-tinker has no auth: the key only names the tenant
 #: read from driver.wandb_env_file (only these names); passed to the platoon process env only
 WANDB_ENV_NAMES = ("WANDB_API_KEY", "WANDB_ENTITY")
@@ -204,7 +209,7 @@ def run_driver_job(run_dir: str | Path) -> int:
                                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                             cwd=str(run.dir), start_new_session=True)
             while platoon_proc.poll() is None:
-                if P.stop_file.exists() and not stop["flag"]:
+                if (P.stop_file.exists() or (P.dir / DRIVER_STOP).exists()) and not stop["flag"]:
                     _term()
                 time.sleep(10)
         rc = platoon_proc.returncode
@@ -224,9 +229,14 @@ def run_driver_job(run_dir: str | Path) -> int:
         d = json.loads(P.driver_file.read_text()) if P.driver_file.exists() else {}
         d.update(status="done", returncode=rc, finished_at=time.time())
         _write_json(P.driver_file, d)
-        keep = P.dir / "KEEP_GATEWAY"
+        ds = P.dir / DRIVER_STOP
+        if ds.exists():
+            ds.rename(ds.with_name(f"{DRIVER_STOP}.{int(time.time())}"))
+        keep = P.dir / KEEP_GATEWAY
         if keep.exists():
-            keep.rename(keep.with_name(f"KEEP_GATEWAY.{int(time.time())}"))
+            if run.driver.get("where", "hc") != "gateway":
+                # separate driver job: consumed here; on the head node the gateway consumes it
+                keep.rename(keep.with_name(f"{KEEP_GATEWAY}.{int(time.time())}"))
         elif run.driver.get("where", "hc") != "gateway" and run.driver.get("stop_gateway", True):
             P.stop_file.write_text(f"driver finished rc={rc}\n")
     return rc

@@ -362,14 +362,19 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                                      "port": port, "url": url, "hosts": hosts,
                                      "ready_after_s": round(ready_s), "ready_at": time.time()})
         _log(log, f"gateway healthy at {url} after {ready_s:.0f}s")
-        if run.driver.get("where") == "gateway":
-            hf_src = run.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
+        def start_driver() -> subprocess.Popen:
+            # a fresh process: it reads run.json and this package's code as they are now
+            r = TrainRun.load(P.config)
+            hf_src = r.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
             env = {**os.environ, "PYTHONPATH": hf_src}
             with open(P.logs / "driver.log", "ab") as out:
-                driver = subprocess.Popen([run.get("python") or sys.executable, "-m", "harnessforge.train",
-                                           "driver-job", "--run-dir", str(run.dir)], env=env, stdout=out,
-                                          stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                          start_new_session=True)
+                return subprocess.Popen([r.get("python") or sys.executable, "-m", "harnessforge.train",
+                                         "driver-job", "--run-dir", str(run.dir)], env=env, stdout=out,
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                        start_new_session=True)
+
+        if run.driver.get("where") == "gateway":
+            driver = start_driver()
         while True:
             if P.stop_file.exists() or stopping["flag"]:
                 _log(log, "STOP requested")
@@ -380,6 +385,10 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                 break
             if driver is not None and driver.poll() is not None:
                 _log(log, f"driver exited rc={driver.returncode}")
+                if driver_exit_action(P.dir) == "restart":
+                    _log(log, "KEEP_GATEWAY: restarting the driver; trainer and engines untouched")
+                    driver = start_driver()
+                    continue
                 rc = driver.returncode
                 break
             time.sleep(15)
@@ -417,6 +426,16 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         _write_json(P.gateway_file, g)
         _log(log, f"gateway job done rc={rc} (PBS reaps what is left on the job's nodes)")
     return rc
+
+
+def driver_exit_action(run_dir: Path) -> str:
+    """What the gateway does when its head-node driver exits: "restart" when a driver-only stop
+    asked for it (KEEP_GATEWAY, consumed here), else "stop" (the run is over)."""
+    keep = Path(run_dir) / "KEEP_GATEWAY"
+    if keep.exists():
+        keep.rename(keep.with_name(f"KEEP_GATEWAY.{int(time.time())}"))
+        return "restart"
+    return "stop"
 
 
 def collect_ray_logs(ray_tmp: Path, dest: Path, max_bytes: int = 50 << 20) -> None:

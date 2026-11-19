@@ -177,7 +177,9 @@ def test_cli_launch_stop_unlend(tmp_path, engines, monkeypatch):
     assert [j.nodes for j in L.jobs] == [1]
     assert SGLangPool.attach("ext", tmp_path / "state").lent()[1]["to"] == run.run_id
     # stop --driver-only never returns the gateway's engines
-    assert cli.main(["stop", "--driver-only", "--grace", "0", "--run-dir", str(run.dir)]) == 0
+    # (head-node driver: asks it to stop and the gateway to restart it; no restart seen within grace 0)
+    assert cli.main(["stop", "--driver-only", "--grace", "0", "--run-dir", str(run.dir)]) == 1
+    assert (run.dir / "DRIVER_STOP").exists() and (run.dir / "KEEP_GATEWAY").exists()
     assert 1 in SGLangPool.attach("ext", tmp_path / "state").lent()
     # gateway still running: unlend refuses; once it ended, the nodes go back
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)

@@ -373,6 +373,24 @@ check was stopped with `python -m harnessforge.train stop`.
 sandboxes. Here 160 concurrent sandboxes is the main limit, and steps will likely be ~15 min: 200 steps ≈ 2 days
 (`gateway.walltime` is 72 h).
 
+## Restarting only the driver
+
+`python -m harnessforge.train stop --driver-only --run-dir <run>` stops platoon and keeps the gateway: trainer, Tinker
+state and any lent engines stay as they are.
+
+- **Driver in its own rt_HC job** (`driver.where: hc`). The job is cancelled. `train driver --run-dir <run>
+  [--set key=json ...]` submits a new one.
+- **Driver on the gateway's head node** (`driver.where: gateway`, as in `naive*.json`).
+  - The command writes `KEEP_GATEWAY` and `DRIVER_STOP`. The driver stops platoon (one SIGTERM: platoon writes
+    its interrupted checkpoint and reaps its sandboxes) and exits.
+  - The gateway consumes `KEEP_GATEWAY` and starts a **fresh** driver process, which reads the current
+    `run.json` and this package's code from disk.
+  - `train driver --run-dir <run> --set stats.wandb.mode='"online"'` edits `run.json` and does the same.
+  - The command waits until `driver.json` shows the new driver.
+  - Without `KEEP_GATEWAY`, a driver exit still ends the run.
+- **What platoon does on restart.** It resumes from its newest checkpoint in the same `log_path` (the launch
+  checkpoint at least). A new `create_model` on the single-tenant gateway resets the trainer to that state.
+
 ## W&B logging
 
 platoon logs the run to W&B. `abci-base.json` sets `stats.wandb` to mode `online`, project `mho-harness`, and run
