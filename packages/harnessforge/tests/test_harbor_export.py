@@ -204,6 +204,15 @@ def test_collected_files_and_patched_outcome(tmp_path):
     assert records[0].extra["verifier_exit_code"] == 1
 
 
+def test_launch_order_survives_bad_times(tmp_path, seq):
+    out = tmp_path / "platoon"
+    for k in range(12):  # rollout_10 sorts before rollout_2 as text; later indices "started" earlier
+        write_trial(out, "t", k, created=f"2026-11-18T10:{59 - k:02d}:00+00:00", wall=10.0)
+    CandidateExport(out, tmp_path / "job", "c", tasks=["t"]).sync()
+    names = [x["name"] for x in seq.launched(tmp_path / "job")["t"]]
+    assert names == [trial_name("t", k) for k in range(12)]
+
+
 def test_incremental_sync_and_stop(tmp_path, gate):
     out = tmp_path / "platoon"
     (out / "rollouts" / "t1" / "rollout_0").mkdir(parents=True)   # launched, in flight

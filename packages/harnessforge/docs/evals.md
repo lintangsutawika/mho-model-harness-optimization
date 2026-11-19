@@ -12,7 +12,8 @@ candidates on Harbor tasks, plus a `FakeBackend` for other workstreams' tests.
 | `dataset` | copies the requested tasks, giving Dockerfile-only tasks their `FROM` image | stdlib |
 | `fake` | `FakeBackend`: scripted rewards, simulated clock, task-major, stop | stdlib |
 | `jobs` | `eval_node_job`: the PBS job an evaluation runs in (`contracts.JobSpec`) | stdlib |
-| `__main__` | `python -m harnessforge.evals run REQUEST.json` / `stage-images` | stdlib |
+| `harbor_export` | platoon run dirs -> harbor-compatible trial dirs (result.json, agent/, verifier/) for harbor-era readers | stdlib |
+| `__main__` | `python -m harnessforge.evals run REQUEST.json [--harbor-export DIR]` / `export` / `stage-images` | stdlib |
 
 ## How a candidate runs
 

@@ -339,12 +339,14 @@ class CandidateExport:
         new = 0
         if rollouts.is_dir():
             for task_dir in sorted(p for p in rollouts.iterdir() if p.is_dir()):
-                for trial_dir in sorted(p for p in task_dir.iterdir()
-                                        if p.is_dir() and p.name.startswith(ROLLOUT_PREFIX)):
-                    try:
-                        k = int(trial_dir.name[len(ROLLOUT_PREFIX):])
-                    except ValueError:
-                        continue
+                trial_dirs = []
+                for trial_dir in task_dir.iterdir():
+                    if trial_dir.is_dir() and trial_dir.name.startswith(ROLLOUT_PREFIX):
+                        try:
+                            trial_dirs.append((int(trial_dir.name[len(ROLLOUT_PREFIX):]), trial_dir))
+                        except ValueError:
+                            continue
+                for k, trial_dir in sorted(trial_dirs):  # launch order: config mtimes must not go backwards
                     task = self.reader._task_of.get(task_dir.name, task_dir.name)
                     meta = _load_json(trial_dir / METADATA)
                     if isinstance(meta, Mapping) and meta.get("task_id"):
@@ -387,9 +389,14 @@ class CandidateExport:
             try:
                 launched = trial_dir.stat().st_mtime
             except OSError:
-                launched = None
-        if launched is not None:  # seq.launched orders a task's trials by config.json's mtime (= launch time)
-            os.utime(out / "config.json", (launched, launched))
+                launched = time.time()
+        # seq.launched orders a task's trials by config.json's mtime (harbor: the launch time), then by name. platoon
+        # launches a task's rollouts in index order, but the times we have are estimates (an unfinished trial's dir
+        # mtime moves as files appear), so keep them non-decreasing in the index: the order is then the index.
+        earlier = out.parent / trial_name(safe_task, record.index - 1) / "config.json"
+        if record.index > 0 and earlier.is_file():
+            launched = max(launched, earlier.stat().st_mtime)
+        os.utime(out / "config.json", (launched, launched))
 
     def export_trial(self, trial_dir: Path, out: Path, name: str, safe_task: str, record: TrialRecord) -> None:
         meta = _load_json(trial_dir / METADATA) or {}
