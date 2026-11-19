@@ -1,10 +1,15 @@
 """The miles-tinker gateway job: a Tinker API server for full fine-tuning on 1 trainer node plus R
 rollout nodes, as ONE batch job (one Ray cluster over all its nodes).
 
-miles-tinker (25b6a76) cannot attach SGLang engines it did not launch (`ServerCell.init` raises
-NotImplementedError for external rollout addresses), so the rollout engines are miles-managed:
-Ray places the Megatron actor on the head node (8 GPUs) and 8*R TP1 SGLang engines (plus miles'
-router) on the other nodes. Weight sync is disk-delta through the run dir (or NCCL broadcast).
+Two rollout modes:
+
+* managed (default): Ray places the Megatron actor on the head node (8 GPUs) and 8*R TP1 SGLang
+  engines (plus miles' router) on the other nodes;
+* external (`rollout.mode: external`, harnessforge.train.external): a 1-node job; miles attaches
+  pool engines lent to the run (`--rollout-external --rollout-external-engine-addrs`, needs
+  miles-tinker `external-engines-fixes`), and the job's teardown returns them to the pool.
+
+Weight sync is disk-delta through the run dir (or NCCL broadcast).
 
     job = gateway_job(run)               # JobSpec: nodes = 1 + R, rt_HF
     launcher.submit(job)
@@ -54,11 +59,23 @@ def tinker_port(run: TrainRun, job_id: str = "") -> int:
     return 20000 + int(digits) % 20000
 
 
-def serve_args(run: TrainRun, *, port: int, local_ckpt: str) -> list[str]:
+def rollout_nodes(run: TrainRun) -> int:
+    """Nodes the gateway job runs miles-managed engines on (0 in external mode)."""
+    from harnessforge.train.external import is_external
+    return 0 if is_external(run) else int(run.gateway.get("rollout_nodes", 1))
+
+
+def serve_args(run: TrainRun, *, port: int, local_ckpt: str,
+               addrs: list[str] | None = None) -> list[str]:
     """serve_tinker.py's miles/Megatron/tinker flags (the model architecture flags come from
     miles' scripts/models/<megatron_model_type>.py, added in the container)."""
     g, m = run.gateway, run["model"]
-    R = int(g.get("rollout_nodes", 1))
+    from harnessforge.train.external import engine_addrs, engine_local_dir, is_external
+    external = is_external(run)
+    R = rollout_nodes(run)
+    if external:
+        # attached pool engines: the host-local checkpoint dir is on the ENGINE hosts, run-unique
+        local_ckpt = engine_local_dir(run)
     # device: miles renders SGLang's argv on a GPU-less manager actor, where this SGLang build
     # auto-detects device=None and the argv round-trip check fails; name it explicitly
     sg = {"device": "cuda", "mem-fraction-static": 0.85, "context-length": 65536,
@@ -86,7 +103,8 @@ def serve_args(run: TrainRun, *, port: int, local_ckpt: str) -> list[str]:
         "--pause-generation-mode", "retract",
         "--update-weight-buffer-size", str(int(g.get("update_weight_buffer_size", 1 << 30))),
         "--num-gpus-per-node", "8", "--actor-num-nodes", "1", "--actor-num-gpus-per-node", "8",
-        "--rollout-num-gpus", str(8 * R),
+        # external: miles derives --rollout-num-gpus from the engine count (and refuses another)
+        *([] if external else ["--rollout-num-gpus", str(8 * R)]),
         "--attention-dropout", "0.0", "--hidden-dropout", "0.0",
         "--accumulate-allreduce-grads-in-fp32", "--attention-softmax-in-fp32",
         "--attention-backend", "flash",
@@ -95,6 +113,9 @@ def serve_args(run: TrainRun, *, port: int, local_ckpt: str) -> list[str]:
         args += ["--log-probs-chunk-size", str(int(g["log_probs_chunk_size"]))]
     for k, v in sg.items():
         args += [f"--sglang-{k}", str(v)]
+    if external:
+        args += ["--rollout-external", "--rollout-external-engine-addrs",
+                 *(engine_addrs(run) if addrs is None else addrs)]
     mode = g.get("weight_sync", "disk-delta")
     if mode == "disk-delta":
         args += ["--update-weight-transfer-mode", "disk-delta",
@@ -155,7 +176,7 @@ def gateway_job(run: TrainRun) -> JobSpec:
     return JobSpec(
         name=f"hftrain-gw-{run.run_id}"[:63],
         command=[py, "-m", "harnessforge.train", "gateway-job", "--run-dir", str(run.dir)],
-        nodes=1 + int(g.get("rollout_nodes", 1)), gpus=8,
+        nodes=1 + rollout_nodes(run), gpus=8,
         walltime=str(g.get("walltime", "4:00:00")),
         env={"PYTHONPATH": hf_src, "PYTHONUNBUFFERED": "1"},
         log=run.paths.logs / "gateway.job.log", options=opts)
@@ -271,7 +292,7 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
     ip, ifname = node_ip_ifname()
     nodes = job_hosts()
     hosts = [h for h, _ in nodes]
-    want = 1 + int(run.gateway.get("rollout_nodes", 1))
+    want = 1 + rollout_nodes(run)
     if len(hosts) != want:
         _log(log, f"ERROR: job has {len(hosts)} nodes {hosts}, config wants {want}")
         return 2
@@ -383,6 +404,14 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                 except ProcessLookupError:
                     pass
         collect_ray_logs(Path(node_local) / "ray", P.logs / f"ray-head-{job_id.split('.')[0]}")
+        from harnessforge.train.external import is_external, unlend_for_run
+        if is_external(run):
+            # the server (miles) is down: hand the lent engines back to the pool
+            try:
+                unlend_for_run(run, log=lambda m: _log(log, m))
+            except Exception as e:                       # never lose the job's teardown over it
+                _log(log, f"ERROR: unlend failed ({type(e).__name__}: {e}); "
+                          f"run `python -m harnessforge.train unlend --run-dir {run.dir}`")
         g = json.loads(P.gateway_file.read_text()) if P.gateway_file.exists() else {}
         g.update(status="stopped", stopped_at=time.time(), returncode=rc)
         _write_json(P.gateway_file, g)

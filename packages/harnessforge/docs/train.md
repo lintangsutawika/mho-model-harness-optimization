@@ -32,6 +32,7 @@ $PY -m harnessforge.train launch --config configs/train/smoke.json     # submit 
 $PY -m harnessforge.train status --run-dir /groups/.../runs/<run_id>   # jobs, gateway/driver state, versions, exports
 $PY -m harnessforge.train stop   --run-dir /groups/.../runs/<run_id>   # STOP, wait, then qdel what is left
 $PY -m harnessforge.train export --run-dir ... [--follow]             # (in the miles SIF) HF from the deltas
+$PY -m harnessforge.train unlend --run-dir /groups/.../runs/<run_id>   # external mode: return lent pool nodes
 $PY -m harnessforge.train mapping                                       # the old-run mapping table below
 ```
 
@@ -50,6 +51,9 @@ All of this runs in CPU jobs (no compute on the login node), and nothing is inst
    - `miles-tinker-max-tokens-per-datum.patch`: adds `--tinker-max-tokens-per-datum`. `GatewayConfig`
      hard-codes 32768, and the first full-size `forward_backward` refused a 43k-token datum. The gateway passes
      `train.context_window_length` (65536).
+   For external rollout mode, a second tree, `~/hf-dev/train/miles-tinker-ext-run`: `git archive` of
+   `external-engines-fixes` (4ce94830) with the same two patches applied. `COMMIT` in the tree records this.
+   The managed tree is left as is.
 2. **Tinker SDK for the server.** The SDK goes into `~/hf-dev/train/extra-site`, which is on the container's
    `PYTHONPATH`:
    ```bash
@@ -73,37 +77,86 @@ All of this runs in CPU jobs (no compute on the login node), and nothing is inst
   rounding of those 24 norms.
 - *Status.* To upstream to miles-tinker.
 
-## Why miles-managed engines, not the pool's
+## Rollout modes: miles-managed engines or lent pool engines
 
-miles-tinker 25b6a76 cannot attach SGLang engines it did not start: `ServerCell.init()` raises
-`NotImplementedError("external rollout address allocation was removed ...")` for `--rollout-external`
-(`miles/ray/rollout/server_cell.py:151`, asserted by a fast test), `--rollout-external-engine-addrs` is parsed and
-never read, and an external router is refused (`rollout_server.py:26`). `docs/advanced/disaggregated-rollout.md` is
-stale. The working deploy (`deploy/abci/tinker_gateway.pbs`) is one Ray cluster over the trainer node and the rollout
-nodes, with miles launching its own engines and router there. `harnessforge.train.gateway` does the same from Python
-for 1 + R nodes (R = 1 for the smoke, 3 for the comparison run).
+`rollout.mode` picks where the rollout engines come from.
 
-Making the pool's engines miles-tinker's rollout engines (one fleet, the PLAN's open question) is a follow-up in
-miles-tinker:
+- **managed** (default; `smoke`, `naive`, `fullcheck`): the gateway job has 1 + R rt_HF nodes. miles launches 8*R
+  TP1 SGLang engines and its router on the R rollout nodes. This works with stock miles-tinker 25b6a76 plus our
+  two patches.
+- **external** (`naive_ext.json`): the gateway job is **one** rt_HF node (the trainer). The engines are borrowed
+  from a running harnessforge pool and attached with `--rollout-external --rollout-external-engine-addrs`.
+  - This needs miles-tinker branch `external-engines-fixes` (4ce94830 = 09995e57 attach + one fix,
+    draft neulab/miles-tinker#21) plus our two patches, deployed as `~/hf-dev/train/miles-tinker-ext-run`.
+  - Stock 25b6a76 raises `NotImplementedError` for `--rollout-external`.
 
-- `miles/ray/rollout/server_cell.py`: an `ExternalServerCell` that wraps an address, with no Ray actor and no
-  launch. Health, pause/continue and `update_weights_*` go through `SGLangApiClient` as they do now.
-- `miles/ray/rollout/rollout_server.py`: build cells from `--rollout-external-engine-addrs`, and allow
-  `--sglang-router-ip/port`, or register the external engines with miles' own router.
-- `miles/ray/placement_group.py`: no rollout bundles in external mode. This part is already done.
-- Weight sync:
-  - disk-delta works as is, provided each engine host has the base checkpoint at the engine's `--model-path`.
-  - broadcast needs `init_weights_update_group` over the network to engines outside Ray, so their hosts must
-    reach the trainer's NCCL rendezvous.
-- Tests: `tests/test_external_rollout.py`, revived.
+### External mode (`harnessforge.train.external`)
 
-Estimate: 2-4 days including a 2-node test. On our side the pool already has the matching half: lending
-(below).
+```json
+"rollout": {"mode": "external",
+            "pool_spec": "/home/aci18914wh/hf-dev/pool/scripts/pool-n4hf72.json",
+            "lend_nodes": [1, 2, 3],
+            "engine_local_dir": "/dev/shm/{user}-hftrain-{run_id}/engine-local",
+            "drain_timeout": 1800}
+```
+
+`train launch` with this config does the following:
+
+1. **Checks the pool.**
+   - The pool's policy path must equal `model.hf_checkpoint`, as a local path. miles refuses hub ids under
+     disk-delta, and disk-delta seeds each engine host's local checkpoint from the engine's `--model-path`.
+   - None of `lend_nodes` may be lent to another run.
+   - Every engine of those nodes must answer `/health` now. pool.json's `status` is not trusted for this: it stays
+     `starting` after `pool start --no-wait`.
+2. **Lends the nodes.** It calls `SGLangPool.lend(nodes, to=<run_id>, on_restart="latest", policy_file=<run>/engine_restart_policy.json)`.
+   - The policy file names the **base** checkpoint (`model.hf_checkpoint`).
+   - A lent engine that dies is restarted by its node agent on the base. miles treats the comeback as a new
+     generation and replays every published delta from the base.
+   - It must never restart on a later HF export: the XOR deltas would be applied twice.
+3. **Checks each lent engine** via `/server_info` and `/model_info`.
+   - The local `model_path` must equal `model.hf_checkpoint`.
+   - `tp_size` must be 1.
+   - `weight_version` must be the pool policy's id (or unset), not a previous trainer's weights. With disk-delta
+     the first sync only records the baseline, so a stale engine would serve stale weights.
+   - These are miles' own attach checks; an engine that fails them never becomes ready, and the trainer would
+     wait forever.
+   - On any problem the nodes are **returned** (unlend), `rollout.json` says `refused` with the reasons, and
+     launch fails.
+4. **Writes `<run>/rollout.json`:** `{status: lent, pool_id, nodes, engines: [host:port...], engine_local_dir}`.
+5. **Submits one gateway job (1 rt_HF).**
+   - Flags: `--rollout-external --rollout-external-engine-addrs <engines>`, disk-delta,
+     `--update-weight-local-checkpoint-dir <engine_local_dir>`. No `--rollout-num-gpus`: miles derives it from
+     the engine count.
+   - If the submission fails, the nodes are returned.
+
+**Getting the nodes back.**
+- The gateway job's teardown (`STOP`, `train stop`, the driver ending, or SIGTERM) first stops the server, then
+  calls `unlend`. That reloads the pool policy into every live lent engine and verifies `weight_version`.
+- If those checks fail, the nodes **stay lent** and `rollout.json` records `unlend_error`.
+- After a hard kill, `train stop` (or `python -m harnessforge.train unlend --run-dir <run>`) returns the nodes once
+  the gateway job has ended. It refuses while the job still runs.
+- `stop --driver-only` never returns them.
+
+**`engine_local_dir`.**
+- It must be host-local, writable, and run-unique on every engine host. An earlier run's applied-version marker
+  makes the first delta of a new run fail as out of order.
+- It needs room for the checkpoint (9.3 GB for Qwen3.5-4B). `/tmp` on ABCI compute nodes holds about 8 GB: the
+  first smoke attempts failed there with `ENOSPC`.
+- The pool jobs' `/local/<jobid>` differs per node, and the flag takes one path for all hosts. So the default is
+  `/dev/shm/<user>-hftrain-<run_id>/engine-local`.
+- That is RAM-backed: 9.3 GB per lent host until the pool job ends. Nothing removes it remotely.
+
+**Pool tooling.** lend/unlend only write `pool.json` and make HTTP calls. They run from this package
+(`harnessforge_src`) and submit no pool jobs, so the pool tooling's path (`~/hf-dev/pool-lend`, whose agents run
+n4hf72) does not matter here. A node restart would; use that checkout for `pool restart-node`.
+
+**Not yet verified on the cluster by this PR.** The miles-side attach (disk-delta to n4hf72 engines) is being
+cluster-tested separately. This PR's lend/check/unlend path is tested against fake engines and a real
+`SGLangPool`.
 
 ## Lending pool nodes to a trainer (`SGLangPool.lend` / `unlend`)
 
-For when a trainer does attach pool engines. It is implemented and tested now; with miles-managed engines it is not
-used.
+Used by the external rollout mode above, which calls these through `harnessforge.train.external`.
 
 ```bash
 python -m harnessforge.pool lend   --spec pool.json --node 3 --to <run_id> [--policy-file <run>/hf/latest.json --on-restart latest]
