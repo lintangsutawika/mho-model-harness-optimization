@@ -14,6 +14,9 @@ import time
 
 from jinja2 import StrictUndefined, Template
 
+# >>> feature:*
+from micro_swe import features
+# <<< feature:*
 from micro_swe.exceptions import FormatError
 
 BASH_TOOL = {
@@ -96,6 +99,10 @@ def format_toolcall_observation_messages(
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
     results = []
     for action, output in zip(actions, padded_outputs):
+        # >>> feature:output_truncation
+        if features.on("output_truncation"):
+            output = _truncate_output(output)
+        # <<< feature:output_truncation
         content = Template(observation_template, undefined=StrictUndefined).render(
             output=output, **(template_vars or {})
         )
@@ -116,3 +123,22 @@ def format_toolcall_observation_messages(
             msg["role"] = "user"  # human issued commands
         results.append(msg)
     return results
+# >>> feature:output_truncation
+
+
+MAX_OUTPUT_CHARS = 10000
+"""Outputs longer than this are shown as their first and last halves of this budget."""
+
+
+def _truncate_output(output: dict) -> dict:
+    text = output.get("output") or ""
+    if len(text) <= MAX_OUTPUT_CHARS:
+        return output
+    half = MAX_OUTPUT_CHARS // 2
+    elided = len(text) - 2 * half
+    note = (
+        f"\n\n[... {elided} characters elided: the output was too long to show in full. Showing the first "
+        f"and last {half} characters. Use grep, head, tail or redirect to a file to see specific parts ...]\n\n"
+    )
+    return {**output, "output": text[:half] + note + text[-half:]}
+# <<< feature:output_truncation

@@ -21,6 +21,9 @@ import argparse
 from pathlib import Path
 
 from micro_swe.config import get_config_from_spec
+# >>> feature:*
+from micro_swe import features
+# <<< feature:*
 from micro_swe.agents import Agent
 from micro_swe.environments.local import LocalEnvironment
 from micro_swe.models import Model
@@ -51,6 +54,9 @@ def main(argv: list[str] | None = None) -> None:
     args, _ignored = p.parse_known_args(argv)
 
     cfg = _merge_configs(args.config)
+    # >>> feature:*
+    features.configure(cfg.get("features"))
+    # <<< feature:*
 
     # model: --model wins over any config model_name/model_class.
     model_cfg = dict(cfg.get("model") or {})

@@ -9,6 +9,9 @@ from typing import Any, Literal
 import litellm
 from pydantic import BaseModel
 
+# >>> feature:*
+from micro_swe import features
+# <<< feature:*
 from micro_swe.exceptions import FormatError
 from micro_swe.tools import (
     BASH_TOOL,
@@ -89,6 +92,16 @@ class ModelConfig(BaseModel):
         "<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
     )
     """Template used to render the observation after executing an action."""
+    # >>> feature:length_recovery
+    length_recovery_factor: float = 2.0
+    """On a response cut off by the output-token limit, re-query once with max_tokens times this."""
+    length_recovery_ceiling: int = 16384
+    """Upper bound for the raised max_tokens."""
+    # <<< feature:length_recovery
+    # >>> feature:missing_command_repair
+    command_repair_max_tokens: int = 1024
+    """Output budget of the repair re-query after a bash call without a command."""
+    # <<< feature:missing_command_repair
 
 
 class Model:
@@ -131,10 +144,22 @@ class Model:
         # models -- see README.)
         return [{k: v for k, v in msg.items() if k != "extra"} for msg in messages]
 
-    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+    def _complete(self, messages: list[dict], **kwargs):
         for attempt in retry(logger=logger, abort_exceptions=self.abort_exceptions):
             with attempt:
                 response = self._query(self._prepare_messages_for_api(messages), **kwargs)
+        return response
+
+    def query(self, messages: list[dict[str, str]], **kwargs) -> dict:
+        response = self._complete(messages, **kwargs)
+        # >>> feature:length_recovery
+        if features.on("length_recovery"):
+            response = self._recover_from_length_cutoff(messages, response, **kwargs)
+        # <<< feature:length_recovery
+        # >>> feature:missing_command_repair
+        if features.on("missing_command_repair"):
+            response = self._repair_missing_command(messages, response, **kwargs)
+        # <<< feature:missing_command_repair
         cost_output = self._calculate_cost(response)
         # Note: all model.query() implementations must persist the response and cost on FormatError.
         try:
@@ -164,6 +189,37 @@ class Model:
                 message["extra"]["rollout"] = rollout
         return message
 
+    # >>> feature:length_recovery
+    def _recover_from_length_cutoff(self, messages: list[dict], response, **kwargs):
+        """A response cut off by max_tokens before any tool call is retried once with a larger budget."""
+        choice = response.choices[0]
+        if choice.finish_reason != "length" or choice.message.tool_calls:
+            return response
+        budget = (kwargs.get("max_tokens") or self.config.model_kwargs.get("max_tokens")
+                  or self.config.model_kwargs.get("max_completion_tokens") or 4096)
+        raised = min(int(budget * self.config.length_recovery_factor), self.config.length_recovery_ceiling)
+        if raised <= budget:
+            return response
+        logger.info(f"response cut off at max_tokens={budget}; re-querying with {raised}")
+        retried = self._complete(messages, **(kwargs | {"max_tokens": raised}))
+        return retried if retried.choices[0].message.tool_calls else response
+
+    # <<< feature:length_recovery
+    # >>> feature:missing_command_repair
+    def _repair_missing_command(self, messages: list[dict], response, **kwargs):
+        """A bash call without a command is re-asked once, telling the model exactly what is missing.
+        The repair instruction is not added to the history; only a successful repaired call is."""
+        tool_calls = response.choices[0].message.tool_calls or []
+        if not tool_calls or not any(_missing_command(tc) for tc in tool_calls):
+            return response
+        repair = {"role": "user", "content": COMMAND_REPAIR_PROMPT}
+        retried = self._complete(
+            list(messages) + [repair], **(kwargs | {"max_tokens": self.config.command_repair_max_tokens})
+        )
+        new_calls = retried.choices[0].message.tool_calls or []
+        return retried if new_calls and not any(_missing_command(tc) for tc in new_calls) else response
+
+    # <<< feature:missing_command_repair
     def _calculate_cost(self, response) -> dict[str, float]:
         try:
             cost = litellm.cost_calculator.completion_cost(response, model=self.config.model_name)
@@ -220,3 +276,22 @@ class Model:
                 },
             }
         }
+# >>> feature:missing_command_repair
+
+
+COMMAND_REPAIR_PROMPT = (
+    "Your last bash tool call was rejected because its `command` argument was missing or empty. "
+    "Do not explain. Reply with exactly one bash tool call whose arguments are "
+    '{"command": "<the shell command you want to run>"} with a non-empty command.'
+)
+
+
+def _missing_command(tool_call) -> bool:
+    if getattr(tool_call.function, "name", None) != "bash":
+        return False
+    try:
+        args = json.loads(tool_call.function.arguments or "{}")
+    except Exception:
+        return False
+    return isinstance(args, dict) and not str(args.get("command") or "").strip()
+# <<< feature:missing_command_repair

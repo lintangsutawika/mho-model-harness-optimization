@@ -12,8 +12,14 @@ from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
 
 from micro_swe import __version__
+# >>> feature:*
+from micro_swe import features
+# <<< feature:*
 from micro_swe.protocols import Environment, Model
 from micro_swe.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+# >>> feature:submit_confirmation
+from micro_swe.exceptions import Submitted
+# <<< feature:submit_confirmation
 from micro_swe.utils.serialize import recursive_merge
 
 
@@ -34,6 +40,16 @@ class AgentConfig(BaseModel):
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    # >>> feature:loop_warning
+    loop_warning_after: int = 3
+    """Warn the model once it has run the same command with the same output this many times in a row."""
+    # <<< feature:loop_warning
+    # >>> feature:context_trim
+    context_keep_recent: int = 6
+    """Observations newer than this many command results are always shown in full."""
+    context_trim_min_chars: int = 1200
+    """Older observations longer than this are shortened to a stub before querying the model."""
+    # <<< feature:context_trim
 
 
 class Agent:
@@ -49,6 +65,13 @@ class Agent:
         self.n_calls = 0
         self.n_consecutive_format_errors = 0
         self._start_time = time.time()
+        # >>> feature:loop_warning
+        self._last_exec: tuple[str, str] | None = None
+        self._repeat_count = 0
+        # <<< feature:loop_warning
+        # >>> feature:submit_confirmation
+        self._submit_confirmed = False
+        # <<< feature:submit_confirmation
 
     def get_template_vars(self, **kwargs) -> dict:
         return recursive_merge(
@@ -60,6 +83,9 @@ class Agent:
                 "model_cost": self.cost,
                 "elapsed_seconds": int(time.time() - self._start_time),
             },
+            # >>> feature:*
+            {"features": features.flags()},
+            # <<< feature:*
             self.extra_template_vars,
             kwargs,
         )
@@ -147,15 +173,74 @@ class Agent:
                 }
             )
         self.n_calls += 1
+        # >>> feature:format_streak_trim,context_trim
+        message = self.model.query(self._model_messages())
+        # --- else
         message = self.model.query(self.messages)
+        # <<< feature:format_streak_trim,context_trim
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message
 
+    # >>> feature:format_streak_trim,context_trim
+    def _model_messages(self) -> list[dict]:
+        """The history as the model sees it (the saved trajectory keeps everything)."""
+        messages = self.messages
+        # >>> feature:format_streak_trim
+        if features.on("format_streak_trim"):
+            messages = _drop_stale_format_errors(messages)
+        # <<< feature:format_streak_trim
+        # >>> feature:context_trim
+        if features.on("context_trim"):
+            messages = _stub_old_observations(
+                messages, self.config.context_keep_recent, self.config.context_trim_min_chars
+            )
+        # <<< feature:context_trim
+        return messages
+
+    # <<< feature:format_streak_trim,context_trim
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
+        # >>> feature:submit_confirmation
+        if features.on("submit_confirmation"):
+            outputs = [self._execute_confirming_submit(action) for action in message.get("extra", {}).get("actions", [])]
+        else:
+            outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+        # --- else
         outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+        # <<< feature:submit_confirmation
+        # >>> feature:loop_warning
+        observations = self.model.format_observation_messages(message, outputs, self.get_template_vars())
+        if features.on("loop_warning"):
+            self._warn_on_repeats(message, outputs, observations)
+        return self.add_messages(*observations)
+        # --- else
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+        # <<< feature:loop_warning
+
+    # >>> feature:submit_confirmation
+    def _execute_confirming_submit(self, action: dict) -> dict:
+        """The first submission is held back once and the model is asked to check its work."""
+        try:
+            return self.env.execute(action)
+        except Submitted:
+            if self._submit_confirmed:
+                raise
+            self._submit_confirmed = True
+            return {"output": SUBMIT_CHECKLIST, "returncode": 0, "exception_info": ""}
+
+    # <<< feature:submit_confirmation
+    # >>> feature:loop_warning
+    def _warn_on_repeats(self, message: dict, outputs: list[dict], observations: list[dict]) -> None:
+        actions = message.get("extra", {}).get("actions", [])
+        for action, output, observation in zip(actions, outputs, observations):
+            key = (action.get("command", ""), output.get("output", ""))
+            self._repeat_count = self._repeat_count + 1 if key == self._last_exec else 1
+            self._last_exec = key
+            if self._repeat_count >= self.config.loop_warning_after:
+                observation["content"] += LOOP_WARNING.format(n=self._repeat_count)
+
+    # <<< feature:loop_warning
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""
@@ -189,3 +274,50 @@ class Agent:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(data, indent=2))
         return data
+# >>> feature:submit_confirmation
+
+
+SUBMIT_CHECKLIST = (
+    "Submission paused for one final check. Before you submit, make sure that:\n"
+    "1. every file or output the task asks for exists at the exact path and in the exact format requested;\n"
+    "2. you actually ran your result (script, build, service, test) after your last edit and it worked;\n"
+    "3. anything that must keep running (e.g. a service) is still running.\n"
+    "Fix anything that is missing. When everything is verified, issue the submit command again."
+)
+# <<< feature:submit_confirmation
+# >>> feature:loop_warning
+
+LOOP_WARNING = (
+    "\n\nNOTE: you have now run this exact command {n} times in a row and got the same output each time. "
+    "Running it again will not give new information. Change your approach: inspect the error, read the "
+    "relevant files or documentation, try a different command, or submit if the task is done."
+)
+# <<< feature:loop_warning
+# >>> feature:format_streak_trim
+
+
+def _drop_stale_format_errors(messages: list[dict]) -> list[dict]:
+    """During a streak of format errors, show the model only the latest rejection."""
+    tail = len(messages)
+    while tail > 0 and messages[tail - 1].get("extra", {}).get("interrupt_type") == "FormatError":
+        tail -= 1
+    if len(messages) - tail <= 1:
+        return messages
+    return messages[:tail] + messages[-1:]
+# <<< feature:format_streak_trim
+# >>> feature:context_trim
+
+
+def _stub_old_observations(messages: list[dict], keep_recent: int, min_chars: int) -> list[dict]:
+    """Shorten long command results that are older than the `keep_recent` most recent ones."""
+    observation_ids = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    old = set(observation_ids[:-keep_recent] if keep_recent > 0 else observation_ids)
+    out = []
+    for i, m in enumerate(messages):
+        content = m.get("content")
+        if i in old and isinstance(content, str) and len(content) > min_chars:
+            head = content[:400]
+            m = {**m, "content": f"{head}\n[... older output shortened: {len(content) - 400} more characters not shown; re-run the command if you need it ...]"}
+        out.append(m)
+    return out
+# <<< feature:context_trim

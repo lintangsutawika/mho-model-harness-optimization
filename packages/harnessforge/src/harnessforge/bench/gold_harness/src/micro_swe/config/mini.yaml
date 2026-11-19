@@ -24,8 +24,16 @@ agent:
 
     - Your response SHOULD include reasoning text explaining what you're doing
     - Your response MUST include AT LEAST ONE bash tool call
+# >>> feature:persistent_cwd
+    {%- if features.persistent_cwd %}
+    - Every action is executed in a new subshell, but the working directory carries over: after `cd /some/dir`, later commands start in `/some/dir`. Environment variable changes are not persistent; prefix commands with `MY_ENV_VAR=MY_VALUE ...` or write/load environment variables from files.
+    {%- else %}
+# <<< feature:persistent_cwd
     - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
     - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+# >>> feature:persistent_cwd
+    {%- endif %}
+# <<< feature:persistent_cwd
     - Submit your changes and finish your work by issuing the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`.
       Do not combine it with any other command. <important>After this command, you cannot continue working on this task.</important>
 
@@ -98,26 +106,22 @@ environment:
     TQDM_DISABLE: '1'
 model:
   observation_template: |
-    {%- if output.output | length < 10000 -%}
+# >>> feature:raw_observation
+    {%- if features is not defined or features.raw_observation -%}
+    <returncode>{{ output.returncode }}</returncode>
+    <output>
+    {{ output.output }}
+    </output>
+    {%- else -%}
+# <<< feature:raw_observation
     {
       "returncode": {{ output.returncode }},
       "output": {{ output.output | tojson }}
-      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
     }
-    {%- else -%}
-    {
-      "returncode": {{ output.returncode }},
-      "output_head": {{ output.output[:5000] | tojson }},
-      "output_tail": {{ output.output[-5000:] | tojson }},
-      "elided_chars": {{ output.output | length - 10000 }},
-      "warning": "Output too long."
-      {%- if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}
-    }
+# >>> feature:raw_observation
     {%- endif -%}
+# <<< feature:raw_observation
   format_error_template: |
-    {% if finish_reason is defined and (finish_reason == "length" or (finish_reason == "tool_calls" and not has_tool_calls)) -%}
-    Your previous response reached the output token limit (finish_reason={{ finish_reason }}) before you produced a tool call, so it was cut off. Respond more concisely and finish with exactly one bash tool call. If you need to think more, do so briefly.
-    {%- else -%}
     Tool call error:
 
     <error>
@@ -134,6 +138,38 @@ model:
 
     If you want to end the task, please issue the following command: `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
     without any other command.
-    {%- endif %}
   model_kwargs:
     drop_params: true
+# >>> feature:*
+features:
+# <<< feature:*
+# >>> feature:output_truncation
+  output_truncation: true
+# <<< feature:output_truncation
+# >>> feature:timeout_guidance
+  timeout_guidance: true
+# <<< feature:timeout_guidance
+# >>> feature:persistent_cwd
+  persistent_cwd: true
+# <<< feature:persistent_cwd
+# >>> feature:length_recovery
+  length_recovery: true
+# <<< feature:length_recovery
+# >>> feature:loop_warning
+  loop_warning: true
+# <<< feature:loop_warning
+# >>> feature:format_streak_trim
+  format_streak_trim: true
+# <<< feature:format_streak_trim
+# >>> feature:missing_command_repair
+  missing_command_repair: true
+# <<< feature:missing_command_repair
+# >>> feature:submit_confirmation
+  submit_confirmation: true
+# <<< feature:submit_confirmation
+# >>> feature:context_trim
+  context_trim: true
+# <<< feature:context_trim
+# >>> feature:raw_observation
+  raw_observation: true
+# <<< feature:raw_observation
