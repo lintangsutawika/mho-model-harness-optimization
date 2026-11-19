@@ -408,6 +408,32 @@ state and any lent engines stay as they are.
   - The driver records `weights/stream_base.json` (`{stream, batch}`) so the exporter continues the step numbers:
     v1 of the new stream is platoon's launch push of the checkpoint's weights = `step_<batch>`.
 
+**Resume test (2026-11-20, 131k run, gateway 2999542 → 3001153).**
+
+*First stop.*
+- STOP reached platoon during step 2's `forward_backward`, which takes ~30 min at 131k.
+- The gateway killed the driver after its fixed 300 s, so platoon never wrote its interrupted checkpoint, and step 1
+  was lost.
+- Fixed: `driver.stop_timeout` (3600 s in `naive_ext_131k.json`); `train stop`'s default grace follows it.
+
+*Relaunch, same run id.*
+- platoon resumed from the newest checkpoint (`recovery-000000`, batch 0).
+- miles-tinker's fresh server loaded it through the sidecar (`load_slot` ok, 16.8 s).
+- The same W&B run (`5zfx8md6`) was resumed rather than a new one.
+- The previous delta stream was moved to `weights/delta.<ts>`, and `stream_base.json` was written.
+- The new stream's launch push reached the engines.
+
+*Still to verify:* resuming from a mid-run checkpoint (batch ≥ 1, Adam state, sampler position), via a stop at a
+step boundary with the longer timeout.
+
+**Throughput at 131k (TP4, 3 lent nodes = 24 engines).** Step 1 took 4105 s:
+- rollouts: the trainer waited 2280 s;
+- `forward_backward`: 1800 s (20.2M tokens in 760 datums, about 3 per trajectory; `actor_train_time` 1311 s,
+  ~15k tok/s);
+- weight sync: 6.9 s.
+
+At ~1 h per step, 200 steps take ~200 h, about 3 pool handovers at 72 h each.
+
 **Checkpoint cadence and disk** (131k, `naive_ext_131k.json`).
 - Recovery checkpoints every 10 steps plus permanent ones every 50; nothing is pruned automatically
   (`keep_recovery` unset).
