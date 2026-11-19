@@ -5,6 +5,7 @@
     python -m harnessforge.train status --run-dir <run>
     python -m harnessforge.train stop   --run-dir <run> [--grace 600]
     python -m harnessforge.train export --run-dir <run> [--follow] [--version N]
+    python -m harnessforge.train unlend --run-dir <run>        # external mode: return lent pool nodes
     python -m harnessforge.train mapping                                        # old run -> new settings
 
 Inside jobs (launched by `launch`): gateway-job, driver-job.
@@ -48,10 +49,14 @@ def _jobs(run: TrainRun) -> dict:
 
 def cmd_render(a) -> int:
     from harnessforge.train.gateway import gateway_job, serve_args
+    from harnessforge.train.external import is_external, rollout_cfg
     run = TrainRun.load(a.config)
+    addrs = ["<engines of lent pool nodes %s>" % rollout_cfg(run).get("lend_nodes")] \
+        if is_external(run) else None
     out = {"run_dir": str(run.dir),
+           "rollout": rollout_cfg(run) or {"mode": "managed"},
            "gateway_job": _spec(gateway_job(run)),
-           "serve_args": serve_args(run, port=0, local_ckpt="$PBS_LOCALDIR/hf-local"),
+           "serve_args": serve_args(run, port=0, local_ckpt="$PBS_LOCALDIR/hf-local", addrs=addrs),
            "driver_job": _spec(driver_job(run)) if run.driver.get("where", "hc") == "hc" else "on the gateway head",
            "train": run["train"]}
     print(json.dumps(out, indent=1))
@@ -78,9 +83,17 @@ def cmd_launch(a) -> int:
     run.write()
     run.paths.logs.mkdir(parents=True, exist_ok=True)
     L = _launcher(run)
-    jobs = {"gateway": L.submit(gateway_job(run))}
-    if run.driver.get("where", "hc") == "hc" and not a.no_driver:
-        jobs["driver"] = L.submit(driver_job(run))
+    from harnessforge.train import external as X
+    if X.is_external(run):
+        X.lend_for_run(run)                    # raises (nodes returned) if the engines don't fit
+    try:
+        jobs = {"gateway": L.submit(gateway_job(run))}
+        if run.driver.get("where", "hc") == "hc" and not a.no_driver:
+            jobs["driver"] = L.submit(driver_job(run))
+    except Exception:
+        if X.is_external(run):
+            X.unlend_for_run(run)
+        raise
     (run.dir / "jobs.json").write_text(json.dumps({**jobs, "submitted_at": time.time()}, indent=1))
     print(json.dumps({"run_dir": str(run.dir), **jobs}))
     return 0
@@ -131,6 +144,8 @@ def cmd_status(a) -> int:
     out["weight_versions"] = (versions(P.delta_dir) or [None])[-1] if P.delta_dir.exists() else None
     out["hf_exports"] = sorted(p.name for p in P.hf_dir.glob("step_*")) if P.hf_dir.exists() else []
     out["stopping"] = P.stop_file.exists()
+    from harnessforge.train.external import read_rollout
+    out["rollout"] = read_rollout(run) or {"mode": "managed"}
     print(json.dumps(out, indent=1))
     return 0
 
@@ -151,13 +166,36 @@ def cmd_stop(a) -> int:
     while time.time() < deadline:
         if all(L.status(j).state == JobState.DONE for j in jobs.values()):
             print("stopped")
-            return 0
+            return _return_nodes(run, L, jobs)
         time.sleep(10)
     for k, j in jobs.items():
         if L.status(j).state != JobState.DONE:
             print(f"cancelling {k} {j}")
             L.cancel(j)
-    return 0
+    return _return_nodes(run, L, jobs)
+
+
+def _return_nodes(run: TrainRun, L, jobs: dict) -> int:
+    """External mode: once the gateway job is gone, make sure the lent nodes went back (its
+    teardown normally did it; a hard kill skips that)."""
+    from harnessforge.train import external as X
+    if not X.is_external(run) or X.read_rollout(run).get("status") != "lent":
+        return 0
+    if "gateway" not in jobs:                  # stop --driver-only: the gateway keeps its engines
+        return 0
+    gw = jobs.get("gateway")
+    deadline = time.time() + 300
+    while gw and L.status(gw).state != JobState.DONE and time.time() < deadline:
+        time.sleep(10)
+    if gw and L.status(gw).state != JobState.DONE:
+        print(f"gateway job {gw} still running: not returning its engines", file=sys.stderr)
+        return 1
+    return 0 if X.unlend_for_run(run) else 1
+
+
+def cmd_unlend(a) -> int:
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    return _return_nodes(run, _launcher(run), {k: v for k, v in _jobs(run).items() if k == "gateway"})
 
 
 def cmd_export(a) -> int:
@@ -199,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "launch":
             s.add_argument("--force", action="store_true")
             s.add_argument("--no-driver", action="store_true")
-    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver"):
+    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver", "unlend"):
         s = sub.add_parser(name)
         s.add_argument("--run-dir", required=True)
         if name == "stop":
@@ -223,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         from harnessforge.train.driver import run_driver_job
         return run_driver_job(a.run_dir)
     return {"render": cmd_render, "launch": cmd_launch, "status": cmd_status, "stop": cmd_stop,
-            "driver": cmd_driver,
+            "driver": cmd_driver, "unlend": cmd_unlend,
             "export": cmd_export, "mapping": cmd_mapping}[a.cmd](a)
 
 
