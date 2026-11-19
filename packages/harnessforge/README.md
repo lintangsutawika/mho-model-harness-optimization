@@ -7,7 +7,7 @@ Optimize agent harnesses, and the models that run them:
   rollout engine, swapping to newer policies as they are trained;
 - RL (GRPO, DPPO) and RSFT training through [platoon](https://github.com/ApGa/platoon).
 
-Status: early. See [docs/PLAN.md](docs/PLAN.md).
+Status: early. See [docs/PLAN.md](docs/PLAN.md); the model pool and launchers: [docs/pool.md](docs/pool.md).
 
 ```bash
 uv run --directory packages/harnessforge --extra dev pytest
