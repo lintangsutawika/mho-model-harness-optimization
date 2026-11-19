@@ -75,6 +75,15 @@ Found by reading the old trial logs and probing the pilot images (`probe.py` in 
    the spec's own limit high enough that the task's limit binds; `on_harness_exit: {timeout: grade, crash: grade}`:
    like harbor, the verifier grades whatever the agent left after a timeout or a crash. The harness's processes count
    against the task's memory limit, as in harbor (`[resources] memory_mb` 0).
+6. **Processes the agent leaves running.** Many tmax tasks say "fix it and leave the service running on :8080", and
+   their tests call that service. harbor grades with whatever the agent left running. platoon kills those processes
+   twice, both on purpose (nothing the agent leaves behind can tamper with grading): (a) when the harness exits, every
+   sandbox process whose environment carries the launch marker `PLATOON_HARNESS_AGENT` (all the agent's commands
+   inherit it), and (b) before the tests, every process in the sandbox (`Sandbox.kill_processes`). With
+   `harbor_keep_processes` (default on) the runner gets `--keep-children`, which unsets the marker before the agent
+   starts, so only the agent loop itself is marked (a timeout still ends it); and the pod provider's
+   `keep_agent_processes` makes (b) a no-op. Pilot task 000032 scored 0/8 on platoon with only (b) disabled and 4/4 on
+   harbor; the bench task `background_service` scored 0 for gold and start the same way (see below).
 
 ## Launch order, concurrency and stopping
 
@@ -86,9 +95,16 @@ backend writes as `EvalRequest.tasks`. `PlatoonRun.order` is `Order.TASK_MAJOR`;
 **One platoon process per candidate**, each with `EvalRequest.concurrency` trials in flight. platoon's runner has no
 way to stop one environment entry while the others go on (its stop ends the evaluation), and its SIGTERM path stops
 the sandboxes of that process (labelled with its output directory), then exits 143. So `stop(candidate)` sends that
-candidate's process SIGTERM (SIGKILL to its process group after `stop_grace_s`, 180 s) and touches nothing else; the
-pilot ran base and candidate side by side this way. Cost per candidate: a gateway and a task listing; the toolchain is
-staged once per node.
+candidate's process SIGTERM, a second SIGTERM after `stop_grace_s / 2` (platoon's second Ctrl+C: stop waiting for
+in-flight trials), SIGKILL to its process group after `stop_grace_s` (180 s), then `platoon sandbox reap` on its output
+directory; it touches nothing else. The pilot ran base and candidate side by side this way. Cost per candidate: a
+gateway and a task listing; the toolchain is staged once per node.
+
+Verified on ABCI (base and a second candidate, 3 tasks x 2 trials, concurrency 2): stopping a candidate before its
+agents started exited 143 in ~2 s; stopping it with two agents mid-run needed SIGKILL after 180 s with a single
+SIGTERM (`stoptest2`), and exits 143 in ~90 s with the escalation (`stoptest3`: platoon reaped the one sandbox left,
+no process left in the group). In both, the stopped candidate's in-flight trials became `error="stopped"`
+(env_failed) and the other candidate finished all 6 trials.
 
 A node runs about one sandbox per core (tmax tasks ask for 1 CPU): `concurrency x candidates <= cores - 4`
 (`jobs.max_concurrency`). On ABCI an `rt_HC` node has 32 cores here; a full `rt_HF` node 192.
@@ -144,5 +160,79 @@ fields plus `platoon` and `site`; options are listed in `backend.py`'s docstring
 with `request.concurrency` per candidate, `stop()` ends a candidate's in-flight trials as `env_failed` `"stopped"`,
 `env_failures` scripts sandbox failures, rewards are deterministic per seed.
 
-PILOT_PLACEHOLDER
+## Running the gold-harness benchmark (`harnessforge.bench`)
+
+The bench tasks and harnesses go through this backend unchanged (`test_bench_tasks_and_harnesses_fit_the_platoon_backend`;
+on ABCI, `bench1`/`bench2` below). What to know:
+
+- **Image.** `task.toml` names the image as `[environment].docker_image`, by default the tag `harnessforge-bench:0.1`,
+  which no registry serves: build the SIF once (`singularity build --fakeroot hf-bench-0.1.sif <out>/image/lab.def`,
+  about a minute in a CPU job) and generate with `--image /abs/path/hf-bench-0.1.sif`. platoon runs a `.sif` path as
+  is (`docker_image_reference`), `stage-images` skips it, nothing is replayed (`materialize` returns `{}`).
+- **platoon's Harbor loader** reads every bench `task.toml` (`schema_version = "1.4"`, legacy `memory = "1G"` ->
+  1024 MB, no `workdir` -> platoon's `/app`, which is the image's `WORKDIR`; no `[agent] user`, no steps). Checked
+  with `HarborTask.load(..., agent_user="ignore")` on the cluster for all 10 families.
+- **Options.** Set `harbor_system_deps: false`: the bench image has what its tasks need, and the apt step would put
+  network installs and a minute per trial back. Keep `harbor_keep_processes` on: `background_service` asks the
+  agent to leave `labctl serve` running (with it off, or before the marker fix, it scores 0 for every harness).
+- The gold, start and ablation harnesses pass `check_candidate` (same dependencies as micro-swe-agent).
+
+Smoke on ABCI (10 tasks, one per family, 1 trial, Qwen3.5-4B on vLLM, gold and start racing, concurrency 5 each):
+all 20 trials graded, none env_failed, ~5 min. `bench1` (before the marker fix): gold 9/10, start 8/10, both 0 on
+`background_service`. `bench2` (after): gold 10/10, start 9/10 (start's miss is `huge_log`, `scored:context_overflow`:
+the output-truncation feature is what that family probes). One trial per task says nothing about effect sizes; it
+shows the pipeline works.
+
+## Pilot: harbor (old path) vs platoon
+
+32 tmax-v11-gate200 tasks (fixed subset) x 2 trials, base micro-swe-agent and one accepted candidate
+(`candidate_6_2_3d`), Qwen3.5-4B on one vLLM 0.28 GPU (the eval.sh serving block), agent timeout x3, concurrency 12
+per harness, all trials on one `rt_HC` node per path. harbor = `mho-rsft/scripts/optimize/eval.sh` unmodified (group
+mode, hpc-sandbox pods). Harbor ran twice (p1, p3) to measure its own run-to-run noise; platoon ran three times, each
+time with the next parity fix (p1: none, p2: + keep processes before the tests, p3: + unmarked agent commands, the
+final code). Accuracy is the mean over tasks of the per-task mean; d and SE are paired over the 32 tasks.
+
+| | harbor p1 | harbor p3 | platoon p3 | platoon p3 - harbor (p1+p3 pooled) |
+|---|---|---|---|---|
+| base acc | 0.562 | 0.438 | 0.469 | -0.031 (SE 0.049) |
+| cand acc | 0.562 | 0.562 | 0.531 | -0.031 (SE 0.046) |
+| cand - base | 0.000 | +0.125 | +0.062 (SE 0.058) | effect difference +0.000 (SE 0.072) |
+| env_failed | 0 / 128 | 0 / 128 | 0 / 128 | |
+| agent timeouts (graded) | 18 | 22 | 20 | |
+| other errors | 2 nonzero agent exit | 3 nonzero exit, 1 setup timeout | 1 harness crash (graded) | |
+| output tokens / trial, median (base, cand) | 7.5k, 7.9k | 6.2k, 6.5k | 6.4k, 8.8k | |
+| wall / trial, median (base, cand) | 215 s, 250 s | 208 s, 213 s | 182 s, 214 s | |
+| span of the run | 68 min | 68 min | 70 min | |
+
+- **Agreement.** platoon p3 is within noise of harbor: -0.031 for both harnesses (|t| < 0.7), and the candidate's
+  effect is the same on both paths (+0.062 vs +0.062 pooled harbor). For scale, harbor against itself (p3 - p1) gave
+  -0.125 (SE 0.071) on base. The first two platoon runs were 0.08-0.14 low (|t| up to 2.1) mostly through task 000032
+  (below) plus that same run-to-run noise.
+- **Task 000032** ("fix the API and leave it running on :8080"): harbor 8/8; platoon p1 0/4 and p2 0/4 (the agent's
+  server was killed before the tests, first by grading's kill, then by the launch-marker kill); p3 4/4.
+- **Tokens.** Prompt tokens of the first call are identical on both paths (same system prompt, tools and task text:
+  1276 / 1485 / 1291 for the first three tasks). Means of input tokens are dominated by a few long trials and differ
+  between harbor's own two runs by as much as between paths; medians agree.
+- **Errors map one to one**: harbor `AgentTimeoutError` = platoon `scored:agent_timeout` (graded after the timeout, as
+  harbor does), harbor `NonZeroAgentExitCodeError` ~ platoon `scored:harness_crash`.
+
+The driver scripts (`harbor_pilot.sh`, `platoon_pilot.sh`, the comparison) are throwaway and not in the package; the
+backend calls they make are the ones in "Running it".
+
+## Known gaps
+
+- **Verifier output is not kept.** platoon puts the tests' output tail in the outcome's metadata but does not write it
+  to the rollout directory (`trajectory_collection.json` has status and reward only), so a platoon 0 cannot be explained
+  from disk the way harbor's `verifier/test-stdout.txt` can. Needs a platoon change or a collect hook.
+- **Grading guard off.** Parity keeps the agent's processes alive through grading (both kills off), so a process the
+  agent left behind could rewrite the reward files; harbor had the same exposure. Turn `harbor_keep_processes` off
+  for tasks that do not need a running service once we no longer compare with harbor.
+- **Network installs.** `harbor_system_deps` (on by default, for parity) apt-installs curl/git/gcc in every trial,
+  about a minute each and a dependency on the mirrors. Baking those into the task images (or turning it off when the
+  images have them, as for the bench) removes it.
+- **Multi-step tasks** are refused by platoon's Harbor loader; no-network tasks use platoon's own isolated sandbox
+  (needs `allow_network_none`), not a pod; tasks whose Dockerfile has more than one distinct RUN replay are refused.
+- **One toolchain.** A candidate that adds a dependency beyond micro-swe-agent's needs a new toolchain version
+  (`check_candidate` refuses it); candidates that change only code run as is.
+
 
