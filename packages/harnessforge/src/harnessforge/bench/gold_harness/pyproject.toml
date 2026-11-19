@@ -1,0 +1,33 @@
+[project]
+name = "micro-swe-agent"
+version = "0.1.0"
+description = "A stripped-down, self-contained agent scaffold, focused on editable scaffolding."
+requires-python = ">=3.11"
+dependencies = [
+    "litellm",
+    "jinja2",
+    "pydantic",
+    "tenacity",
+    "pyyaml",
+    "mcp",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+# Exposes the `mini-swe-agent` binary a runner invokes (SAME name on purpose: a runner
+# shells out to `mini-swe-agent --yolo --model=... --task=... --output=...`). Installing
+# this thus shadows the PyPI mini CLI with this scaffold. See src/micro_swe/__main__.py.
+[project.scripts]
+mini-swe-agent = "micro_swe.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/micro_swe"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
