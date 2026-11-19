@@ -98,6 +98,8 @@ the only result format). Change a contract only in a PR of its own.
   within noise before anything depends on this.
 
 ### D. Gold-harness benchmark (`harnessforge.bench`)
+Implemented: see [bench.md](bench.md) (features, builder, probes, task families, metrics, planned
+experiments).
 - 10 features, each a small, separable change to micro-swe-agent. Draw them from what our
   optimizer actually discovered: truncation recovery, loop escape, format-error repair,
   output trimming, finish discipline, and so on.
