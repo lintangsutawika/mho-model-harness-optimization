@@ -52,7 +52,8 @@ def wait_gateway(run: TrainRun, timeout: float = 4 * 3600, poll: float = 15) -> 
 
 
 def exporter_argv(run: TrainRun, *, follow: bool) -> list[str]:
-    node_local = os.environ.get("PBS_LOCALDIR") or "/tmp"
+    from harnessforge.train.gateway import node_local_dir
+    node_local = node_local_dir()
     py = ["python3", "-m", "harnessforge.train", "export", "--run-dir", str(run.dir)]
     return container_argv(run, node_local=node_local) + py + (["--follow"] if follow else [])
 
@@ -60,7 +61,8 @@ def exporter_argv(run: TrainRun, *, follow: bool) -> list[str]:
 def platoon_env(run: TrainRun, url: str) -> dict[str, str]:
     d = run.driver
     hf_src = run.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
-    node_local = os.environ.get("PBS_LOCALDIR") or os.environ.get("TMPDIR") or "/tmp"
+    from harnessforge.train.gateway import node_local_dir
+    node_local = node_local_dir()
     env = dict(os.environ)
     env.update({
         "PYTHONPATH": os.pathsep.join(p for p in (hf_src, env.get("PYTHONPATH")) if p),
@@ -88,7 +90,8 @@ def prepare(run: TrainRun, url: str) -> Path:
     popts = env.setdefault("provider_options", {})
     if d.get("seed_image_cache"):
         from harnessforge.evals.__main__ import stage_images
-        node_cache = Path(os.environ.get("PBS_LOCALDIR") or "/tmp") / "images"
+        from harnessforge.train.gateway import node_local_dir
+        node_cache = Path(node_local_dir()) / "images"
         staged, missing = stage_images(run.paths.dataset_dir, tasks, d["seed_image_cache"], node_cache)
         _log(run, f"staged {staged} images to {node_cache}; {missing} not cached (pulled on first use)")
         popts.setdefault("image_cache", str(node_cache))
@@ -158,6 +161,9 @@ def run_driver_job(run_dir: str | Path) -> int:
         d = json.loads(P.driver_file.read_text()) if P.driver_file.exists() else {}
         d.update(status="done", returncode=rc, finished_at=time.time())
         _write_json(P.driver_file, d)
-        if run.driver.get("where", "hc") != "gateway" and run.driver.get("stop_gateway", True):
+        keep = P.dir / "KEEP_GATEWAY"
+        if keep.exists():
+            keep.rename(keep.with_name(f"KEEP_GATEWAY.{int(time.time())}"))
+        elif run.driver.get("where", "hc") != "gateway" and run.driver.get("stop_gateway", True):
             P.stop_file.write_text(f"driver finished rc={rc}\n")
     return rc

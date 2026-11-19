@@ -59,11 +59,12 @@ def serve_args(run: TrainRun, *, port: int, local_ckpt: str) -> list[str]:
     miles' scripts/models/<megatron_model_type>.py, added in the container)."""
     g, m = run.gateway, run["model"]
     R = int(g.get("rollout_nodes", 1))
-    sg = {"mem-fraction-static": 0.85, "context-length": 65536, "chunked-prefill-size": 8192,
-          "max-running-requests": 256, **(g.get("sglang") or {})}
+    # device: miles renders SGLang's argv on a GPU-less manager actor, where this SGLang build
+    # auto-detects device=None and the argv round-trip check fails; name it explicitly
+    sg = {"device": "cuda", "mem-fraction-static": 0.85, "context-length": 65536,
+          "chunked-prefill-size": 8192, "max-running-requests": 256, **(g.get("sglang") or {})}
     args = [
         "--hf-checkpoint", m["hf_checkpoint"], "--ref-load", m["ref_load"],
-        "--save", str(run.paths.dir / "megatron"),
         "--tinker-train-mode", "full", "--tinker-server-port", str(port),
         "--tinker-checkpoint-root", str(run.paths.tinker_root),
         "--tinker-base-model", m["name"],
@@ -117,7 +118,7 @@ def container_argv(run: TrainRun, *, node_local: str, ifname: str = "", master: 
              *hf_cache_binds(), hf_src, *g.get("binds", ["/groups"])]
     env = {
         "PYTHONPATH": ":".join(["/root/miles", "/root/Megatron-LM", g["extra_site"], hf_src]),
-        "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONFAULTHANDLER": "1",
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         "TMPDIR": f"{node_local}/tmp", "RAY_TMPDIR": f"{node_local}/ray",
         "TRITON_CACHE_DIR": f"{node_local}/triton", "TORCHINDUCTOR_CACHE_DIR": f"{node_local}/inductor",
@@ -125,6 +126,8 @@ def container_argv(run: TrainRun, *, node_local: str, ifname: str = "", master: 
         "RAY_memory_monitor_refresh_ms": "0", "RAY_raylet_startup_timeout": "300",
         "RAY_AUTH_MODE": "token", "RAY_AUTH_TOKEN_PATH": str(run.paths.secrets / "ray_token"),
         "MILES_SCRIPT_EXTERNAL_RAY": "1", "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+        # ABCI jobs set CUDA_VISIBLE_DEVICES to GPU UUIDs; miles parses Ray's GPU ids as ints
+        "CUDA_VISIBLE_DEVICES": ",".join(map(str, range(8))),
         "WANDB_MODE": "disabled",
         **({"NCCL_SOCKET_IFNAME": ifname, "GLOO_SOCKET_IFNAME": ifname} if ifname else {}),
         **({"MASTER_ADDR": master} if master else {}),
@@ -182,6 +185,33 @@ def node_ip_ifname() -> tuple[str, str]:
     return socket.gethostbyname(socket.gethostname()), ""
 
 
+def node_local_dir(min_free_gb: float = 40.0) -> str:
+    """Node-local scratch for this job: $PBS_LOCALDIR, else /local/<jobid> (ABCI does not always
+    export the variable), else the roomiest of $TMPDIR and /tmp/<user>-<job>. The disk-delta
+    local checkpoint (~9 GB for 4B) and Ray's object store live here."""
+    import shutil
+    job = os.environ.get("PBS_JOBID", "local")
+    cands = [os.environ.get("PBS_LOCALDIR", ""), f"/local/{job}"]
+    for c in cands:
+        if c and os.path.isdir(c) and os.access(c, os.W_OK):
+            return c
+    fallback = [os.environ.get("TMPDIR", ""), f"/tmp/{os.environ.get('USER', 'u')}-{job}"]
+    best, free = fallback[-1], -1.0
+    for c in fallback:
+        if not c:
+            continue
+        try:
+            os.makedirs(c, exist_ok=True)
+            f = shutil.disk_usage(c).free / 2**30
+        except OSError:
+            continue
+        if f > free:
+            best, free = c, f
+    if free < min_free_gb:
+        print(f"WARNING: node-local dir {best} has only {free:.0f} GB free", flush=True)
+    return best
+
+
 def job_hosts() -> list[tuple[str, int]]:
     """(host, pbsdsh vnode index) of each node of the job, head first."""
     nf = os.environ.get("PBS_NODEFILE")
@@ -191,6 +221,24 @@ def job_hosts() -> list[tuple[str, int]]:
     for i, h in enumerate(Path(nf).read_text().split()):
         hosts.setdefault(h, i)
     return list(hosts.items())
+
+
+WARMUP_FAILED = "backend warmup failed"
+WARMUP_DONE = ("warmup done", "backend warmup ok", "Tinker gateway ready")
+
+
+def warmup_failed(head_log: Path) -> str | None:
+    """serve_tinker answers /healthz even when its backend warmup (first weight sync) failed;
+    the head log says so."""
+    try:
+        with open(head_log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - (8 << 20)))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    i = tail.rfind(WARMUP_FAILED)
+    return tail[i:i + 300].splitlines()[0] if i >= 0 else None
 
 
 def _healthy(url: str) -> bool:
@@ -214,7 +262,7 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
     P.logs.mkdir(parents=True, exist_ok=True)
     log = P.logs / "gateway.log"
     job_id = os.environ.get("PBS_JOBID", "local")
-    node_local = os.environ.get("PBS_LOCALDIR") or f"/tmp/{os.environ.get('USER', 'u')}-{job_id}"
+    node_local = node_local_dir()
     os.makedirs(f"{node_local}/tmp", exist_ok=True)
     ip, ifname = node_ip_ifname()
     nodes = job_hosts()
@@ -237,7 +285,7 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
     local_ckpt = f"{node_local}/hf-local"
     _write_json(P.gateway_file, {"status": "starting", "job_id": job_id, "host": hosts[0], "ip": ip,
                                  "port": port, "url": url, "hosts": hosts, "started_at": time.time()})
-    _log(log, f"job {job_id} hosts {hosts} head {ip} ({ifname}) port {port}")
+    _log(log, f"job {job_id} hosts {hosts} head {ip} ({ifname}) port {port} node-local {node_local}")
     cont = container_argv(run, node_local=node_local, ifname=ifname, master=ip)
     py = "python3"
     head_cmd = cont + [py, "-m", "harnessforge.train.gateway", "inner-head", "--run-dir", str(run.dir),
@@ -278,6 +326,12 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                 rc = 1
                 return rc
             time.sleep(10)
+        # the server answers before (and regardless of) its warmup weight sync
+        time.sleep(30)
+        if (why := warmup_failed(P.logs / "gateway.head.log")):
+            _log(log, f"ERROR: {why}")
+            rc = 1
+            return rc
         ready_s = time.time() - t0
         _write_json(P.gateway_file, {"status": "ready", "job_id": job_id, "host": hosts[0], "ip": ip,
                                      "port": port, "url": url, "hosts": hosts,
@@ -324,11 +378,28 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                     os.killpg(p.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+        collect_ray_logs(Path(node_local) / "ray", P.logs / f"ray-head-{job_id.split('.')[0]}")
         g = json.loads(P.gateway_file.read_text()) if P.gateway_file.exists() else {}
         g.update(status="stopped", stopped_at=time.time(), returncode=rc)
         _write_json(P.gateway_file, g)
         _log(log, f"gateway job done rc={rc} (PBS reaps what is left on the job's nodes)")
     return rc
+
+
+def collect_ray_logs(ray_tmp: Path, dest: Path, max_bytes: int = 50 << 20) -> None:
+    """Copy the head node's Ray session logs (node-local, gone with the job) into the run dir:
+    worker stderr is where a crashed actor's last words are."""
+    import shutil
+    try:
+        logs = sorted(ray_tmp.glob("session_*/logs"))
+        if not logs:
+            return
+        dest.mkdir(parents=True, exist_ok=True)
+        for f in logs[-1].iterdir():
+            if f.is_file() and f.suffix in (".err", ".out", ".log") and 0 < f.stat().st_size <= max_bytes:
+                shutil.copy2(f, dest / f.name)
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- inside the container
@@ -369,7 +440,7 @@ def inner_head(run_dir: str, ip: str, port: int, gpus: int, local_ckpt: str) -> 
     args = serve_args(run, port=port, local_ckpt=local_ckpt)
     env_vars = {
         "PYTHONUNBUFFERED": "1", "CUDA_DEVICE_MAX_CONNECTIONS": "1", "NCCL_NVLS_ENABLE": "1",
-        "no_proxy": f"127.0.0.1,{ip}", "MASTER_ADDR": ip,
+        "no_proxy": f"127.0.0.1,{ip}", "MASTER_ADDR": ip, "PYTHONFAULTHANDLER": "1",
         "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
         **{k: os.environ[k] for k in ("NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "NCCL_DEBUG",
                                       "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "TMPDIR",

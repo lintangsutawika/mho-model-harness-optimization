@@ -86,6 +86,32 @@ def cmd_launch(a) -> int:
     return 0
 
 
+def cmd_driver(a) -> int:
+    """(Re)submit only the driver job of an existing run, against its running gateway (e.g. after
+    changing run.json's env/train sections). The previous driver must have ended."""
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    if a.set:
+        from harnessforge.train.config import merge
+        for kv in a.set:
+            key, _, val = kv.partition("=")
+            node: dict = {}
+            cur = node
+            parts = key.split(".")
+            for k in parts[:-1]:
+                cur = cur.setdefault(k, {})
+            cur[parts[-1]] = json.loads(val)
+            run.raw = merge(run.raw, node)
+        run.write()
+    jobs = _jobs(run)
+    f = run.paths.driver_file
+    if f.exists():
+        f.rename(f.with_name(f"{f.name}.{int(time.time())}"))
+    jobs["driver"] = _launcher(run).submit(driver_job(run))
+    (run.dir / "jobs.json").write_text(json.dumps(jobs, indent=1))
+    print(json.dumps({"driver": jobs["driver"]}))
+    return 0
+
+
 def cmd_status(a) -> int:
     from harnessforge.train.export import versions
     run = TrainRun.load(Path(a.run_dir) / "run.json")
@@ -111,9 +137,16 @@ def cmd_status(a) -> int:
 
 def cmd_stop(a) -> int:
     run = TrainRun.load(Path(a.run_dir) / "run.json")
-    run.paths.stop_file.write_text(f"stop requested {time.time()}\n")
     L = _launcher(run)
     jobs = {k: v for k, v in _jobs(run).items() if k != "submitted_at"}
+    if a.driver_only:
+        # the driver stops the gateway on exit unless told not to; qdel = SIGTERM to platoon
+        (run.dir / "KEEP_GATEWAY").write_text(str(time.time()))
+        jobs = {k: v for k, v in jobs.items() if k == "driver"}
+        for j in jobs.values():
+            L.cancel(j)
+    else:
+        run.paths.stop_file.write_text(f"stop requested {time.time()}\n")
     deadline = time.time() + a.grace
     while time.time() < deadline:
         if all(L.status(j).state == JobState.DONE for j in jobs.values()):
@@ -165,11 +198,16 @@ def main(argv: list[str] | None = None) -> int:
         if name == "launch":
             s.add_argument("--force", action="store_true")
             s.add_argument("--no-driver", action="store_true")
-    for name in ("status", "stop", "export", "gateway-job", "driver-job"):
+    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver"):
         s = sub.add_parser(name)
         s.add_argument("--run-dir", required=True)
         if name == "stop":
             s.add_argument("--grace", type=float, default=600)
+            s.add_argument("--driver-only", action="store_true",
+                           help="stop the driver (platoon) and keep the gateway serving")
+        if name == "driver":
+            s.add_argument("--set", action="append", default=[],
+                           help="run.json override, dotted key = JSON value, e.g. env.harbor_system_deps=false")
         if name == "export":
             s.add_argument("--follow", action="store_true")
             s.add_argument("--every", type=int)
@@ -184,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
         from harnessforge.train.driver import run_driver_job
         return run_driver_job(a.run_dir)
     return {"render": cmd_render, "launch": cmd_launch, "status": cmd_status, "stop": cmd_stop,
+            "driver": cmd_driver,
             "export": cmd_export, "mapping": cmd_mapping}[a.cmd](a)
 
 
