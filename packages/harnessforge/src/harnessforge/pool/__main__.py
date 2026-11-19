@@ -9,6 +9,9 @@
     python -m harnessforge.pool repair  --spec pool.yaml
     python -m harnessforge.pool restart-node --spec pool.yaml --node 1
     python -m harnessforge.pool stop    --spec pool.yaml
+    python -m harnessforge.pool lend    --spec pool.yaml --node 3 [--node 2] --to RUN \
+                                        [--policy-file F --on-restart latest]   # prints engine URLs
+    python -m harnessforge.pool unlend  --spec pool.yaml [--node 3] [--no-reload]
 
 Instead of --spec, an existing pool can be named with --pool-id [--state-root].
 """
@@ -38,7 +41,8 @@ def _pool(a, *, new: bool) -> SGLangPool:
 
 def _summary(h: dict) -> str:
     lines = [f"pool {h['pool_id']}  status={h['status']}  policy={h['policy']['id']} "
-             f"({h['policy']['path']})",
+             f"({h['policy']['path']})"
+             + (f"  lent={ {k: v.get('to') for k, v in h['lent'].items()} }" if h.get("lent") else ""),
              f"endpoint {h.get('endpoint', '-')}  engines ok {h['engines_ok']}/"
              f"{h['engines_total']}"]
     if h.get("router"):
@@ -46,10 +50,12 @@ def _summary(h: dict) -> str:
         lines.append(f"router {r['url']} ok={r['ok']} workers={len(r['workers'])}")
     for n in h["nodes"]:
         lines.append(f"  node {n['index']} job {n['job_id']} [{n['job']['state']}] "
-                     f"host={n['host']} status={n['status']}")
+                     f"host={n['host']} status={n['status']}"
+                     + (f" LENT to {n['lent_to']}" if n.get("lent_to") else ""))
         for e in n["engines"]:
             lines.append(f"    {e['url']} ok={e['ok']} version={e.get('weight_version')} "
-                         f"running={e.get('running')} queued={e.get('queued')}")
+                         f"running={e.get('running')} queued={e.get('queued')}"
+                         + (f" HELD ({e['held']})" if e.get("held") else ""))
     return "\n".join(lines)
 
 
@@ -57,7 +63,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m harnessforge.pool", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["start", "status", "endpoint", "wait", "load", "repair",
-                                    "restart-node", "stop"])
+                                    "restart-node", "stop", "lend", "unlend"])
     ap.add_argument("--spec")
     ap.add_argument("--pool-id")
     ap.add_argument("--state-root")
@@ -68,7 +74,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--path")
     ap.add_argument("--base-model")
     ap.add_argument("--no-drain", action="store_true")
-    ap.add_argument("--node", type=int)
+    ap.add_argument("--node", type=int, action="append",
+                    help="node index (lend/unlend: repeatable)")
+    ap.add_argument("--to", help="lend: who borrows the nodes (a training run id)")
+    ap.add_argument("--policy-file", help="lend: the trainer's latest-weights pointer file")
+    ap.add_argument("--on-restart", default="down", choices=["down", "latest"])
+    ap.add_argument("--drain-timeout", type=float, default=600.0)
+    ap.add_argument("--no-reload", action="store_true")
     a = ap.parse_args(argv)
     try:
         if a.cmd == "start":
@@ -93,7 +105,18 @@ def main(argv: list[str] | None = None) -> int:
         elif a.cmd == "repair":
             print(f"restarted nodes {p.repair()}")
         elif a.cmd == "restart-node":
-            print(f"node {a.node} -> job {p.restart_node(a.node)}")
+            for i in a.node or []:
+                print(f"node {i} -> job {p.restart_node(i)}")
+        elif a.cmd == "lend":
+            if not (a.node and a.to):
+                sys.exit("lend needs --node and --to")
+            urls = p.lend(a.node, to=a.to, policy_file=a.policy_file, on_restart=a.on_restart,
+                          drain_timeout=a.drain_timeout)
+            print(json.dumps({"lent": a.node, "to": a.to, "engines": urls}) if a.json
+                  else "\n".join(urls))
+        elif a.cmd == "unlend":
+            p.unlend(a.node, reload=not a.no_reload)
+            print(f"returned; lent now {sorted(p.lent())}")
         elif a.cmd == "stop":
             p.stop()
             print("stopped")

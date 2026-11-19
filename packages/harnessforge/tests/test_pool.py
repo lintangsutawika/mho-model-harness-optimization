@@ -275,3 +275,143 @@ def test_local_pool_end_to_end(tmp_path):
 def test_cli_missing_pool_is_a_clean_error(tmp_path, capsys):
     assert cli(["status", "--pool-id", "nope", "--state-root", str(tmp_path)]) == 2
     assert "no pool state" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------- lending
+def _lendable_pool(tmp_path, urls_by_node, features=("lend",)):
+    p = SGLangPool(PoolSpec(nodes=len(urls_by_node), gpus_per_node=2), BASE, pool_id="lend",
+                   state_root=tmp_path, launcher=RecordingLauncher())
+    p.start(wait=False)
+    for i, urls in enumerate(urls_by_node):
+        write_json(p.dir.node_file(i), {"status": "ready", "updated_at": time.time(),
+                                        "features": list(features),
+                                        "engines": [{"url": u, "ready": True} for u in urls]})
+    return p
+
+
+def test_lend_unlend_offline(tmp_path, engines):
+    a, b, c = engines.urls
+    p = _lendable_pool(tmp_path, [[a], [b, c]])
+    with pytest.raises(PoolError, match="not part"):
+        p.lend([5], to="run")
+    with pytest.raises(PoolError, match="policy_file"):
+        p.lend([1], to="run", on_restart="latest")
+    assert p.lend([1], to="run", drain_timeout=5) == [b, c]
+    assert p.lent() == {1: {"to": "run", "since": p.lent()[1]["since"], "policy_file": None,
+                            "on_restart": "down"}}
+    with pytest.raises(PoolError, match="already lent"):
+        p.lend([1], to="other")
+    assert p.engines() == [a]                         # router/load see node 0 only
+    assert p.lent_engines() == [b, c]
+    p.load(PolicyRef("v2", "/ckpt/v2"))
+    assert http.get_json(a + "/model_info")["weight_version"] == "v2"
+    assert http.get_json(b + "/model_info")["weight_version"] == "base"     # untouched
+    assert p.dir.pool()["history"][-1]["skipped_lent_nodes"] == [1]
+    # the trainer moves its engines on
+    http.post_json(b + "/update_weights_from_disk", {"model_path": "/t/s1", "weight_version": "s1"})
+    h = p.health()
+    assert h["lent"]["1"]["to"] == "run" and h["nodes"][1]["lent_to"] == "run"
+    # a failed reload keeps the node lent (no trainer weights back into the router)
+    p.dir.update_pool(policy={"id": "bad", "path": "/ckpt/BAD", "base_model": None})
+    with pytest.raises(PoolError, match="stay lent"):
+        p.unlend()
+    assert 1 in p.lent()
+    p.dir.update_pool(policy={"id": "v2", "path": "/ckpt/v2", "base_model": None})
+    p.unlend([1])
+    assert p.lent() == {}
+    assert {http.get_json(u + "/model_info")["weight_version"] for u in (a, b, c)} == {"v2"}
+    assert [e["op"] for e in p.dir.pool()["lend_history"]] == ["lend", "unlend"]
+
+
+def test_lend_refuses_old_agents(tmp_path, engines):
+    a, b, c = engines.urls
+    p = _lendable_pool(tmp_path, [[a], [b, c]], features=())
+    with pytest.raises(PoolError, match="predates lending"):
+        p.lend([1], to="run")
+    assert p.lent() == {}
+
+
+def test_lend_waits_for_drain(tmp_path, engines):
+    a, b, c = engines.urls
+    p = _lendable_pool(tmp_path, [[a], [b, c]])
+    p._inflight = lambda u: 1 if u == c else 0
+    with pytest.raises(PoolError, match="still busy"):
+        p.lend([1], to="run", drain_timeout=0.3, poll=0.1)
+    assert 1 in p.lent()                              # stays lent: the caller decides
+
+
+def _engine_pid(p, node, k):
+    for _ in range(100):
+        n = p.dir.node(node) or {}
+        e = [x for x in n.get("engines", []) if x["k"] == k]
+        if e and e[0].get("pid"):
+            return e[0]["pid"]
+        time.sleep(0.1)
+    raise AssertionError("no pid")
+
+
+def _until(fn, timeout=30, poll=0.2):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        v = fn()
+        if v:
+            return v
+        time.sleep(poll)
+    raise AssertionError("timed out")
+
+
+def test_local_pool_lending_end_to_end(tmp_path):
+    """Real node agents + fake engines/router: a lent node leaves the router, load() skips it,
+    a dead lent engine is held down (or restarted on the trainer's published weights), and
+    unlend reloads the active policy and routes it again."""
+    import signal as _signal
+    cfg = {
+        "pool_id": "lend2", "state_root": str(tmp_path / "state"),
+        "policy": {"id": "base", "path": "/ckpt/base"},
+        "spec": {"nodes": 2, "gpus_per_node": 2, "tp": 1,
+                 "launcher": {"kind": "local", "engine_port": 42500, "router_port": 42400}},
+        "engine_cmd": [sys.executable, FAKE, "engine"],
+        "router_cmd": [sys.executable, FAKE, "router"],
+        "advertise": "127.0.0.1", "job_env": {"HF_POOL_POLL": "0.2"},
+        "startup_timeout": 60,
+    }
+    L = LocalLauncher(tmp_path / "jobs")
+    p = from_config(cfg, launcher=L)
+    try:
+        p.start(wait=False)
+        p.wait_ready(timeout=60, poll=0.2)
+        ep = p.endpoint()
+        published = tmp_path / "latest.json"
+        urls = p.lend([1], to="grpo", policy_file=str(published), drain_timeout=10, poll=0.2)
+        assert len(urls) == 2 and set(urls).isdisjoint(p.router_workers())
+        assert len({_chat(ep, "hi")["served_by"] for _ in range(8)}) == 2
+        p.load(PolicyRef("v2", "/ckpt/v2"))
+        assert {http.get_json(u + "/model_info")["weight_version"] for u in urls} == {"base"}
+        # the trainer's engine 0 dies: held down (on_restart=down), not restarted on v2/base
+        os.kill(_engine_pid(p, 1, 0), _signal.SIGKILL)
+        held = _until(lambda: [e for e in (p.dir.node(1) or {}).get("engines", [])
+                               if e["k"] == 0 and e.get("held")])
+        assert "on_restart=down" in held[0]["held"]
+        assert set(p.router_workers()).isdisjoint(urls)
+        # unlend: the live lent engine is reloaded to v2, the held one starts on v2
+        p.unlend([1])
+        p.wait_ready(timeout=60, poll=0.2)
+        assert len(p.router_workers()) == 4
+        assert {_chat(ep, "x")["choices"][0]["message"]["content"] for _ in range(12)} == {"v2: x"}
+
+        # on_restart=latest: a dead lent engine comes back on the trainer's published export
+        ckpt = tmp_path / "hf" / "step3"
+        ckpt.mkdir(parents=True)
+        write_json(published, {"id": "grpo-step3", "path": str(ckpt)})
+        p.lend([1], to="grpo", policy_file=str(published), on_restart="latest",
+               drain_timeout=10, poll=0.2)
+        os.kill(_engine_pid(p, 1, 1), _signal.SIGKILL)
+        url1 = [u for u in p.lent_engines(ready_only=False) if u.endswith(
+            str((p.dir.node(1) or {})["engines"][1]["port"]))][0]
+        _until(lambda: http.ok(url1 + "/health") and
+               http.get_json(url1 + "/model_info")["weight_version"] == "grpo-step3")
+        assert url1 not in p.router_workers()
+        p.unlend()
+        assert http.get_json(url1 + "/model_info")["weight_version"] == "v2"
+    finally:
+        p.stop(wait=20)

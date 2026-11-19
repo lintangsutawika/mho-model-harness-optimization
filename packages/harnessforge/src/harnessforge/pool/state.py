@@ -2,7 +2,8 @@
 process), the node agents (one per node job) and clients (eval jobs on other nodes).
 
     <root>/<pool_id>/
-        pool.json            controller: spec, sif, job ids, active policy, status, history
+        pool.json            controller: spec, sif, job ids, active policy, status, history,
+                             lent nodes ({"<i>": {to, since, policy_file, on_restart}})
         router.json          node 0's agent: the router's URL (the pool endpoint)
         nodes/<i>.json       node i's agent: host, ip, job id, engines [{url, gpus, pid}], status
         logs/                node agents' job logs and per-engine / router logs
@@ -116,12 +117,23 @@ class PoolDir:
                 out[i] = d
         return dict(sorted(out.items()))
 
-    def engine_urls(self, *, ready_only: bool = True, max_age: float | None = 90.0) -> list[str]:
+    def lent(self) -> dict[int, dict[str, Any]]:
+        """Nodes lent to a trainer (pool.json "lent"): index -> {to, since, policy_file,
+        on_restart}. Lent engines serve the trainer only: no routing, no load()."""
+        d = read_json(self.pool_file, {}) or {}
+        return {int(k): v for k, v in (d.get("lent") or {}).items()}
+
+    def engine_urls(self, *, ready_only: bool = True, max_age: float | None = 90.0,
+                    include_lent: bool = False, nodes: "set[int] | None" = None) -> list[str]:
         """Engine URLs of every node. ready_only: only ready engines of ready nodes whose file
-        was refreshed in the last `max_age` seconds (a SIGKILLed node stops refreshing)."""
+        was refreshed in the last `max_age` seconds (a SIGKILLed node stops refreshing).
+        Engines of lent nodes are left out unless include_lent; `nodes` restricts to those."""
         urls = []
         now = time.time()
-        for n in self.nodes().values():
+        lent = set() if include_lent else set(self.lent())
+        for i, n in self.nodes().items():
+            if i in lent or (nodes is not None and i not in nodes):
+                continue
             if ready_only and n.get("status") != "ready":
                 continue
             if ready_only and max_age is not None and now - n.get("updated_at", now) > max_age:
