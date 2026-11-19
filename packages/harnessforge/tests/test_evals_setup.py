@@ -61,6 +61,15 @@ def test_backend_passes_image_map_and_cap_to_the_pod_provider(tmp_path, monkeypa
 class Spec:
     image: str
     network: str = "egress"
+    labels: dict = dataclasses.field(default_factory=dict)
+    mounts: list = dataclasses.field(default_factory=list)
+
+
+class FakeStarted:
+    """What a fake start returns: an object the provider can tag (_hf_labels/_hf_times, as since #61)."""
+
+    def __init__(self, image):
+        self.image = image
 
 
 @pytest.fixture
@@ -78,7 +87,7 @@ def provider_cls(monkeypatch, tmp_path):
         await asyncio.sleep(0.03)
         active[0] -= 1
         started.append(spec.image)
-        return spec.image
+        return FakeStarted(spec.image)
 
     monkeypatch.setattr(pods.SingularityProvider, "__init__", fake_init)
     monkeypatch.setattr(pods.SingularityProvider, "start", fake_start)
@@ -98,7 +107,7 @@ def test_pod_provider_maps_images_and_caps_starts(provider_cls, tmp_path):
         specs = [Spec("docker://alexgshaw/a:1"), Spec("alexgshaw/a:1", network="none"), Spec("b:2")] * 3
         return await asyncio.gather(*(provider.start(s) for s in specs))
 
-    images = asyncio.run(main())
+    images = [s.image for s in asyncio.run(main())]
     assert images.count("/prep/a.sif") == 6 and images.count("b:2") == 3
     assert peak[0] == 2 and provider.start_gate.held() == 0
 
