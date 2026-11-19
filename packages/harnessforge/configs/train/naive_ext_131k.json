@@ -19,7 +19,8 @@
   }
  },
  "driver": {
-  "hold": true
+  "hold": true,
+  "stop_timeout": 3600
  },
  "train": {
   "context_window_length": 131072

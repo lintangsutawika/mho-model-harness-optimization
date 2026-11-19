@@ -419,7 +419,9 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         if driver is not None and driver.poll() is None:
             driver.send_signal(signal.SIGTERM)
             try:
-                driver.wait(timeout=300)
+                # platoon's graceful stop finishes the in-flight forward_backward (~30 min at
+                # 131k) and then writes its interrupted checkpoint: give it the time
+                driver.wait(timeout=float(run.driver.get("stop_timeout", 900)))
             except subprocess.TimeoutExpired:
                 os.killpg(driver.pid, signal.SIGKILL)
         for p in procs:

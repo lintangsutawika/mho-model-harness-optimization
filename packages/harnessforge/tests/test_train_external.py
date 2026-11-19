@@ -218,6 +218,7 @@ def test_naive_ext_131k_config():
     ip = r["train"]["workflow_config"]["rollout_config"]["inference_params"]
     assert ip["max_completion_tokens"] == 16384
     assert "ctx131k" in r["stats"]["wandb"]["tags"] and r.driver["hold"] is True
+    assert r.driver["stop_timeout"] >= 1800            # graceful stop outlasts a 131k forward_backward
     a = serve_args(r, port=1, local_ckpt="/x", addrs=["h:1"])
     val = lambda f: a[a.index(f) + 1]
     assert val("--tinker-max-tokens-per-datum") == "131072"

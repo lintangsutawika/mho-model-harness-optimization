@@ -161,6 +161,8 @@ def cmd_status(a) -> int:
 def cmd_stop(a) -> int:
     run = TrainRun.load(Path(a.run_dir) / "run.json")
     L = _launcher(run)
+    if a.grace is None:
+        a.grace = float(run.driver.get("stop_timeout", 900)) + 900
     jobs = {k: v for k, v in _jobs(run).items() if k != "submitted_at"}
     if a.driver_only:
         return _stop_driver_only(run, L, jobs, grace=a.grace, restart=False)
@@ -325,7 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         s = sub.add_parser(name)
         s.add_argument("--run-dir", required=True)
         if name == "stop":
-            s.add_argument("--grace", type=float, default=600)
+            s.add_argument("--grace", type=float, default=None,
+                           help="seconds before the jobs are cancelled (default: driver.stop_timeout + 900)")
             s.add_argument("--driver-only", action="store_true",
                            help="stop the driver (platoon) and keep the gateway serving")
         if name == "scan-secrets":
