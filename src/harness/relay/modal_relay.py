@@ -48,8 +48,14 @@ SECRET_NAME = os.environ.get("RELAY_SECRET_NAME", "mho-relay")
 # into the app (Secret.from_dict) — this is what per-job ephemeral relays use, so
 # no `modal secret create` step is needed. Otherwise fall back to a named Modal
 # secret (the stable shared relay uses `tts-relay`).
+# Training (Miles rollouts on Sail) runs far more agents at once than an eval, and one
+# turn can generate for minutes: both are deploy-time knobs.
+MAX_INPUTS = int(os.environ.get("RELAY_MAX_INPUTS", "64"))
 if os.environ.get("RELAY_SECRET"):
-    _relay_secret = modal.Secret.from_dict({"RELAY_SECRET": os.environ["RELAY_SECRET"]})
+    _relay_secret = modal.Secret.from_dict({
+        "RELAY_SECRET": os.environ["RELAY_SECRET"],
+        "RELAY_REQUEST_TIMEOUT": os.environ.get("RELAY_REQUEST_TIMEOUT", "600"),
+    })
 else:
     _relay_secret = modal.Secret.from_name(SECRET_NAME)
 
@@ -85,13 +91,16 @@ image = modal.Image.debian_slim().pip_install("fastapi==0.115.*", "websockets>=1
     cpu=4.0,
     secrets=[_relay_secret],
 )
-@modal.concurrent(max_inputs=64)  # many concurrent agents multiplexed over one WS
+@modal.concurrent(max_inputs=MAX_INPUTS)  # many concurrent agents multiplexed over one WS
 @modal.asgi_app()
 def web():
     from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 
     api = FastAPI()
+    import hmac
+
     secret = os.environ["RELAY_SECRET"]
+    request_timeout = float(os.environ.get("RELAY_REQUEST_TIMEOUT", "600"))
     # Per-container state (safe: exactly one container).
     bridge_ws: dict[str, object] = {"ws": None}
     pending: dict[str, asyncio.Future] = {}
@@ -132,6 +141,19 @@ def web():
     async def proxy(path: str, request: Request):
         if request.headers.get("authorization") != f"Bearer {secret}":
             raise HTTPException(status_code=401, detail="bad relay token")
+        return await forward(f"/v1/{path}", request)
+
+    # Key-in-path route for clients that cannot set the Authorization header: Miles'
+    # Harbor agent function hands the in-sandbox agent a fixed "dummy" key and a session
+    # URL (/sessions/<id>/v1/...). The trainer rewrites that URL to /k/<secret>/sessions/...
+    # here, and the bridge forwards /sessions/... to the trainer's session server.
+    @api.api_route("/k/{key}/{path:path}", methods=["GET", "POST"])
+    async def proxy_keyed(key: str, path: str, request: Request):
+        if not hmac.compare_digest(key, secret):
+            raise HTTPException(status_code=401, detail="bad relay token")
+        return await forward(f"/{path}", request)
+
+    async def forward(path: str, request: Request):
         ws = bridge_ws["ws"]
         if ws is None:
             raise HTTPException(status_code=503, detail="no vLLM bridge connected")
@@ -139,7 +161,7 @@ def web():
         frame = {
             "id": rid,
             "method": request.method,
-            "path": f"/v1/{path}",
+            "path": path,
             "query": request.url.query or "",
             "body": (await request.body()).decode(),
         }
@@ -152,7 +174,7 @@ def web():
         async with send_lock:
             await ws.send_text(payload)
         try:
-            resp = await asyncio.wait_for(fut, timeout=600)
+            resp = await asyncio.wait_for(fut, timeout=request_timeout)
         except asyncio.TimeoutError:
             pending.pop(rid, None)
             raise HTTPException(status_code=504, detail="relay timeout waiting for node")

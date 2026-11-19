@@ -13,6 +13,15 @@
 set -euo pipefail
 REPO_DIR="${MHO_REPO_DIR:-${PBS_O_WORKDIR:-${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}}"; cd "$REPO_DIR"
 . scripts/utils/load_env.sh && load_env .env
+# Self-hosted proposer LLM (scripts/serve/optimizer_deepseek.qsub): MHO_OPTIMIZER_ENV names the env
+# file that server writes once healthy; it overrides .env's OPTIMIZER_* (LiteLLM proxy). Set but
+# missing = the server is down: fail now (the loop counts it as no_proposal) rather than silently
+# fall back to the proxy.
+if [ -n "${MHO_OPTIMIZER_ENV:-}" ]; then
+  [ -s "${MHO_OPTIMIZER_ENV}" ] || { echo "[propose] MHO_OPTIMIZER_ENV=${MHO_OPTIMIZER_ENV} missing (optimizer server down?)" >&2; exit 3; }
+  . "${MHO_OPTIMIZER_ENV}"
+  echo "[propose] optimizer endpoint from ${MHO_OPTIMIZER_ENV} (server job ${OPTIMIZER_SERVER_JOB:-?})"
+fi
 export PYTHONPATH="${REPO_DIR}/src:${PYTHONPATH:-}"
 # Do not let cwd (the repo root) prepend to sys.path: the stale repo-root harness/ package
 # would shadow src/harness/ (micro_swe_agent lives only in src). src stays on
