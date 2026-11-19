@@ -12,7 +12,8 @@
 continue (its runner's stop ends the whole evaluation), and its SIGTERM handling stops exactly the sandboxes that
 process started (they carry its output directory as their label) and exits 143. So each candidate gets its own
 `platoon eval` (own config, output directory, gateway and concurrency `request.concurrency`), started in a session
-of its own; `stop(candidate)` sends that process SIGTERM (SIGKILL to its process group after `stop_grace_s`), and the
+of its own; `stop(candidate)` sends that process SIGTERM (again after `stop_grace_s / 2`, platoon's second Ctrl+C; SIGKILL to
+its process group after `stop_grace_s`, then `platoon sandbox reap` on its output directory), and the
 other candidates' processes are untouched. The cost is one gateway and one task listing per candidate, which is
 small next to the trials; the toolchain is staged once per node and shared.
 
@@ -90,7 +91,9 @@ class _Member:
     reader: RolloutReader
     process: subprocess.Popen | None = None
     stop_requested: float | None = None
+    second_term: bool = False
     killed: bool = False
+    reaper: subprocess.Popen | None = None
     returncode: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -103,10 +106,12 @@ class _Member:
 class PlatoonRun:
     order = Order.TASK_MAJOR
 
-    def __init__(self, request: EvalRequest, members: dict[str, _Member], *, stop_grace_s: float) -> None:
+    def __init__(self, request: EvalRequest, members: dict[str, _Member], *, stop_grace_s: float,
+                 reap: Any = None) -> None:
         self.request = request
         self._members = members
         self._stop_grace_s = stop_grace_s
+        self._reap_sandboxes = reap  # member -> Popen of `platoon sandbox reap`, after a forced kill
 
     # ------------------------------------------------------------------ EvalRun
     def records(self) -> list[TrialRecord]:
@@ -160,9 +165,17 @@ class PlatoonRun:
             code = member.process.poll()
             if code is not None:
                 member.returncode = code
+                if member.killed and self._reap_sandboxes is not None:
+                    member.reaper = self._reap_sandboxes(member)  # what the killed process left running
                 continue
-            if (member.stop_requested is not None and not member.killed
-                    and time.monotonic() - member.stop_requested > self._stop_grace_s):
+            waited = None if member.stop_requested is None else time.monotonic() - member.stop_requested
+            if waited is None:
+                continue
+            if not member.second_term and waited > self._stop_grace_s / 2:
+                # platoon's second Ctrl+C: stop waiting for the in-flight rollouts' teardowns
+                member.process.send_signal(signal.SIGTERM)
+                member.second_term = True
+            elif not member.killed and waited > self._stop_grace_s:
                 try:
                     os.killpg(member.process.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -222,7 +235,7 @@ class PlatoonBackend:
         if self.launch:
             for member in members.values():
                 member.process = self._spawn(member, opts)
-        return PlatoonRun(request, members, stop_grace_s=self.stop_grace_s)
+        return PlatoonRun(request, members, stop_grace_s=self.stop_grace_s, reap=self._reaper(opts))
 
     # ------------------------------------------------------------------ helpers
     def _config(self, request: EvalRequest, candidate: Candidate, model: str, spec: Path, dataset_dir: Path,
@@ -269,12 +282,24 @@ class PlatoonBackend:
             "split": "eval",
         }
 
-    def _spawn(self, member: _Member, opts: Mapping[str, Any]) -> subprocess.Popen:
+    def _reaper(self, opts: Mapping[str, Any]):
+        def reap(member: _Member) -> subprocess.Popen:
+            with member.log.open("ab") as log:
+                return subprocess.Popen([self.platoon, "sandbox", "reap", str(member.out_dir)], stdout=log,
+                                        stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=self._env(opts),
+                                        start_new_session=True)
+        return reap if self.launch else None
+
+    def _env(self, opts: Mapping[str, Any]) -> dict[str, str]:
         env = dict(os.environ)
         env["PYTHONPATH"] = os.pathsep.join(p for p in (self.pythonpath, env.get("PYTHONPATH")) if p)
         if self.site is not None:
             env["PLATOON_SITE"] = str(self.site)
         env.update({k: str(v) for k, v in opts.get("env", {}).items()})
+        return env
+
+    def _spawn(self, member: _Member, opts: Mapping[str, Any]) -> subprocess.Popen:
+        env = self._env(opts)
         member.log.parent.mkdir(parents=True, exist_ok=True)
         log = member.log.open("ab")
         try:

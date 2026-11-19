@@ -233,6 +233,28 @@ def test_platoon_backend_runs_and_stops_one_candidate(tmp_path, monkeypatch):
     assert sorted((r.task, r.index) for r in c1) == order[:len(c1)]
 
 
+@pytest.mark.parametrize("terms,expected", [("2", 143), ("0", -9)])
+def test_platoon_stop_escalates(tmp_path, monkeypatch, terms, expected):
+    """A platoon that ignores the first SIGTERM gets a second at grace/2; one that ignores both is killed, and then
+    its sandboxes are reaped with `platoon sandbox reap`."""
+    monkeypatch.setenv("HF_FAKE_TRIAL_S", "30")
+    monkeypatch.setenv("HF_FAKE_TERMS_TO_EXIT", terms)
+    request = platoon_request(tmp_path, n_candidates=1, tasks=("t1",))
+    run = PlatoonBackend(platoon=FIXTURES / "fake_platoon.py", stop_grace_s=1.0).start(request)
+    deadline = time.time() + 20
+    while not any(not r.finished for r in run.records()) and time.time() < deadline:
+        time.sleep(0.05)
+    run.stop("c0")
+    assert run.wait(timeout=20, poll_s=0.1)
+    assert run.status()["c0"]["returncode"] == expected
+    assert {r.error for r in run.records()} == {"stopped"}
+    reaped = tmp_path / "out" / "r1" / "c0" / "platoon" / "reaped"
+    deadline = time.time() + 10
+    while expected == -9 and not reaped.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert reaped.exists() == (expected == -9)
+
+
 # ----------------------------------------------------------------------------- FakeBackend
 def fake_request(cands=("A", "B"), tasks=("t1", "t2", "t3"), trials=2, concurrency=2):
     return EvalRequest(run_id="f", candidates=[Candidate(c, Path(f"/h/{c}")) for c in cands], tasks=list(tasks),

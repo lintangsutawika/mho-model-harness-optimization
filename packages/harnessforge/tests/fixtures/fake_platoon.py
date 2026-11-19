@@ -10,6 +10,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+if sys.argv[1:3] == ["sandbox", "reap"]:  # record that the backend reaped what a killed run left
+    Path(sys.argv[3]).mkdir(parents=True, exist_ok=True)
+    (Path(sys.argv[3]) / "reaped").write_text("1")
+    sys.exit(0)
 assert sys.argv[1] == "eval"
 config = json.loads(Path(sys.argv[2]).read_text())
 inference = config["inference"]
@@ -18,7 +22,13 @@ tasks = config["environments"][0]["service_kwargs"]["splits"]["eval"]
 trials = inference["workflow"]["num_rollouts_per_task"]
 slots = inference["workflow"]["num_concurrent_workers"]
 duration = float(os.environ.get("HF_FAKE_TRIAL_S", "0.2"))
-signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+terms = []
+def on_term(*_):  # HF_FAKE_TERMS_TO_EXIT: how many SIGTERMs it takes (0: never, it must be killed)
+    terms.append(1)
+    need = int(os.environ.get("HF_FAKE_TERMS_TO_EXIT", "1"))
+    if need and len(terms) >= need:
+        sys.exit(143)
+signal.signal(signal.SIGTERM, on_term)
 queue = [(t, k) for t in tasks for k in range(trials)]
 running = []
 while queue or running:
