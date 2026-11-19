@@ -15,6 +15,8 @@ Sections (see configs/train/*.json and docs/train.md):
     harness  {dir, agent_config}
     env      {agent_timeout_multiplier, verifier_timeout_multiplier, harbor_system_deps,
               harbor_keep_processes, provider, provider_options, service_kwargs, on_harness_exit}
+    sandboxes {mode: local | remote, hosts_spec, local_slots}: remote = pods on sandbox host jobs too
+              (harnessforge.sandboxhost, docs/sandboxhost.md)
     train    platoon's `train:` section (batch_size, max_training_steps, optimizer, loss_fn, ...)
     checkpoint  platoon's `checkpoint:` section (resumable Tinker state; heavy: model + Adam)
     export   {every}: HF checkpoints from the disk-delta stream every N steps
