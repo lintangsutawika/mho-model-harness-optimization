@@ -12,7 +12,7 @@ client --https /v1/*--> Modal app hf-serve-<name> --ws--> bridge.py (node) --> S
   `src/harness/relay/bridge.py`, probes `/v1/models` through the relay, supervises (bridge restarts;
   the job ends if SGLang dies).
 - `pair.sh`: the PBS job: two `endpoint.sh` on one rt_HF node, A on GPUs 0-3, B on GPUs 4-7
-  (defaults: Qwen3.5-9B as `qwen35-9b` on :30011, Qwen3.5-4B as `qwen35-4b` on :30012).
+  (defaults: served `Qwen/Qwen3.5-9B` as `qwen35-9b` on :30011, `Qwen/Qwen3.5-4B` as `qwen35-4b` on :30012).
 
 Adapted from the MSL eval serve process (`msl-multilingual-self-learning`:
 `scripts/serve/eval_pair.sh` -> `scripts/rollout.sh` with `CAPTURE=0` -> `src/relay/public_api.py`
@@ -48,9 +48,17 @@ curl -H "Authorization: Bearer $KEY" https://<workspace>--hf-serve-qwen35-9b-web
 ```
 
 `OPENAI_BASE_URL=https://<workspace>--hf-serve-<name>-web.modal.run/v1`, `OPENAI_API_KEY=$KEY`,
-model = the served name (`Qwen3.5-9B` / `Qwen3.5-4B`). The relay does not stream (`stream: false`).
+model = the served name (`Qwen/Qwen3.5-9B` / `Qwen/Qwen3.5-4B`; litellm: `litellm_proxy/Qwen/Qwen3.5-9B`). The relay does not stream (`stream: false`).
 Tool calls come back as structured `tool_calls` (qwen3_coder parser); thinking is on by default
 (`chat_template_kwargs: {"enable_thinking": false}` turns it off).
+
+The relay container asks Modal for `RELAY_CPU` CPUs (default 1). With 4 it sometimes waited
+minutes for capacity after a redeploy, and every request hung meanwhile.
+
+Redeploying a running app is safe only while no old bridge is connected. A bridge connected to the
+old container keeps it alive (`max_containers=1`, and the WebSocket is a 24 h input), so the new
+version never gets scheduled and requests hang. `endpoint.sh` therefore stamps each deploy with an id
+(`RELAY_DEPLOY_ID`, reported by `/health`) and starts the bridge only once `/health` reports it. Never run two jobs against one app.
 
 Stop: `qdel <job>` ends SGLang and the bridge; the relay apps stay (503 until a bridge connects)
 until `modal app stop hf-serve-qwen35-9b` / `modal app stop hf-serve-qwen35-4b`.

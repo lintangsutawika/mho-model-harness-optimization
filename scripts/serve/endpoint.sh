@@ -24,6 +24,7 @@
 #   RELAY_APP       Modal app name (default hf-serve-$NAME) -> https://<workspace>--$RELAY_APP-web.modal.run
 #   KEY_FILE        relay key (default $SERVE_DIR/$NAME.key; created with mode 600 if missing)
 #   RELAY_MAX_INPUTS / RELAY_REQUEST_TIMEOUT   relay concurrency / per-request timeout (128 / 1800)
+#   RELAY_CPU       relay container CPUs (default 1.0; 4 waited a long time for Modal capacity)
 #   MILES_SIF       SGLang image (default the shared miles_latest.sif)
 set -euo pipefail
 export PATH="${HOME}/.local/bin:/opt/pbs/bin:/usr/sbin:/usr/bin:/bin:${PATH}"
@@ -92,13 +93,24 @@ curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null || { log "sglang not healt
 log "sglang healthy"
 
 # 2. Modal relay (fixed app name = stable URL; the key is baked in from the env at deploy).
-DEPLOY_OUT="$(RELAY_APP_NAME="$RELAY_APP" RELAY_SECRET="$RELAY_SECRET" \
-  RELAY_MAX_INPUTS="${RELAY_MAX_INPUTS:-128}" RELAY_REQUEST_TIMEOUT="${RELAY_REQUEST_TIMEOUT:-1800}" \
+DEPLOY_ID="${JOBTAG}-$(date +%s)"
+DEPLOY_OUT="$(RELAY_APP_NAME="$RELAY_APP" RELAY_SECRET="$RELAY_SECRET" RELAY_DEPLOY_ID="$DEPLOY_ID" \
+  RELAY_MAX_INPUTS="${RELAY_MAX_INPUTS:-128}" RELAY_CPU="${RELAY_CPU:-1.0}" RELAY_REQUEST_TIMEOUT="${RELAY_REQUEST_TIMEOUT:-1800}" \
   uv run -q --no-project --with modal modal deploy src/harness/relay/modal_relay.py 2>&1)" \
   || { echo "$DEPLOY_OUT"; log "relay deploy failed"; exit 1; }
 RELAY_URL="$(printf '%s' "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9._-]+\.modal\.run' | head -1)"
 [ -n "$RELAY_URL" ] || { echo "$DEPLOY_OUT"; log "could not parse relay URL"; exit 1; }
 log "relay deployed: ${RELAY_URL}"
+# Connect the bridge only once THIS deployment's container answers /health (it reports the
+# deploy id). The relay is max_containers=1 and a redeploy drains the old container, which stays
+# alive as long as it holds a bridge WebSocket (a 24 h input). A bridge that connects before the
+# cutover lands on the old container and pins it: the new version never gets a container and every
+# request hangs with no HTTP response. A plain /health check is not enough: right after the deploy
+# the old container still answers it.
+relay_is_new() { curl -sf --max-time 20 "${RELAY_URL}/health" 2>/dev/null | grep -q "\"deploy\": *\"${DEPLOY_ID}\""; }
+for _ in $(seq 1 90); do relay_is_new && break; sleep 10; done
+relay_is_new && log "relay /health ok (deploy ${DEPLOY_ID})" \
+  || log "WARNING: new relay deploy not answering after 15 min; starting bridge anyway"
 
 # 3. Bridge: dials out to the relay and proxies to SGLang.
 start_bridge() {

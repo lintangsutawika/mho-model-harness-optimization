@@ -55,6 +55,9 @@ if os.environ.get("RELAY_SECRET"):
     _relay_secret = modal.Secret.from_dict({
         "RELAY_SECRET": os.environ["RELAY_SECRET"],
         "RELAY_REQUEST_TIMEOUT": os.environ.get("RELAY_REQUEST_TIMEOUT", "600"),
+        # Not secret: /health reports it so a node can tell this deploy's container from a
+        # previous deploy's container that is still draining (scripts/serve/endpoint.sh).
+        "RELAY_DEPLOY_ID": os.environ.get("RELAY_DEPLOY_ID", ""),
     })
 else:
     _relay_secret = modal.Secret.from_name(SECRET_NAME)
@@ -88,7 +91,10 @@ image = modal.Image.debian_slim().pip_install("fastapi==0.115.*", "websockets>=1
     # large SWE-bench payloads and missed the bridge's WebSocket keepalive, so the
     # bridge tore the socket down (1011) and every in-flight request was lost.
     # Give the loop real cores so it can pong on time and forward without stalling.
-    cpu=4.0,
+    # The singleton container is rescheduled on every redeploy or recycle, and a big CPU
+    # request can wait a long time for capacity ("waiting to be scheduled on a CPU worker"),
+    # during which every request hangs. RELAY_CPU at deploy time sizes it (scripts/serve uses 1).
+    cpu=float(os.environ.get("RELAY_CPU", "4.0")),
     secrets=[_relay_secret],
 )
 @modal.concurrent(max_inputs=MAX_INPUTS)  # many concurrent agents multiplexed over one WS
@@ -135,7 +141,8 @@ def web():
 
     @api.get("/health")
     async def health():
-        return {"ok": True, "bridge_connected": bridge_ws["ws"] is not None}
+        return {"ok": True, "bridge_connected": bridge_ws["ws"] is not None,
+                "deploy": os.environ.get("RELAY_DEPLOY_ID", "")}
 
     @api.api_route("/v1/{path:path}", methods=["GET", "POST"])
     async def proxy(path: str, request: Request):
