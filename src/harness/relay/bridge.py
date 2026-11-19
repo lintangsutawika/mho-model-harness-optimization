@@ -10,6 +10,7 @@ Env:
     RELAY_WS_URL    wss://<workspace>--tts-vllm-relay-web.modal.run/bridge
     RELAY_SECRET    shared secret (matches the Modal 'tts-relay' secret)
     VLLM_LOCAL_URL  local vLLM base, e.g. http://localhost:8000  (no trailing /v1)
+    BACKEND_API_KEY optional bearer key sent to the local server (SGLang --api-key)
 
 Run (deps resolved by uv):
     uv run --with websockets --with httpx python harbor/relay/bridge.py
@@ -31,6 +32,7 @@ import websockets
 RELAY_WS_URL = os.environ["RELAY_WS_URL"]
 RELAY_SECRET = os.environ["RELAY_SECRET"]
 VLLM_LOCAL_URL = os.environ.get("VLLM_LOCAL_URL", "http://localhost:8000").rstrip("/")
+BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "")
 
 # A path of the form /_hp/<host>:<port>/rest targets that host:port instead of
 # VLLM_LOCAL_URL (Miles runs one session server per cell on the node IP, ports
@@ -118,7 +120,8 @@ async def handle(frame: dict, client: httpx.AsyncClient) -> None:
                     frame["method"],
                     url,
                     content=frame["body"].encode(),
-                    headers={"content-type": "application/json"},
+                    headers={"content-type": "application/json",
+                             **({"authorization": f"Bearer {BACKEND_API_KEY}"} if BACKEND_API_KEY else {})},
                 )
                 break
             except httpx.ConnectError:
