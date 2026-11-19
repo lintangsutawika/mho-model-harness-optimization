@@ -373,6 +373,27 @@ check was stopped with `python -m harnessforge.train stop`.
 sandboxes. Here 160 concurrent sandboxes is the main limit, and steps will likely be ~15 min: 200 steps ≈ 2 days
 (`gateway.walltime` is 72 h).
 
+## W&B logging
+
+platoon logs the run to W&B. `abci-base.json` sets `stats.wandb` to mode `online`, project `mho-harness`, and run
+name = run id; tags come from the config. miles' own W&B stays disabled.
+
+**Credentials.**
+- The driver reads only `WANDB_API_KEY` and `WANDB_ENTITY`, from its process environment or else from
+  `driver.wandb_env_file`. The default is `~/mho-model-harness-optimization/mho-platoon-port/.env`, the worktrees'
+  shared `.env` symlink.
+- It passes them only into the `platoon train` process environment.
+- They are not written to `run.json`, the rendered platoon config or any log. The driver logs only which variable
+  came from which source.
+- Never put the key in a config's `driver.env`: that is written to `run.json`.
+
+**No key.** If no key is found, the driver logs a warning and falls back to `offline`. The offline run is under
+`<run>/platoon/<run_id>/train/wandb/`; upload it later with `wandb sync`.
+
+**Leak check.** `python -m harnessforge.train scan-secrets --run-dir <run> [--also <path>]` compares every file
+under the run dir (and the extra paths) against the key's value. It prints counts and file paths, never the value,
+and exits 1 on a hit.
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the
