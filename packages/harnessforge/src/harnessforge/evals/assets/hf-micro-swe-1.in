@@ -1,0 +1,8 @@
+litellm
+jinja2
+pydantic
+tenacity
+pyyaml
+mcp
+orjson
+fastapi
