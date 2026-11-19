@@ -20,8 +20,13 @@ which this module replays on CPU, away from the trainer:
   (`.hf_export_applying` left behind) rebuilds `work` from the base, since XOR deltas are not
   idempotent.
 
-Version N is the weights after the N-th `save_weights_for_sampler` push; in a platoon run that
-is after optimizer step N (version 0 = the base, pushed at the gateway's warmup).
+Version N is the weights after the N-th `save_weights_for_sampler` push (version 0 = the base, at
+the gateway's warmup). platoon pushes once at launch (its launch checkpoint) and then once per
+optimizer step (a permanent or recovery checkpoint replaces that step's weights-only push), and
+once more for its final checkpoint, so step k = version k + `version_offset` (1). The launch push
+is not empty with Qwen3.5 (it carries the trainer's BF16 rounding of the F32 norm weights); the
+final push is (same weights as the last step), so the final export is named after the last version
+that changed weights. Exports are `step_<k>`, with the version in HF_EXPORT.json.
 
 Needs numpy and zstandard (the miles images have both); checksums need xxhash/blake3 for those
 formats (adler32 is stdlib).
@@ -39,6 +44,7 @@ from typing import Any, Callable
 
 VERSION_FILE = ".hf_export_version"
 APPLYING_FILE = ".hf_export_applying"
+STREAM_FILE = ".hf_export_stream"         # which delta stream work was built from
 
 
 # ----------------------------------------------------------------------------- safetensors I/O
@@ -131,7 +137,7 @@ def _atomic_json(path: Path, data: Any) -> None:
 class DeltaExporter:
     def __init__(self, *, base: str | Path, deltas: str | Path, work: str | Path,
                  out: str | Path, every: int = 10, policy_file: str | Path | None = None,
-                 run_id: str = "run", base_model: str | None = None,
+                 run_id: str = "run", base_model: str | None = None, version_offset: int = 1,
                  log: Callable[[str], None] = print):
         self.base = Path(base)
         self.deltas = Path(deltas)
@@ -141,6 +147,7 @@ class DeltaExporter:
         self.policy_file = Path(policy_file) if policy_file else None
         self.run_id = run_id
         self.base_model = base_model or str(self.base)
+        self.version_offset = int(version_offset)
         self.log = log
 
     # -- state
@@ -167,10 +174,23 @@ class DeltaExporter:
         os.replace(tmp, self.work)
         self._set_version(0)
 
+    def stream_id(self) -> str:
+        """miles recreates the delta dir at every gateway start (a new stream from version 0)."""
+        try:
+            st = os.stat(self.deltas)
+            return f"{st.st_ino}-{int(st.st_ctime)}"
+        except FileNotFoundError:
+            return ""
+
     def ensure(self) -> None:
-        if (self.work / APPLYING_FILE).exists() or self.version < 0:
+        try:
+            built_from = (self.work / STREAM_FILE).read_text().strip()
+        except FileNotFoundError:
+            built_from = None
+        if (self.work / APPLYING_FILE).exists() or self.version < 0 or built_from != self.stream_id():
             self.log(f"[export] (re)building {self.work} from {self.base}")
             self.reset()
+            (self.work / STREAM_FILE).write_text(self.stream_id())
 
     # -- applying
     def apply(self, v: int) -> dict[str, Any]:
@@ -213,27 +233,44 @@ class DeltaExporter:
         (self.work / APPLYING_FILE).unlink()
         return {"version": v, "tensors": n, "bytes": changed, "unchecked": unchecked}
 
+    def step_of(self, v: int) -> int:
+        return v - self.version_offset
+
+    def changed(self, v: int) -> bool:
+        index = json.loads((self.deltas / f"weight_v{v:06d}" / "model.safetensors.index.json").read_text())
+        return bool(index.get("weight_map"))
+
+    def last_changed(self, upto: int) -> int:
+        """The last version <= upto that changed weights (later ones re-push the same weights)."""
+        last = 0
+        for u in versions(self.deltas):
+            if u <= upto and self.changed(u):
+                last = u
+        return last
+
     def snapshot(self, v: int | None = None) -> Path:
-        """Copy work (at its current version) to <out>/step_<v> and point policy_file at it."""
+        """Copy work (at its current version) to <out>/step_<k> (k = v - version_offset) and point
+        policy_file at it. v may be an earlier version when every version after it was empty."""
         v = self.version if v is None else v
-        if v != self.version:
+        if v != self.version and self.last_changed(self.version) != v:
             raise RuntimeError(f"work is at v{self.version}, not v{v}")
-        dest = self.out / f"step_{v}"
+        k = self.step_of(v)
+        dest = self.out / f"step_{k}"
         if dest.exists():
             return dest
         self.out.mkdir(parents=True, exist_ok=True)
-        tmp = self.out / f".step_{v}.tmp"
+        tmp = self.out / f".step_{k}.tmp"
         shutil.rmtree(tmp, ignore_errors=True)
-        shutil.copytree(self.work, tmp, ignore=shutil.ignore_patterns(VERSION_FILE, APPLYING_FILE))
-        _atomic_json(tmp / "HF_EXPORT.json", {"version": v, "run_id": self.run_id,
+        shutil.copytree(self.work, tmp, ignore=shutil.ignore_patterns(VERSION_FILE, APPLYING_FILE, STREAM_FILE))
+        _atomic_json(tmp / "HF_EXPORT.json", {"version": v, "step": k, "run_id": self.run_id,
                                               "base": str(self.base), "deltas": str(self.deltas),
                                               "exported_at": time.time()})
         os.replace(tmp, dest)
         if self.policy_file is not None:
             self.policy_file.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_json(self.policy_file, {"id": f"{self.run_id}-step{v}", "path": str(dest),
-                                            "base_model": self.base_model, "version": v})
-        self.log(f"[export] step {v} -> {dest}")
+            _atomic_json(self.policy_file, {"id": f"{self.run_id}-step{k}", "path": str(dest),
+                                            "base_model": self.base_model, "version": v, "step": k})
+        self.log(f"[export] v{v} = step {k} -> {dest}")
         return dest
 
     def poll(self, *, final: bool = False) -> list[int]:
@@ -251,10 +288,13 @@ class DeltaExporter:
             self.log(f"[export] applied v{v}: {info['tensors']} tensors in {time.time() - t0:.1f}s"
                      + (f" ({info['unchecked']} unchecked: no hash lib)" if info["unchecked"] else ""))
             done.append(v)
-            if self.every and v % self.every == 0:
+            k = self.step_of(v)
+            if self.every and k > 0 and k % self.every == 0 and self.changed(v):
                 self.snapshot(v)
-        if final and self.version > 0:
-            self.snapshot()
+        if final:
+            last = self.last_changed(self.version)
+            if self.step_of(last) > 0:
+                self.snapshot(last)
         return done
 
     def run(self, *, stop: Callable[[], bool], interval: float = 30.0) -> None:

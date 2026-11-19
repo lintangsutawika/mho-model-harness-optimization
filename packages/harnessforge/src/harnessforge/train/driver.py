@@ -126,6 +126,9 @@ def run_driver_job(run_dir: str | Path) -> int:
         _log(run, f"gateway ready at {url}")
         cfg = prepare(run, url)
         env = platoon_env(run, url)
+        final = P.dir / "export" / "FINAL"
+        if final.exists():                                  # a previous driver's end marker
+            final.rename(final.with_name(f"FINAL.{int(time.time())}"))
         if int(run.get("export", {}).get("every", 0)) > 0 and \
                 run.gateway.get("weight_sync", "disk-delta") == "disk-delta":
             with open(P.logs / "export.log", "ab") as out:

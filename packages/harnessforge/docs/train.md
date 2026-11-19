@@ -39,6 +39,36 @@ $PY -m harnessforge.train mapping                                       # the ol
 `extends`): `abci-base.json` (our paths and the old run's hyperparameters), `smoke.json`, `naive.json` (the full
 comparison run), `pass_rate.json` (the Thompson-sampling variant; not to be run yet).
 
+## One-time setup on ABCI
+
+All of this runs in CPU jobs (no compute on the login node), and nothing is installed into the image.
+
+1. **miles-tinker source.** `git archive` of neulab/miles-tinker at 25b6a76, unpacked to
+   `~/hf-dev/train/miles-tinker` and bound over `/root/miles` in `miles_latest.sif`. Then apply
+   `src/harnessforge/train/patches/miles-tinker-disk-delta-cast.patch` (see below).
+2. **Tinker SDK for the server.** The SDK goes into `~/hf-dev/train/extra-site`, which is on the container's
+   `PYTHONPATH`:
+   ```bash
+   singularity exec miles_latest.sif python -m pip install --no-deps --target ~/hf-dev/train/extra-site \
+       "tinker==0.27.1" "pyqwest>=0.4.1"
+   ```
+   Install with `--no-deps`: with its dependencies, the SDK's opentelemetry shadows the image's and `ray start`
+   fails. The image has everything else the SDK needs.
+3. **Base model.** The HF snapshot is in `~/.cache/huggingface`. `--ref-load` is the old run's torch_dist
+   conversion of the same snapshot, used read-only.
+4. **platoon.** The evals venv (`~/hf-dev/evals/venv`: platoon 0.6.0, tinker 0.16.1), with its site profile and the
+   `hf-micro-swe-1` toolchain.
+
+**The disk-delta patch.**
+- *Problem.* Qwen3.5 stores 24 tensors in F32 in the HF checkpoint (`linear_attn.norm.weight`, `A_log`, ...).
+  Megatron emits them as BF16. Disk-delta diffs raw bytes against the checkpoint files, so its baseline check
+  refuses the run (`dtype=F32 ... trainer emitted dtype=BF16`).
+- *Fix.* The patch casts those tensors to the checkpoint's dtype before diffing. The cast is a lossless upcast.
+  Engines load F32 there anyway, exactly as from the base checkpoint.
+- *Side effect.* Because of this, the first push (platoon's launch checkpoint) is not empty: it carries the BF16
+  rounding of those 24 norms.
+- *Status.* To upstream to miles-tinker.
+
 ## Why miles-managed engines, not the pool's
 
 miles-tinker 25b6a76 cannot attach SGLang engines it did not start: `ServerCell.init()` raises
@@ -105,8 +135,13 @@ The exporter replays the stream on CPU into a working full HF copy:
 - every `export.every` versions it copies the result to `hf/step_<N>/` (atomic rename, with `HF_EXPORT.json`) and
   points `hf/latest.json` at it. That pointer is what `pool load` takes, and the lent-node restart target.
 
-In a platoon run, version N = after optimizer step N (one `save_weights_for_sampler` per step), as long as no step
-is skipped.
+**Version → step.** platoon pushes:
+- once at launch (its launch checkpoint) → v1;
+- once per optimizer step → step k = v(k+1);
+- once for its final checkpoint, with the same weights.
+
+Exports are therefore `hf/step_<k>` from v(k+1). The final export is named after the last version that changed
+weights. `HF_EXPORT.json` records both numbers.
 
 The driver runs the exporter beside platoon, inside the miles SIF (numpy, zstandard, xxhash), and takes a final
 snapshot at the end. An apply interrupted midway rebuilds the working copy from the base, because XOR deltas are not
@@ -199,6 +234,47 @@ Images:
   few tasks).
 - `driver.image_cache` points the pods at the shared cache directly (6725 tasks).
 
+## Smoke test (2026-11-19, `configs/train/smoke.json`)
+
+**Setup.**
+- Qwen3.5-4B, full fine-tuning.
+- Gateway: 1 trainer + 1 rollout rt_HF node (8 miles-managed SGLang engines), disk-delta weight sync.
+- Driver: an rt_HC job.
+- Training: platoon `train`, uniform sampler, 6 tmax train tasks with mixed 4B pass rates, 4 steps × 2 tasks ×
+  group 4, 4096 tokens/call, 30 agent steps, PPO loss, lr 1e-6.
+- Run dir: `/groups/gai51740/aci18914wh/mho/runs/platoon-grpo-smoke1`.
+
+**Timings.**
+
+| step | batch time | mean rollout time | trainer waited on rollouts | `actor_train_time` | weight sync (`update_weights`) | delta (changed bytes / on disk) |
+|---|---|---|---|---|---|---|
+| 1 | 139.7 s | 75.5 s | 76.8 s | 53.6 s (first step, warm-up) | 6.8 s | 1.71 % / 0.34 GB |
+| 2 | 81.3 s | 95.0 s | 40.1 s | 21.1 s | 7.0 s | 1.34 % / 0.28 GB |
+| 3 | 111.8 s | 91.5 s | 43.4 s | 22.9 s | 6.7 s | 1.22 % / 0.25 GB |
+| 4 | 49.7 s | 99.9 s | 14.5 s | 4.5 s | 6.5 s | 1.00 % / 0.21 GB |
+
+Mean rollout time is per rollout. "Waited on rollouts" is `trainer_queue_wait_seconds_total`. Weight sync covers
+writing the delta, the engines pulling it, and the reload.
+
+**Checks.**
+- **Steps complete.** All 4 steps trained (`skipped_optimizer` 0, grad norm 0.39-0.85). Batch reward was
+  0.50 / 0.50 / 0.75 / 0.75; at this size that is not evidence of learning.
+- **Weight versions advance.** All 8 engines logged `Weight version changed` 0 → 1 → … → 5 in step with the
+  pushes. Startup took 310 s to a healthy gateway: Ray, 8 engines, Megatron load, baseline snapshot.
+- **HF export loads.** The exporter replayed the stream into `hf/step_*`, checking xxh3 checksums.
+  `transformers` loads it as `Qwen3_5ForCausalLM`, all 426 language tensors. Against the base, 2.3 % of bytes
+  differ (360/738 tensors), last-token logits differ by at most 0.17 (mean 0.024), and the greedy answer is the
+  same.
+- **Cleanup.** The driver's exit writes `STOP`, and the gateway tore down and its job ended. Nothing was left
+  running.
+- **Sandbox setup.** With `harbor_system_deps` on, the per-trial `apt-get install` was still running after
+  10 minutes on the rt_HC node, with 8 sandboxes pulling about 95 MB each through slirp4netns. The smoke turned it
+  off. `pp/sandbox-setup` removes it for good.
+
+**Weight-sync cost.** At lr 1e-6, one step changes only 1-2 % of the BF16 bytes: most updates are below BF16
+resolution, as in the old run. A delta is about 0.3 GB and a sync about 7 s. 200 steps come to roughly 60 GB of
+deltas.
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the
@@ -206,9 +282,8 @@ Images:
 - Disk-delta's baseline check needs the trainer's emitted HF tensors to match the checkpoint's names, dtypes and
   layout byte for byte (`A_log` fp32, `model.language_model.*`).
 - miles-tinker's `--ref-load` here is the old run's torch_dist conversion of the base model (read only).
-- **Disk use.** Deltas are never pruned: one per step, a few GB each for full fine-tuning at lr 1e-6 (measure in
-  the smoke run: `[disk delta v=N] density=..% wire=..GB`). Over 200 steps that is likely a few hundred GB under
-  `<run>/weights/delta`, plus 20 HF exports of ~9 GB. `/groups` has 365 TB free.
+- **Disk use.** Deltas are never pruned: about 0.3 GB per step (smoke), ~60 GB over 200 steps. Add 20 HF exports
+  of 9 GB each, and platoon's launch and `checkpoint.every` Tinker states (torch_dist + Adam, tens of GB each).
 - **No per-step weight-sync or rollout timings from the server.** miles-tinker logs `tinker perf` (train time, MFU)
   per `optim_step` into `<run>/tinker/perf.jsonl`. Disk-delta prints density/wire per version in the head log.
   platoon logs `timing/batch_total` and the rollout-side waits.

@@ -168,6 +168,7 @@ def cmd_export(a) -> int:
     ex = DeltaExporter(base=m["hf_checkpoint"], deltas=P.delta_dir, work=P.export_work, out=P.hf_dir,
                        every=int(a.every if a.every is not None else run.get("export", {}).get("every", 10)),
                        policy_file=P.latest_policy, run_id=run.run_id, base_model=m.get("name"),
+                       version_offset=int(run.get("export", {}).get("version_offset", 1)),
                        log=lambda s: print(s, flush=True))
     if a.follow:
         final = P.dir / "export" / "FINAL"

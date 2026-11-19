@@ -93,7 +93,7 @@ def test_replays_versions_and_snapshots(tmp_path, encoding):
     logs = []
     ex = DeltaExporter(base=base, deltas=deltas, work=tmp_path / "work", out=tmp_path / "hf",
                        every=2, policy_file=tmp_path / "hf" / "latest.json", run_id="r",
-                       log=logs.append)
+                       version_offset=0, log=logs.append)
     assert ex.poll() == [1, 2, 3, 4, 5]
     assert sorted(p.name for p in (tmp_path / "hf").glob("step_*")) == ["step_2", "step_4"]
     for v in (2, 4):
@@ -141,3 +141,40 @@ def test_missing_version_and_bad_encoding(tmp_path):
         ex.poll()
     with pytest.raises(ValueError):
         apply_delta(np.zeros(4, np.uint8), b"\0" * 4, "nope")
+
+
+def test_step_naming_launch_push_final_push_new_stream(tmp_path):
+    """platoon pushes once at launch: version v holds step v - 1."""
+    base, w, _ = make_base(tmp_path)
+    deltas = tmp_path / "delta"
+    states = [w]
+    for v in range(1, 6):
+        empty = v == 5                                            # final push re-sends the same weights
+        nxt = {k: a + (0 if empty else 1) for k, a in states[-1].items()}
+        if empty:
+            (deltas / f"weight_v{v:06d}").mkdir(parents=True)
+            (deltas / f"weight_v{v:06d}" / "model.safetensors.index.json").write_text(json.dumps(
+                {"metadata": {"version": f"{v:06d}", "base_version": f"{v - 1:06d}", "delta_encoding": "xor",
+                              "checksum_format": "adler32"}, "weight_map": {}}))
+        else:
+            publish(deltas, v, states[-1], nxt)
+        states.append(nxt)
+    ex = DeltaExporter(base=base, deltas=deltas, work=tmp_path / "work", out=tmp_path / "hf", every=2,
+                       policy_file=tmp_path / "hf" / "latest.json", run_id="r", log=lambda m: None)
+    ex.poll(final=True)
+    # v1 = launch push (non-empty: rounding), v2..v4 = steps 1..3, v5 = final (empty)
+    assert sorted(p.name for p in (tmp_path / "hf").glob("step_*")) == ["step_2", "step_3"]
+    meta = json.loads((tmp_path / "hf" / "step_2" / "HF_EXPORT.json").read_text())
+    assert (meta["version"], meta["step"]) == (3, 2)
+    assert json.loads((tmp_path / "hf" / "step_3" / "HF_EXPORT.json").read_text())["version"] == 4
+    assert json.loads((tmp_path / "hf" / "latest.json").read_text())["step"] == 3
+    # a new stream (gateway restarted: miles recreates the dir) rebuilds the working copy
+    import shutil
+    shutil.move(str(deltas), str(tmp_path / "old-delta"))
+    publish(deltas, 1, w, {k: a + 7 for k, a in w.items()})
+    ex.poll()
+    assert ex.version == 1
+    np.testing.assert_array_equal(read(tmp_path / "work", "model.visual.patch"),
+                                  read(base, "model.visual.patch"))
+    for k, a in states[3].items():
+        np.testing.assert_array_equal(read(tmp_path / "hf" / "step_2", k), a.ravel())

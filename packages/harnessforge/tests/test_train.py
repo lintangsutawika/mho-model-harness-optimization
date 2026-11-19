@@ -111,7 +111,9 @@ def test_platoon_config(run):
     tasks = select_tasks(run)
     assert len(tasks) == 3 and tasks == select_tasks(run)                  # seeded shuffle
     prep = materialize(run, tasks)
-    assert "mkdir -p /workspace" in prep[0] and len(prep) == 2      # replay + system deps
+    assert "mkdir -p /workspace" in prep[0] and len(prep) == 1      # smoke: replay, no system deps
+    run.raw["env"]["harbor_system_deps"] = True
+    assert len(materialize(run, tasks)) == 2                        # + harbor's apt step
     for t in tasks:
         assert 'docker_image = "ghcr.io/x/img:1"' in (run.paths.dataset_dir / t / "task.toml").read_text()
     spec = render_harness(run, prep)
