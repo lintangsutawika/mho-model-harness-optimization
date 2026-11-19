@@ -321,6 +321,15 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         head = subprocess.Popen(head_cmd, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     procs.append(head)
+    # GPU memory of the trainer node, every 5 s (peak = the memory probe's number)
+    try:
+        gmon = open(P.logs / f"gpu_mem.{job_id.split('.')[0]}.csv", "ab")
+        procs.append(subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=timestamp,index,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits", "-l", "5"], stdout=gmon, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True))
+    except OSError:
+        pass
     for k, (h, vnode) in enumerate(nodes[1:], start=1):
         # pbsdsh gives a bare environment: everything is in the argv; node-local dirs first
         wcmd = (f"mkdir -p {shlex.quote(node_local)}/tmp && exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
@@ -373,9 +382,18 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                         start_new_session=True)
 
-        if run.driver.get("where") == "gateway":
-            driver = start_driver()
+        held = bool(run.driver.get("hold"))
+        if run.driver.get("where") == "gateway" and held:
+            _log(log, "driver held: start it with `python -m harnessforge.train driver --run-dir ...` "
+                      "(writes START_DRIVER)")
         while True:
+            if driver is None and run.driver.get("where") == "gateway" and \
+                    (not held or (P.dir / "START_DRIVER").exists()):
+                if held:
+                    sd = P.dir / "START_DRIVER"
+                    sd.rename(sd.with_name(f"START_DRIVER.{int(time.time())}"))
+                    _log(log, "START_DRIVER: starting the driver")
+                driver = start_driver()
             if P.stop_file.exists() or stopping["flag"]:
                 _log(log, "STOP requested")
                 break

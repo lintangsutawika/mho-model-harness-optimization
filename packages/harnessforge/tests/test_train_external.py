@@ -207,3 +207,21 @@ def test_naive_ext_config():
     assert gateway_job(ext).nodes == 1 and gateway_job(naive).nodes == 4
     # same training recipe as naive.json
     assert ext["train"] == naive["train"] and ext["env"] == naive["env"]
+
+
+def test_naive_ext_131k_config():
+    from harnessforge.train.gateway import serve_args
+    r = TrainRun.load(CONFIGS / "naive_ext_131k.json")
+    base = TrainRun.load(CONFIGS / "naive_ext.json")
+    assert "131k" in r.run_id and "noKL" in r.run_id and r.run_id != base.run_id
+    assert r["train"]["context_window_length"] == 131072
+    ip = r["train"]["workflow_config"]["rollout_config"]["inference_params"]
+    assert ip["max_completion_tokens"] == 16384
+    assert "ctx131k" in r["stats"]["wandb"]["tags"] and r.driver["hold"] is True
+    a = serve_args(r, port=1, local_ckpt="/x", addrs=["h:1"])
+    val = lambda f: a[a.index(f) + 1]
+    assert val("--tinker-max-tokens-per-datum") == "131072"
+    assert val("--max-tokens-per-gpu") == "131072" and val("--context-parallel-size") == "1"
+    # everything else as naive_ext
+    strip = lambda t: {k: v for k, v in t.items() if k != "context_window_length"}
+    assert strip(r["train"]) == strip(base["train"]) and X.rollout_cfg(r) == X.rollout_cfg(base)

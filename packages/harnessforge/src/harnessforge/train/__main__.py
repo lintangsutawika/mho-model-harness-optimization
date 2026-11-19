@@ -6,6 +6,7 @@
     python -m harnessforge.train stop   --run-dir <run> [--grace 600]
     python -m harnessforge.train export --run-dir <run> [--follow] [--version N]
     python -m harnessforge.train unlend --run-dir <run>        # external mode: return lent pool nodes
+    python -m harnessforge.train probe  --run-dir <run> --tokens 131072   # one long datum: fwd/bwd + optim
     python -m harnessforge.train mapping                                        # old run -> new settings
 
 Inside jobs (launched by `launch`): gateway-job, driver-job.
@@ -117,6 +118,11 @@ def cmd_driver(a) -> int:
         run.write()
     jobs = _jobs(run)
     if run.driver.get("where", "hc") == "gateway":
+        if not run.paths.driver_file.exists():
+            # held driver (driver.hold): the gateway starts it when START_DRIVER appears
+            (run.dir / "START_DRIVER").write_text(str(time.time()))
+            print("START_DRIVER written: the gateway starts the held driver")
+            return 0
         return _stop_driver_only(run, _launcher(run), jobs, grace=a.grace, restart=True)
     f = run.paths.driver_file
     if f.exists():
@@ -277,6 +283,25 @@ def cmd_scan_secrets(a) -> int:
     return 1 if hits else 0
 
 
+def cmd_probe(a) -> int:
+    """Run harnessforge.train.probe with the platoon venv's python (it has the tinker SDK)."""
+    import os
+    import subprocess
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    g = json.loads(run.paths.gateway_file.read_text()) if run.paths.gateway_file.exists() else {}
+    if g.get("status") != "ready":
+        print(f"gateway not ready: {g.get('status')}", file=sys.stderr)
+        return 2
+    py = str(Path(run.driver.get("platoon", "platoon")).with_name("python"))
+    hf_src = run.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
+    env = {**os.environ, "PYTHONPATH": hf_src, "TINKER_API_KEY": "tml-local",
+           "no_proxy": f"{g['ip']},127.0.0.1"}
+    out = run.paths.logs / f"probe-{a.tokens}.json"
+    return subprocess.call([py, "-m", "harnessforge.train.probe", "--url", g["url"],
+                            "--model", run["model"]["name"], "--tokens", str(a.tokens),
+                            "--steps", str(a.steps), "--out", str(out)], env=env)
+
+
 def cmd_mapping(a) -> int:
     print("| old setting | old value | platoon / miles-tinker | status |")
     print("|---|---|---|---|")
@@ -315,6 +340,10 @@ def main(argv: list[str] | None = None) -> int:
             s.add_argument("--every", type=int)
             s.add_argument("--interval", type=float, default=30)
             s.add_argument("--version", type=int)
+    pr = sub.add_parser("probe")
+    pr.add_argument("--run-dir", required=True)
+    pr.add_argument("--tokens", type=int, default=131072)
+    pr.add_argument("--steps", type=int, default=2)
     sub.add_parser("mapping")
     a = ap.parse_args(argv)
     if a.cmd == "gateway-job":
@@ -325,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_driver_job(a.run_dir)
     return {"render": cmd_render, "launch": cmd_launch, "status": cmd_status, "stop": cmd_stop,
             "driver": cmd_driver, "unlend": cmd_unlend, "scan-secrets": cmd_scan_secrets,
+            "probe": cmd_probe,
             "export": cmd_export, "mapping": cmd_mapping}[a.cmd](a)
 
 
