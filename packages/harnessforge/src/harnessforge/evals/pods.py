@@ -13,8 +13,13 @@ holder relays. This provider does the same for platoon:
   (18080, ...), which the sandbox's routes report, so the harness reaches the gateway through the route;
 - a sandbox without a network (a no-network task) is platoon's own single sandbox (needs `allow_network_none`).
 
+`keep_agent_processes: true` makes `kill_processes` a no-op. platoon's Harbor grading kills every process the agents
+left running before the tests run (so nothing forges the reward), which fails every task whose tests check a service
+the agent was asked to leave running (tmax has many: "start the API on 0.0.0.0:8080"). Harbor, and so our old path,
+grades with those processes alive; keep them for parity, at the cost of that guard.
+
 Select it in a Harbor entry: `provider: harnessforge.evals.pods:PodSingularityProvider`, with the usual singularity
-`provider_options` (image_cache, scratch_root, fakeroot, ...) plus `pod_users`.
+`provider_options` (image_cache, scratch_root, fakeroot, ...) plus `pod_users` and `keep_agent_processes`.
 """
 from __future__ import annotations
 
@@ -43,7 +48,15 @@ class _PodRoutes:
         return self.routes
 
 
-class PodSandbox(HpcSandbox):
+class _KeepingSandbox(HpcSandbox):
+    """A sandbox whose `kill_processes` is a no-op when its provider keeps the agents' processes (harbor parity)."""
+
+    async def kill_processes(self) -> None:
+        if not getattr(self._provider, "keep_agent_processes", False):
+            await super().kill_processes()
+
+
+class PodSandbox(_KeepingSandbox):
     """The `main` service of a one-service pod; stopping it stops the pod."""
 
     def __init__(self, provider: "PodSingularityProvider", inner: Any, pod: Any, routes: _PodRoutes) -> None:
@@ -59,14 +72,19 @@ class PodSandbox(HpcSandbox):
 
 
 class PodSingularityProvider(SingularityProvider):
-    def __init__(self, *, pod_users: str = "subids", **options: Any) -> None:
+    def __init__(self, *, pod_users: str = "subids", keep_agent_processes: bool = False, **options: Any) -> None:
         if pod_users not in ("subids", "single"):
             raise ValueError(f"pod_users must be subids or single, not {pod_users!r}")
         super().__init__(**options)
         self.pod_users = pod_users
-        self.options = {**self.options, "pod_users": pod_users}  # what a reap rebuilds the provider from
+        self.keep_agent_processes = bool(keep_agent_processes)
+        # what a reap rebuilds the provider from
+        self.options = {**self.options, "pod_users": pod_users, "keep_agent_processes": self.keep_agent_processes}
         # Its sandboxes do not share this host's network: the harness reaches the gateway through the pod's route.
         self.capabilities = frozenset(self.capabilities - {"host_loopback"})
+
+    def sandbox_for(self, inner: Any, *, routes: Any = None) -> HpcSandbox:
+        return _KeepingSandbox(self, inner, routes=routes)  # no-network tasks' single sandboxes
 
     async def start(self, spec: Any) -> HpcSandbox:
         if spec.network == "none":

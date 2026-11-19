@@ -34,6 +34,8 @@ Options (`EvalRequest.options`):
     agent_timeout_multiplier, verifier_timeout_multiplier   as harbor's --agent-timeout-multiplier (default 1.0)
     harbor_system_deps  apt/dnf/apk-install curl, bash, gcc/make, git, python3, pip3 when missing, before the agent
                       runs, as harbor's installed-agent setup does in every trial (default True: parity with harbor)
+    harbor_keep_processes  grade with the processes the agent left running alive, as harbor does (default True; platoon
+                      kills them before the tests, which fails tasks that check a server the agent started)
     materialize       copy the tasks into the run dir and give Dockerfile-only tasks their FROM image (default True)
     toolchain         toolchain name (default harness.TOOLCHAIN)
     hosted_timeout_s  seconds one model call may take at the gateway (default 3600, the agent's own litellm timeout)
@@ -241,6 +243,9 @@ class PlatoonBackend:
     def _config(self, request: EvalRequest, candidate: Candidate, model: str, spec: Path, dataset_dir: Path,
                 out: Path, opts: Mapping[str, Any]) -> dict[str, Any]:
         provider_options = {"fakeroot": True, "allow_network_none": True, **opts.get("provider_options", {})}
+        if opts.get("provider", DEFAULT_PROVIDER) == DEFAULT_PROVIDER:
+            # harbor grades with the agent's processes alive (servers a task asked for); platoon kills them first
+            provider_options.setdefault("keep_agent_processes", bool(opts.get("harbor_keep_processes", True)))
         service_kwargs = {
             "dataset_dir": str(dataset_dir),
             "splits": {"eval": list(request.tasks)},

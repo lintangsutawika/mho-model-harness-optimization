@@ -195,6 +195,7 @@ def test_platoon_backend_writes_configs(tmp_path):
     assert kw["mounts"][0]["source"] == str((tmp_path / "cand0").resolve()) and kw["mounts"][0]["read_only"]
     assert kw["agent_timeout_multiplier"] == 3.0 and kw["agent_user"] == "ignore"
     assert kw["provider"] == "harnessforge.evals.pods:PodSingularityProvider"
+    assert kw["provider_options"]["keep_agent_processes"] is True
     assert entry["on_harness_exit"] == {"timeout": "grade", "crash": "grade"}
     inf = cfg["inference"]
     assert inf["model_name"] == "Qwen3.5-4B" and inf["hosted"]["base_url"] == "http://gpu:8000/v1"

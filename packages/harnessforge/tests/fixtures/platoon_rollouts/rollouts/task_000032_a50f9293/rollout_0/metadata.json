@@ -1,0 +1,74 @@
+{
+  "task_id": "task_000032_a50f9293",
+  "rollout_index": 0,
+  "source_path": "/redacted",
+  "wall_time_seconds": 203.23774218698964,
+  "error": null,
+  "outcome_status": "scored",
+  "reward_key": "reward",
+  "created_at": "2026-11-19T02:10:30.867880+00:00",
+  "status": "completed",
+  "usage": {
+    "policy": {
+      "calls": 45,
+      "prompt_tokens": 477537,
+      "completion_tokens": 5358,
+      "cached_prompt_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "aux": {
+      "calls": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "cached_prompt_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "judge": {
+      "calls": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "cached_prompt_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0
+    },
+    "verifier": {
+      "calls": 0,
+      "prompt_tokens": 0,
+      "completion_tokens": 0,
+      "cached_prompt_tokens": 0,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 0
+    }
+  },
+  "cost": {
+    "usd": null,
+    "unpriced_calls": 45
+  },
+  "backend": {
+    "attempts": 45,
+    "rate_limited": 0,
+    "failed_calls": 0,
+    "refusals": 0,
+    "calls_without_usage": 0,
+    "served_models": {
+      "Qwen3.5-4B": 45
+    },
+    "fatal": null
+  },
+  "judges": {
+    "verifier_agents": 0,
+    "verifier_steps": 0,
+    "judge_calls": 0,
+    "grading_fallbacks": {},
+    "refused": 0,
+    "refused_first": null
+  },
+  "provenance": {
+    "judges": false,
+    "backend": "hosted",
+    "model": "Qwen3.5-4B",
+    "base_url_origin": "http://model-server:8000"
+  }
+}
