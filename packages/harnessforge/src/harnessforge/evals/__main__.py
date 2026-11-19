@@ -2,7 +2,8 @@
 
     python -m harnessforge.evals run REQUEST.json [--poll 30]
         Start PlatoonBackend on the request and write <out_dir>/<run_id>/records.jsonl every --poll seconds until
-        every candidate is done. Creating <out_dir>/<run_id>/<candidate>.stop stops that candidate.
+        every candidate is done. Creating <out_dir>/<run_id>/<candidate>.stop stops that candidate. status.json there
+        says whether every candidate's process has exited ("done": true is written after the final records).
 
     python -m harnessforge.evals stage-images REQUEST.json --from SHARED_CACHE --to NODE_CACHE
         Copy the hpc-sandbox image cache entries of the request's tasks (by their docker_image, else their
@@ -54,10 +55,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"[{time.strftime('%H:%M:%S')}] {finished} finished, {len(records) - finished} in flight", flush=True)
         if done:
             break
+        _write_status(run_dir, run, done=False)
         time.sleep(args.poll)
     run.write_records(run_dir / "records.jsonl")
+    _write_status(run_dir, run, done=True)  # after the final records: a reader seeing done=true has them
     print(json.dumps(run.status(), indent=1), flush=True)
     return 0
+
+
+def _write_status(run_dir: Path, run, *, done: bool) -> None:
+    """<run_dir>/status.json: per-candidate process state and `done` (every process exited, records final), for
+    drivers on other nodes (harnessforge.race_run.FileRun)."""
+    tmp = run_dir / "status.json.tmp"
+    tmp.write_text(json.dumps({"time": time.time(), "done": done, "candidates": run.status()}, indent=1))
+    tmp.replace(run_dir / "status.json")
 
 
 def task_image(task_dir: Path) -> str | None:
