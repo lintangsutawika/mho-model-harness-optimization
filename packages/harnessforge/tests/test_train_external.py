@@ -95,12 +95,16 @@ def test_lend_for_run_and_serve_args(tmp_path, engines):
     assert "--rollout-num-gpus" not in a                              # miles derives it
     local = a[a.index("--update-weight-local-checkpoint-dir") + 1]
     assert run.run_id in local and local.startswith("/dev/shm/")      # run-unique, host-local
+    assert local == info["engine_local_dir"]                          # fixed at lend time
     assert a[a.index("--update-weight-transfer-mode") + 1] == "disk-delta"
     assert gateway_job(run).nodes == 1                                # only the trainer node
     # returned: reloaded to the pool policy, back in the router
     assert X.unlend_for_run(run, pool=pool, log=lambda m: None)
     assert pool.lent() == {} and X.read_rollout(run)["status"] == "returned"
     assert X.unlend_for_run(run, pool=pool)                           # idempotent
+    # a relaunch of the same run id gets a different engine-local dir
+    later = X.engine_local_dir(run, launch="29990101-000000")
+    assert later != local and "29990101-000000" in later
 
 
 def test_lend_refusals(tmp_path, engines):

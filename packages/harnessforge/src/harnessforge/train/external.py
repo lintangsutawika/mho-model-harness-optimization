@@ -39,7 +39,7 @@ from typing import Any, Callable
 
 from harnessforge.train.config import TrainRun
 
-DEFAULT_LOCAL_DIR = "/dev/shm/{user}-hftrain-{run_id}/engine-local"
+DEFAULT_LOCAL_DIR = "/dev/shm/{user}-hftrain-{run_id}-{launch}/engine-local"
 
 
 class ExternalRolloutError(RuntimeError):
@@ -54,9 +54,16 @@ def is_external(run: TrainRun) -> bool:
     return rollout_cfg(run).get("mode", "managed") == "external"
 
 
-def engine_local_dir(run: TrainRun) -> str:
+def engine_local_dir(run: TrainRun, launch: str | None = None) -> str:
+    """The engines' host-local checkpoint dir. Fixed per launch: lend_for_run records it in
+    rollout.json and the gateway reads it from there, so relaunching the same run id never meets
+    an earlier launch's applied-version marker. `{launch}` = the lend time (YYYYmmdd-HHMMSS)."""
+    recorded = read_rollout(run).get("engine_local_dir")
+    if launch is None and recorded and read_rollout(run).get("status") == "lent":
+        return recorded
     tmpl = rollout_cfg(run).get("engine_local_dir", DEFAULT_LOCAL_DIR)
-    return tmpl.format(user=os.environ.get("USER") or getpass.getuser(), run_id=run.run_id)
+    return tmpl.format(user=os.environ.get("USER") or getpass.getuser(), run_id=run.run_id,
+                       launch=launch or time.strftime("%Y%m%d-%H%M%S"))
 
 
 def engine_addr(url: str) -> str:
@@ -185,7 +192,8 @@ def lend_for_run(run: TrainRun, *, pool=None, check: Callable[..., list[str]] = 
     addrs = [engine_addr(u) for u in urls]
     _write(rollout_file(run), {"status": "lent", "pool_id": pool.pool_id,
                                "state_root": str(pool.dir.root), "nodes": nodes, "engines": addrs,
-                               "engine_local_dir": engine_local_dir(run), "policy": pol.id,
+                               "engine_local_dir": engine_local_dir(run, launch=time.strftime("%Y%m%d-%H%M%S")),
+                               "policy": pol.id,
                                "lent_at": time.time()})
     log(f"[external] {len(addrs)} engines: {' '.join(addrs)}")
     return addrs
