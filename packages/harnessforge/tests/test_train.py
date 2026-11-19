@@ -80,6 +80,7 @@ def test_serve_args_disk_delta_and_topology():
     assert val("--update-weight-local-checkpoint-dir") == "/local/x/hf-local"
     assert val("--rollout-temperature") == "1.0" and val("--context-parallel-size") == "1"
     assert val("--sglang-context-length") == "65536"
+    assert val("--tinker-max-tokens-per-datum") == "65536"
     # miles-tinker full mode refuses these
     for bad in ("--use-precision-aware-optimizer", "--offload-train", "--calculate-per-token-loss",
                 "--colocate", "--lora-rank"):

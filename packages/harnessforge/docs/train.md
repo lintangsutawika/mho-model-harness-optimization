@@ -44,8 +44,12 @@ comparison run), `pass_rate.json` (the Thompson-sampling variant; not to be run 
 All of this runs in CPU jobs (no compute on the login node), and nothing is installed into the image.
 
 1. **miles-tinker source.** `git archive` of neulab/miles-tinker at 25b6a76, unpacked to
-   `~/hf-dev/train/miles-tinker` and bound over `/root/miles` in `miles_latest.sif`. Then apply
-   `src/harnessforge/train/patches/miles-tinker-disk-delta-cast.patch` (see below).
+   `~/hf-dev/train/miles-tinker` and bound over `/root/miles` in `miles_latest.sif`. Then apply the two patches
+   in `src/harnessforge/train/patches/` (`patch -p1` in the tree; both are to upstream):
+   - `miles-tinker-disk-delta-cast.patch`: see below.
+   - `miles-tinker-max-tokens-per-datum.patch`: adds `--tinker-max-tokens-per-datum`. `GatewayConfig`
+     hard-codes 32768, and the first full-size `forward_backward` refused a 43k-token datum. The gateway passes
+     `train.context_window_length` (65536).
 2. **Tinker SDK for the server.** The SDK goes into `~/hf-dev/train/extra-site`, which is on the container's
    `PYTHONPATH`:
    ```bash
@@ -275,6 +279,47 @@ writing the delta, the engines pulling it, and the reload.
 resolution, as in the old run. A delta is about 0.3 GB and a sync about 7 s. 200 steps come to roughly 60 GB of
 deltas.
 
+## Full-topology check (`configs/train/fullcheck.json`)
+
+This is `naive.json` on its real topology, with only 2 small steps (4 tasks × group 8). The setup:
+- 1 trainer + 3 rollout rt_HF nodes (24 engines).
+- platoon and the sandboxes run on the head node.
+- All 6726 tmax-v11-train-naive tasks, the shared image cache, harbor system deps **on**, 64k context,
+  `group_admission: informative`.
+
+**What happened.**
+- The gateway was healthy after 360-370 s.
+- Driver start-up took about 3.5 min, mostly copying the 6726 tasks.
+- On the head node's network the apt system-deps step took about 3 min per sandbox. On the rt_HC node it had not
+  finished after 10 min.
+
+**First attempt.** It failed at the first `forward_backward`: `datum 0: 43456 tokens exceeds 32768`. That is
+miles-tinker's hard-coded `max_tokens_per_datum`, fixed by `miles-tinker-max-tokens-per-datum.patch`.
+
+**Second attempt, step 1.**
+
+| | value |
+|---|---|
+| batch time | 951 s |
+| trainer waited on rollouts | 779 s |
+| groups admitted | 4 of 7 (3 uniform groups rejected: 2 all-fail, 1 all-pass) |
+| datums / tokens | 47 / 872k |
+| `forward_backward` | 163 s, of which `actor_train_time` 143 s (TP2, 65536 tokens/GPU) |
+| weight sync to 24 engines | 7.9 s |
+| delta | 1.66 % / 0.33 GB |
+| trainer memory | peak ~115 of 140 GB on rank 0 |
+
+**Step 2 and stopping.** Step 2 was still waiting on straggler rollouts (3600 s agent limit) after 19 min, so the
+check was stopped with `python -m harnessforge.train stop`.
+- `STOP` reached platoon, which began its interrupted checkpoint. The gateway tore down, and both jobs ended
+  66 s after the command.
+- The driver forwarded SIGTERM twice (on seeing `STOP`, and again when the gateway signalled it). platoon takes a
+  second SIGTERM as "force exit" and skipped the checkpoint. Fixed: the driver forwards it once.
+
+**Implication for the full run.** The old run took ~9-10 min per step (rollout-bound) with 256 concurrent
+sandboxes. Here 160 concurrent sandboxes is the main limit, and steps will likely be ~15 min: 200 steps ≈ 2 days
+(`gateway.walltime` is 72 h).
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the
@@ -283,7 +328,10 @@ deltas.
   layout byte for byte (`A_log` fp32, `model.language_model.*`).
 - miles-tinker's `--ref-load` here is the old run's torch_dist conversion of the base model (read only).
 - **Disk use.** Deltas are never pruned: about 0.3 GB per step (smoke), ~60 GB over 200 steps. Add 20 HF exports
-  of 9 GB each, and platoon's launch and `checkpoint.every` Tinker states (torch_dist + Adam, tens of GB each).
+  of 9 GB each.
+- **Tinker states.** Each `save_state` (torch_dist + Adam) is ~47 GB. platoon saves one at launch, one at the end
+  (or on interrupt) and every `checkpoint.every` (50 in `naive.json`): ~280 GB for the full run. The smoke and
+  check runs hold 94 GB each under `<run>/tinker`.
 - **No per-step weight-sync or rollout timings from the server.** miles-tinker logs `tinker perf` (train time, MFU)
   per `optim_step` into `<run>/tinker/perf.jsonl`. Disk-delta prints density/wire per version in the head log.
   platoon logs `timing/batch_total` and the rollout-side waits.

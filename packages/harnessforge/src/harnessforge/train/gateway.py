@@ -70,6 +70,10 @@ def serve_args(run: TrainRun, *, port: int, local_ckpt: str) -> list[str]:
         "--tinker-base-model", m["name"],
         "--tinker-lease-timeout-s", str(int(g.get("lease_timeout_s", 3600))),
         "--tinker-max-concurrent-samples", str(int(g.get("max_concurrent_samples", 512))),
+        # longest training datum; miles-tinker's default (32768) is below our 64k context
+        # (patches/miles-tinker-max-tokens-per-datum.patch adds the flag)
+        "--tinker-max-tokens-per-datum", str(int(g.get("max_tokens_per_datum",
+                                                       run["train"].get("context_window_length", 32768)))),
         # initial optimizer config only: platoon's AdamParams arrive with every optim_step
         "--optimizer", "adam", "--lr", str(run["train"].get("optimizer", {}).get("learning_rate", 1e-6)),
         "--tensor-model-parallel-size", str(int(g.get("tp", 2))),

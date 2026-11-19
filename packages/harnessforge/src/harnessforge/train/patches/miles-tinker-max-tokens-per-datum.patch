@@ -1,0 +1,25 @@
+--- a/miles/utils/arguments.py	2026-09-06 22:54:43
++++ b/miles/utils/arguments.py	2026-11-19 03:37:37
+@@ -1890,6 +1890,12 @@
+                 type=int,
+                 default=512,
+                 help="Maximum in-flight /generate posts per gateway (default: 512)",
++            )
++            parser.add_argument(
++                "--tinker-max-tokens-per-datum",
++                type=int,
++                default=32768,
++                help="Longest datum (prompt + completion tokens) forward_backward accepts (default: 32768)",
+             )
+             parser.add_argument(
+                 "--tinker-retrieve-poll-timeout-s",
+--- a/serve_tinker.py	2026-09-06 22:54:43
++++ b/serve_tinker.py	2026-11-19 03:37:37
+@@ -65,6 +65,7 @@
+         sampler_versions_to_keep=args.tinker_sampler_versions_to_keep,
+         coalesce_wait_s=args.tinker_coalesce_wait_s,
+         max_concurrent_samples=args.tinker_max_concurrent_samples,
++        max_tokens_per_datum=args.tinker_max_tokens_per_datum,
+     )
+     router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+     backend = MilesBackend(args, trainer, router_url, inference_controller=inference_controller)

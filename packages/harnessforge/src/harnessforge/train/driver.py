@@ -115,9 +115,12 @@ def run_driver_job(run_dir: str | Path) -> int:
     stop = {"flag": False}
 
     def _term(*_: Any) -> None:
+        # once: platoon takes a second SIGTERM as "force exit" (no interrupted checkpoint, no reaping)
+        if stop["flag"]:
+            return
         stop["flag"] = True
         if platoon_proc is not None and platoon_proc.poll() is None:
-            platoon_proc.send_signal(signal.SIGTERM)       # platoon stops its sandboxes, exits 143
+            platoon_proc.send_signal(signal.SIGTERM)       # platoon checkpoints, stops its sandboxes
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
     try:
