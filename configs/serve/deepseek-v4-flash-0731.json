@@ -1,0 +1,19 @@
+{
+  "_model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "_note": "DeepSeek-V4-Flash-0731 (284B total / ~13B active MoE, FP4 experts + FP8, 166.9 GB). Flags from the vLLM recipe (recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash?variant=fp8), 8x H200 TP8+EP default; DSpark speculative decoding omitted (favours single-stream latency over many-session throughput). Served names include azure_ai/DeepSeek-V4-Flash-0731 because paper2rlenv sends model openai/azure_ai/DeepSeek-V4-Flash-0731 and litellm strips the openai/ prefix.",
+  "extra_args": [
+    "--trust-remote-code",
+    "--kv-cache-dtype", "fp8",
+    "--block-size", "256",
+    "--enable-expert-parallel",
+    "--tokenizer-mode", "deepseek_v4",
+    "--enable-auto-tool-choice",
+    "--tool-call-parser", "deepseek_v4",
+    "--reasoning-parser", "deepseek_v4",
+    "--reasoning-config", "{\"reasoning_parser\":\"deepseek_v4\",\"reasoning_start_str\":\"\",\"reasoning_end_str\":\"\"}",
+    "--enable-prefix-caching",
+    "--served-model-name", "azure_ai/DeepSeek-V4-Flash-0731", "deepseek-ai/DeepSeek-V4-Flash-0731", "DeepSeek-V4-Flash-0731"
+  ],
+  "max_model_len": 393216,
+  "_note_context": "Recipe: Think Max needs >= 393216 to avoid truncation; native 1048576."
+}

@@ -8,6 +8,15 @@
 #                  SingularityWritableEnvironment. harbor run executes on the host (not nested),
 #                  and the sandbox shares the host net namespace, so the agent reaches the local
 #                  vLLM at localhost directly -- NO Modal, NO relay.
+#   hpcsb       -> LOCAL sandboxes via hpc-sandbox (mho.backends.hpc_sandbox_env), on THIS node like
+#                  singularity (no Modal, no relay), with a shared image cache, per-trial node-local
+#                  roots, command timeouts, a memory watchdog and janitors. HPCSB_IMAGE_CACHE (default
+#                  /groups/.../hpc-sandbox-images), HPCSB_RUNTIME (singularity|enroot|gvisor),
+#                  HPCSB_DOCKERFILE_STEPS (run|error|warn|ignore), HPCSB_EXTRA_EK (space-separated k=v).
+#                  HPCSB_NETWORK=pod (default): each trial gets its own network namespace (no port
+#                  clashes between trials or with vLLM) with internet egress; the self-served vLLM
+#                  is relayed in as http://llm:${HPCSB_LLM_PORT:-39317} through a Unix socket
+#                  (mho.backends.uds_forward). HPCSB_NETWORK=host shares the node's network.
 #   modal       -> cloud sandboxes; the local vLLM is exposed to them via the Modal reverse relay.
 #   sail        -> Sail cloud sandboxes (sail.harbor:SailboxEnvironment, CPU-only); needs
 #                  SAIL_API_KEY (or SAIL_KEY in .env). With MHO_MODEL set, the local vLLM is
@@ -50,6 +59,8 @@ export PYTHONSAFEPATH=1
 # left harbor missing in the batch eval. Override with MHO_VENV_BIN.
 VENV_BIN="${MHO_VENV_BIN:-${REPO_DIR}/.venv/bin}"
 . "${REPO_DIR}/scripts/utils/load_env.sh" && load_env "${REPO_DIR}/.env"
+# An external model server (MHO_LLM_ENDPOINT) wins over a default MHO_MODEL from .env.
+[ -n "${MHO_LLM_ENDPOINT:-}" ] && unset MHO_MODEL
 # Every sif this script needs sits next to BASE_SIF. Resolve the dir now (empty if BASE_SIF is
 # unset) and demand it only on the paths that use one -- a modal run needs no image at all.
 SIF_DIR="${BASE_SIF:+$(dirname "${BASE_SIF}")}"
@@ -62,12 +73,12 @@ require_sif_dir() {
 
 HARBOR_ENV="${HARBOR_ENV:-singularity}"   # local singularity by default; 'modal' or 'sail' for cloud
 case "${HARBOR_ENV}" in
-  singularity|modal|sail) ;;
-  *) echo "ERROR: HARBOR_ENV must be singularity|modal|sail (got '${HARBOR_ENV}')" >&2; exit 2 ;;
+  singularity|hpcsb|modal|sail) ;;
+  *) echo "ERROR: HARBOR_ENV must be singularity|hpcsb|modal|sail (got '${HARBOR_ENV}')" >&2; exit 2 ;;
 esac
 # Cloud sandboxes cannot reach this node: a self-served model goes through the Modal relay.
-CLOUD_SANDBOX=0; [ "${HARBOR_ENV}" != "singularity" ] && CLOUD_SANDBOX=1
-SAIL_IMPORT="${SAIL_IMPORT:-sail.harbor:SailboxEnvironment}"
+CLOUD_SANDBOX=1; case "${HARBOR_ENV}" in singularity|hpcsb) CLOUD_SANDBOX=0 ;; esac
+SAIL_IMPORT="${SAIL_IMPORT:-mho.backends.sail_retry:RetryingSailboxEnvironment}"  # retries transient Sail start errors
 SAIL_FORCE_BUILD="${SAIL_FORCE_BUILD:-1}"   # build environment/Dockerfile, not the task's docker_image
 if [ "${HARBOR_ENV}" = "sail" ]; then
   export SAIL_API_KEY="${SAIL_API_KEY:-${SAIL_KEY:-}}"
@@ -77,6 +88,15 @@ AGENT_IMPORT="${AGENT_IMPORT:-harness.micro_swe_agent:MicroSweAgent}"
 # Custom harbor-singularity-hpc env class, selected by --environment-import-path (harbor's
 # -e is a fixed enum and cannot name a custom class). Override to test a fork.
 HARBOR_SING_IMPORT="${HARBOR_SING_IMPORT:-harbor_singularity_hpc.environment:SingularityWritableEnvironment}"
+HPCSB_IMPORT="${HPCSB_IMPORT:-mho.backends.hpc_sandbox_env:HpcSandboxEnvironment}"
+# Sandbox images live on node-local scratch ($PBS_LOCALDIR, wiped at job end), not /groups
+# (shared quota). Falls back to the shared cache only when there is no node-local dir.
+_HPCSB_IMG_DEFAULT="/groups/gai51740/aci18914wh/mho/hpc-sandbox-images"
+[ -n "${PBS_LOCALDIR:-}" ] && [ -d "${PBS_LOCALDIR}" ] && _HPCSB_IMG_DEFAULT="${PBS_LOCALDIR}/hpcsb-images"
+HPCSB_IMAGE_CACHE="${HPCSB_IMAGE_CACHE:-${_HPCSB_IMG_DEFAULT}}"
+HPCSB_NETWORK="${HPCSB_NETWORK:-pod}"
+HPCSB_LLM_PORT="${HPCSB_LLM_PORT:-39317}"   # vLLM's port INSIDE each pod (unusual: tasks pick 8000/5000/...)
+UDS_FWD_PID=""
 # Singularity (on-node) knobs. The .sif cache is a PERSISTENT SHARED dir for converted task
 # images, decoupled from the sif-in-use (BASE_SIF); node-local dirs are wiped per job, causing
 # re-pulls. Sandbox dir defaults to live $PBS_LOCALDIR.
@@ -146,6 +166,7 @@ VLLM_PID=""; RELAY_BRIDGE_PID=""; RELAY_APP_STOP=""
 cleanup() {
   [ -n "${RELAY_BRIDGE_PID}" ] && { echo "[relay] stopping bridge (pid=${RELAY_BRIDGE_PID})"; kill "${RELAY_BRIDGE_PID}" 2>/dev/null; }
   [ -n "${RELAY_APP_STOP}" ] && { echo "[relay] stopping Modal app ${RELAY_APP_STOP}"; uv run modal app stop "${RELAY_APP_STOP}" </dev/null >/dev/null 2>&1 || true; }
+  [ -n "${UDS_FWD_PID}" ] && { echo "[hpcsb] stopping llm socket forwarder (pid=${UDS_FWD_PID})"; kill "${UDS_FWD_PID}" 2>/dev/null; }
   [ -n "${VLLM_PID}" ] && { echo "[eval] stopping vLLM (pid=${VLLM_PID})"; kill "${VLLM_PID}" 2>/dev/null; }
   :  # a false test above would otherwise become the script's exit status
 }
@@ -190,9 +211,49 @@ if [ -n "${MHO_MODEL:-}" ]; then
   MODEL="litellm_proxy/${SERVED_NAME}"; VLLM_LOCAL_URL="http://localhost:${VLLM_PORT}"
   if [ "${CLOUD_SANDBOX}" = 1 ]; then
     RELAY=1                                   # cloud sandboxes reach the vLLM via the relay
+  elif [ "${HARBOR_ENV}" = "hpcsb" ] && [ "${HPCSB_NETWORK}" = "pod" ]; then
+    # hpc-sandbox pods have their own network namespace: relay vLLM in as an upstream. A Unix
+    # socket (mode 0600) forwards to vLLM's TCP port; every pod reaches it as http://llm:PORT.
+    UDS_SOCK="${PBS_LOCALDIR:-${TMPDIR:-/tmp}}/mho-llm-$$.sock"
+    [ "${#UDS_SOCK}" -lt 100 ] || UDS_SOCK="/tmp/mho-llm-$$.sock"
+    UDS_LOG="$(dirname "${VLLM_LOG}")/uds_forward-$$.log"
+    "${VENV_BIN}/python" -m mho.backends.uds_forward "${UDS_SOCK}" "127.0.0.1:${VLLM_PORT}" >"${UDS_LOG}" 2>&1 &
+    UDS_FWD_PID=$!
+    for _i in $(seq 1 50); do [ -S "${UDS_SOCK}" ] && break; sleep 0.2; done
+    [ -S "${UDS_SOCK}" ] || { echo "[hpcsb] llm socket forwarder failed; see ${UDS_LOG}" >&2; cat "${UDS_LOG}" >&2; exit 1; }
+    export HPCSB_UPSTREAMS="llm=${UDS_SOCK}@${HPCSB_LLM_PORT}"
+    export LITELLM_PROXY_API_BASE="http://llm:${HPCSB_LLM_PORT}/v1"
+    export LITELLM_PROXY_API_KEY="${LITELLM_PROXY_API_KEY:-EMPTY}"
+    echo "[hpcsb] vLLM :${VLLM_PORT} -> ${UDS_SOCK} -> pods as ${LITELLM_PROXY_API_BASE}"
   else
-    # local singularity: the sandbox shares the host net namespace -> hit vLLM directly.
+    # local singularity (or hpcsb with HPCSB_NETWORK=host): the sandbox shares the host net
+    # namespace -> hit vLLM directly.
     export LITELLM_PROXY_API_BASE="http://localhost:${VLLM_PORT}/v1"
+    export LITELLM_PROXY_API_KEY="${LITELLM_PROXY_API_KEY:-EMPTY}"
+  fi
+fi
+# --- external OpenAI-compatible server (e.g. a harnessforge SGLang pool) -------
+# MHO_MODEL unset + MHO_LLM_ENDPOINT=<host:port> (no /v1) + MODEL=litellm_proxy/<served name>:
+# route the sandboxes to it exactly like the self-served vLLM (pod: Unix-socket upstream; host /
+# singularity: direct; cloud: Modal relay).
+if [ -z "${MHO_MODEL:-}" ] && [ -n "${MHO_LLM_ENDPOINT:-}" ]; then
+  echo "[eval] external model server: ${MHO_LLM_ENDPOINT} (MODEL=${MODEL:-?})"
+  if [ "${CLOUD_SANDBOX}" = 1 ]; then
+    RELAY=1; VLLM_LOCAL_URL="http://${MHO_LLM_ENDPOINT}"
+  elif [ "${HARBOR_ENV}" = "hpcsb" ] && [ "${HPCSB_NETWORK}" = "pod" ]; then
+    UDS_SOCK="${PBS_LOCALDIR:-${TMPDIR:-/tmp}}/mho-llm-$$.sock"
+    [ "${#UDS_SOCK}" -lt 100 ] || UDS_SOCK="/tmp/mho-llm-$$.sock"
+    UDS_LOG="${MHO_OUT:-/tmp}/uds_forward-$$.log"; mkdir -p "$(dirname "${UDS_LOG}")"
+    "${VENV_BIN}/python" -m mho.backends.uds_forward "${UDS_SOCK}" "${MHO_LLM_ENDPOINT}" >"${UDS_LOG}" 2>&1 &
+    UDS_FWD_PID=$!
+    for _i in $(seq 1 50); do [ -S "${UDS_SOCK}" ] && break; sleep 0.2; done
+    [ -S "${UDS_SOCK}" ] || { echo "[hpcsb] llm socket forwarder failed; see ${UDS_LOG}" >&2; cat "${UDS_LOG}" >&2; exit 1; }
+    export HPCSB_UPSTREAMS="llm=${UDS_SOCK}@${HPCSB_LLM_PORT}"
+    export LITELLM_PROXY_API_BASE="http://llm:${HPCSB_LLM_PORT}/v1"
+    export LITELLM_PROXY_API_KEY="${LITELLM_PROXY_API_KEY:-EMPTY}"
+    echo "[hpcsb] ${MHO_LLM_ENDPOINT} -> ${UDS_SOCK} -> pods as ${LITELLM_PROXY_API_BASE}"
+  else
+    export LITELLM_PROXY_API_BASE="http://${MHO_LLM_ENDPOINT}/v1"
     export LITELLM_PROXY_API_KEY="${LITELLM_PROXY_API_KEY:-EMPTY}"
   fi
 fi
@@ -242,6 +303,14 @@ if [ "${HARBOR_ENV}" = "singularity" ]; then
   [ -n "${SINGULARITY_SANDBOX_DIR}" ] && ENV_FLAGS+=( --ek "singularity_sandbox_dir=${SINGULARITY_SANDBOX_DIR}" )
   [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
   [ -n "${SINGULARITY_MEMORY_ENFORCEMENT}" ] && ENV_FLAGS+=( --ek "memory_enforcement_policy=${SINGULARITY_MEMORY_ENFORCEMENT}" )
+elif [ "${HARBOR_ENV}" = "hpcsb" ]; then
+  mkdir -p "${HPCSB_IMAGE_CACHE}" 2>/dev/null || true
+  ENV_FLAGS=( --environment-import-path "${HPCSB_IMPORT}" --ek "hpc_image_cache=${HPCSB_IMAGE_CACHE}"
+              --ek "hpc_network=${HPCSB_NETWORK}" )
+  [ -n "${HPCSB_RUNTIME:-}" ] && ENV_FLAGS+=( --ek "hpc_runtime=${HPCSB_RUNTIME}" )
+  [ -n "${HPCSB_DOCKERFILE_STEPS:-}" ] && ENV_FLAGS+=( --ek "hpc_dockerfile_steps=${HPCSB_DOCKERFILE_STEPS}" )
+  [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
+  for _kv in ${HPCSB_EXTRA_EK:-}; do ENV_FLAGS+=( --ek "${_kv}" ); done
 elif [ "${HARBOR_ENV}" = "sail" ]; then
   ENV_FLAGS=( --environment-import-path "${SAIL_IMPORT}" )
   [ "${SAIL_FORCE_BUILD}" = "1" ] && ENV_FLAGS+=( --force-build )
@@ -299,6 +368,9 @@ elif [ -n "${AGENT_TASK_CONFIG}" ]; then
 fi
 [ -n "${AGENT_CONFIG}" ] && CMD+=( --ak "config_file=${AGENT_CONFIG}" )
 [ -n "${MINI_FORK_LOCAL:-}" ] && CMD+=( --ak "mini_fork_local=${MINI_FORK_LOCAL}" )
+# Extra agent kwargs (e.g. for harbor's built-in agents such as Terminus 2):
+# EXTRA_AGENT_KWARGS="key=value key2=value2" -> one --ak per pair (values must not contain spaces).
+for _kv in ${EXTRA_AGENT_KWARGS:-}; do CMD+=( --ak "${_kv}" ); done
 
 # --- Modal reverse relay (HARBOR_ENV=modal|sail: expose local vLLM to cloud sandboxes) --
 if [ "${RELAY:-0}" = "1" ]; then
@@ -349,9 +421,96 @@ echo "output: ${EVAL_JOBS_DIR}/${EVAL_JOB_NAME}/"
 echo "host:   $(hostname)  job: ${PBS_JOBID:-${SLURM_JOB_ID:-none}}"
 echo "=================================================================="
 
-RUN_CMD=("${CMD[@]}")
-if command -v timeout >/dev/null 2>&1 && [ "${HARBOR_EXTERNAL_TIMEOUT:-0}" != "1" ]; then
-  RUN_CMD=(timeout --signal=SIGINT "${HARBOR_TIMEOUT_SECONDS}" "${CMD[@]}")
+TIMEOUT_PREFIX=()
+if command -v timeout >/dev/null 2>&1; then
+  if [ "${HARBOR_EXTERNAL_TIMEOUT:-0}" != "1" ]; then
+    TIMEOUT_PREFIX=(timeout --signal=SIGINT "${HARBOR_TIMEOUT_SECONDS}")
+  else
+    # no time limit (0), but still a SIGINT-forwarding parent: a background job of this
+    # non-interactive shell starts with SIGINT ignored, so harbor could not be stopped with it
+    TIMEOUT_PREFIX=(timeout --signal=SIGINT 0)
+  fi
 fi
+
+# --- early stop (sequential gate) -----------------------------------------------------------
+# The loop asks a run to stop once its verdict is known by creating <jobs dir>/<job name>.stop.
+# The run then gets SIGINT (harbor's graceful path: cancel trials, tear down sandboxes, as on
+# the external timeout), and SIGTERM if it is still alive EVAL_STOP_GRACE seconds later.
+# Usage: _watch_stop "<stop file> <pid>" ...   (returns when every pid has exited)
+EVAL_STOP_POLL="${EVAL_STOP_POLL:-15}"; EVAL_STOP_GRACE="${EVAL_STOP_GRACE:-300}"
+_watch_stop() {
+  local -a _sf=() _wp=() _ws=()
+  local _x _k _alive
+  for _x in "$@"; do _sf+=("${_x% *}"); _wp+=("${_x##* }"); _ws+=(""); done
+  while :; do
+    _alive=0
+    for _k in "${!_wp[@]}"; do
+      kill -0 "${_wp[$_k]}" 2>/dev/null || continue
+      _alive=1
+      if [ -z "${_ws[$_k]}" ] && [ -f "${_sf[$_k]}" ]; then
+        echo "[eval] stop requested (${_sf[$_k]}): SIGINT pid ${_wp[$_k]}"
+        kill -INT "${_wp[$_k]}" 2>/dev/null; _ws[$_k]=${SECONDS}
+      elif [ -n "${_ws[$_k]}" ] && (( SECONDS - _ws[$_k] > EVAL_STOP_GRACE )); then
+        echo "[eval] pid ${_wp[$_k]} still alive ${EVAL_STOP_GRACE}s after SIGINT: SIGTERM"
+        kill -TERM "${_wp[$_k]}" 2>/dev/null; _ws[$_k]=$(( SECONDS + 100000 ))
+      fi
+    done
+    [ "${_alive}" = 1 ] || return 0
+    sleep "${EVAL_STOP_POLL}"
+  done
+}
+
+# --- group mode (MHO_EVAL_GROUP): several harnesses, ONE served model -----------------------
+# The file lists members {harness, out_dir, job_name, logs}. Each gets its own `harbor run`
+# (same model endpoint, data, sandboxes backend and N_CONCURRENT), differing only in
+# --jobs-dir/--job-name and the harness (--ak mini_fork_local=...). They run side by side on
+# this node; each member's output goes to its own log. Exit 0 if any member produced a run
+# (the loop judges each member by its own trials), 1 if all failed.
+if [ -n "${MHO_EVAL_GROUP:-}" ]; then
+  mapfile -t _MEMBERS < <("${VENV_BIN}/python" - "${MHO_EVAL_GROUP}" <<'PYG'
+import json, sys
+for m in json.load(open(sys.argv[1])):
+    print("\t".join([m["harness"], m["out_dir"], m["job_name"], m["logs"]]))
+PYG
+)
+  echo "[group] ${#_MEMBERS[@]} members from ${MHO_EVAL_GROUP}, n=${N_CONCURRENT} each"
+  _PIDS=(); _LOGS=(); _STOPS=()
+  for _row in "${_MEMBERS[@]}"; do
+    IFS=$'\t' read -r _h _out _jn _log <<<"${_row}"
+    mkdir -p "${_out}" "$(dirname "${_log}")"
+    _C=()
+    for _a in "${CMD[@]}"; do
+      case "${_a}" in
+        "${EVAL_JOBS_DIR}") _C+=("${_out}") ;;
+        "${EVAL_JOB_NAME}") _C+=("${_jn}") ;;
+        "mini_fork_local=${MINI_FORK_LOCAL}") _C+=("mini_fork_local=${_h}") ;;
+        *) _C+=("${_a}") ;;
+      esac
+    done
+    {
+      echo "=================================================================="
+      echo "[group member] harness: ${_h}"
+      echo "output: ${_out}/${_jn}/   host: $(hostname)  job: ${PBS_JOBID:-none}"
+      echo "=================================================================="
+    } >> "${_log}"
+    "${TIMEOUT_PREFIX[@]}" "${_C[@]}" >> "${_log}" 2>&1 &
+    _PIDS+=($!); _LOGS+=("${_log}"); _STOPS+=("${_out}/${_jn}.stop ${!}")
+    echo "[group] started pid=$! harness=${_h} -> ${_out}/${_jn} (log ${_log})"
+  done
+  _watch_stop "${_STOPS[@]}"
+  _ANY_OK=0
+  for _i in "${!_PIDS[@]}"; do
+    _rc=0; wait "${_PIDS[$_i]}" || _rc=$?
+    echo "[group] member ${_i} pid=${_PIDS[$_i]} exited rc=${_rc} (log ${_LOGS[$_i]})"
+    echo "[group member] harbor exited rc=${_rc}" >> "${_LOGS[$_i]}"
+    [ "${_rc}" = 0 ] && _ANY_OK=1
+  done
+  [ "${_ANY_OK}" = 1 ] || { echo "[group] every member failed" >&2; exit 1; }
+  exit 0
+fi
+
+RUN_CMD=("${TIMEOUT_PREFIX[@]}" "${CMD[@]}")
 # Never exec here: a relay/vLLM child must be torn down by the EXIT trap.
-"${RUN_CMD[@]}" & HARBOR_PID=$!; wait "${HARBOR_PID}"
+"${RUN_CMD[@]}" & HARBOR_PID=$!
+_watch_stop "${EVAL_JOBS_DIR}/${EVAL_JOB_NAME}.stop ${HARBOR_PID}"
+wait "${HARBOR_PID}"

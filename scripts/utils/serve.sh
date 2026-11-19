@@ -90,6 +90,10 @@ vllm_argv=(
     "${APPTAINER_BIN}" exec --nv --writable-tmpfs
     --workdir "${BASE_DIR}"
     --bind "${HF_DIR:-$HOME/.cache/huggingface}:/root/.cache/huggingface"
+)
+# A local checkpoint dir (e.g. a trained candidate under /groups, not bound by default).
+[ -d "${MODEL}" ] && vllm_argv+=(--bind "${MODEL}:${MODEL}")
+vllm_argv+=(
     "${BASE_SIF}"
     vllm serve "${MODEL}"
         --host 0.0.0.0

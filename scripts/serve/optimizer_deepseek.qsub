@@ -1,0 +1,57 @@
+#!/bin/bash
+# optimizer_deepseek.qsub -- self-hosted DeepSeek-V4-Flash-0731 for the MHO optimizer (proposer) agent,
+# replacing the CMU LiteLLM proxy (team budget). One full H200 node (rt_HF), vLLM 0.32.0, TP8 + expert
+# parallel. Recipe, weights and sif reused from TSA (paper2rlenv/serve/deepseek.qsub); no Modal relay:
+# proposer jobs run on ABCI and reach this node directly over the cluster network.
+#
+# Submit (from the mho-rsft repo):
+#   qsub -N mho-dsv4 -j oe -o logs/ -P gai51740 -q R9920261300 -v RTYPE=rt_HF -l select=1 \
+#        -l walltime=120:00:00 scripts/serve/optimizer_deepseek.qsub
+# Clients: once /health is up, $ENVF holds OPTIMIZER_MODEL / OPTIMIZER_LLM_BASE_URL / OPTIMIZER_LLM_API_KEY.
+# propose.sh sources it when MHO_OPTIMIZER_ENV=$ENVF (overriding .env's proxy settings). The file is
+# removed when this job ends, so proposals fail fast (and the loop aborts cleanly) instead of hanging.
+set -euo pipefail
+REPO=/home/aci18914wh/mho-model-harness-optimization/mho-rsft
+MSL=/home/aci18914wh/msl-multilingual-self-learning          # serve_vllm.sh (shared serve wrapper)
+ENVF=${ENVF:-/groups/gai51740/aci18914wh/mho/optimizer-deepseek.env}
+KEYF=/groups/gai51740/aci18914wh/mho/optimizer-deepseek.key
+CACHE_DIR=/groups/gai51740/aci18914wh/tsa/cache               # huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731
+PORT=${PORT:-8000}
+log(){ echo "[dsv4 $(date +%H:%M:%S)] $*"; }
+
+[ -d "$CACHE_DIR/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash-0731" ] || { log "weights missing"; exit 2; }
+umask 077
+[ -s "$KEYF" ] || openssl rand -hex 24 > "$KEYF"
+export VLLM_API_KEY="$(cat "$KEYF")"                         # vLLM requires Bearer <key>; inherited by the sif
+umask 027
+IP="$(hostname -i | awk '{print $1}')"
+
+cleanup(){ [ -f "$ENVF" ] && grep -q "OPTIMIZER_SERVER_JOB=${PBS_JOBID:-none}" "$ENVF" && rm -f "$ENVF"; kill 0 2>/dev/null || true; }
+trap cleanup EXIT
+
+export HF_HUB_OFFLINE=1
+MODEL=deepseek-ai/DeepSeek-V4-Flash-0731 \
+SERVE_CONFIG=configs/serve/deepseek-v4-flash-0731.json \
+VLLM_CUDA_SIF=/home/aci18914wh/vllm-openai_v0.32.0-cu129.sif \
+TENSOR_PARALLEL=8 DATA_PARALLEL=1 GPU_MEM_UTIL=0.90 PORT="$PORT" \
+BASE_DIR="${PBS_LOCALDIR:-/tmp}" CACHE_DIR="$CACHE_DIR" USE_RELAY=0 \
+REPO_ROOT="$REPO" bash "$MSL/scripts/serve/serve_vllm.sh" &
+SERVE_PID=$!
+
+log "waiting for vLLM on $IP:$PORT"
+for _ in $(seq 1 360); do      # up to 60 min (weights load from /groups + compile)
+  kill -0 $SERVE_PID 2>/dev/null || { log "vLLM exited before becoming healthy"; exit 3; }
+  curl -sf -o /dev/null "http://127.0.0.1:$PORT/health" && break
+  sleep 10
+done
+curl -sf -o /dev/null "http://127.0.0.1:$PORT/health" || { log "not healthy after 60 min"; exit 3; }
+# end-to-end check through the node IP with the key, before advertising it
+curl -sf -H "Authorization: Bearer $VLLM_API_KEY" "http://$IP:$PORT/v1/models" | grep -q "DeepSeek-V4-Flash-0731" \
+  || { log "/v1/models via $IP failed"; exit 3; }
+
+umask 077
+printf 'export OPTIMIZER_MODEL=%s\nexport OPTIMIZER_LLM_BASE_URL=%s\nexport OPTIMIZER_LLM_API_KEY=%s\nexport OPTIMIZER_SERVER_JOB=%s\n' \
+  "litellm_proxy/azure_ai/DeepSeek-V4-Flash-0731" "http://$IP:$PORT/v1" "$VLLM_API_KEY" "${PBS_JOBID:-none}" > "$ENVF.tmp"
+mv -f "$ENVF.tmp" "$ENVF"
+log "ready: http://$IP:$PORT/v1 (env -> $ENVF)"
+wait $SERVE_PID
