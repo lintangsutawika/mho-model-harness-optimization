@@ -92,3 +92,46 @@ def test_group_filter_swap(monkeypatch):
     monkeypatch.setenv("MHO_RSFT_GROUP_FILTER", "any_success")
     out = objectives.objective_group_filter(AGENT, "rsft")
     assert objectives.GRPO_GROUP_FILTER not in out and objectives.RSFT_GROUP_FILTER in out
+
+
+ASYNC_AGENT = ("--custom-rm-path generate.reward_func --rollout-function-path generate.RolloutFn "
+         "--dynamic-sampling-filter-path x.y ")
+
+
+def test_async_args_default_on(monkeypatch):
+    for v in ("MHO_FULLY_ASYNC", "MHO_ASYNC_MAX_STALENESS", "MHO_ASYNC_MAX_CONCURRENT"):
+        monkeypatch.delenv(v, raising=False)
+    g = objectives.async_train_args(ASYNC_AGENT, "grpo")
+    assert "--rollout-function-path" not in g and "--fully-async " in g
+    assert "--max-weight-staleness 3 " in g and "--use-tis " in g
+    assert "--async-max-concurrent-samples 128 " in g and "--dynamic-sampling-filter-path x.y " in g
+    assert "--use-tis" not in objectives.async_train_args(ASYNC_AGENT, "rsft")
+
+
+def test_async_args_knobs_and_off(monkeypatch):
+    monkeypatch.setenv("MHO_ASYNC_MAX_STALENESS", "1")
+    monkeypatch.setenv("MHO_ASYNC_MAX_CONCURRENT", "256")
+    g = objectives.async_train_args(ASYNC_AGENT, "grpo")
+    assert "--max-weight-staleness 1 " in g and "--async-max-concurrent-samples 256 " in g
+    monkeypatch.setenv("MHO_FULLY_ASYNC", "0")
+    assert objectives.async_train_args(ASYNC_AGENT, "grpo") == ASYNC_AGENT
+
+
+def test_dr_grpo_flags(monkeypatch):
+    monkeypatch.delenv("MHO_DR_GRPO", raising=False)
+    g = objectives.objective_train_args("grpo")
+    assert "--disable-grpo-std-normalization " in g and objectives.DRGRPO_REDUCER in g
+    assert "--disable-grpo-std-normalization" not in objectives.objective_train_args("rsft")
+    monkeypatch.setenv("MHO_DR_GRPO", "0")
+    g = objectives.objective_train_args("grpo")
+    assert "--disable-grpo-std-normalization" not in g and objectives.DRGRPO_REDUCER not in g
+
+
+def test_dr_grpo_reducer_divides_token_sums_by_constant(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from mho.train import drgrpo
+    monkeypatch.setenv("MHO_DRGRPO_DIVISOR", "10")
+    x = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])          # two trajectories: 3 + 2 tokens
+    masks = [torch.tensor([1.0, 1.0, 0.0]), torch.tensor([1.0, 1.0])]
+    red = drgrpo.get_pg_loss_reducer(None, [3, 2], masks)
+    assert float(red(x)) == pytest.approx((1 + 2) / 10 + (4 + 5) / 10)
