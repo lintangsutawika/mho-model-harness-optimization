@@ -71,10 +71,19 @@ def task_image(task_dir: Path) -> str | None:
 def cmd_stage_images(args: argparse.Namespace) -> int:
     request, _ = load_request(args.request)
     shared, dest = Path(args.from_), Path(args.to)
+    staged, missing = stage_images(request.dataset, request.tasks, shared, dest)
+    print(f"staged {staged} image(s) into {dest}; {missing} not in {shared} (pulled on first use)")
+    return 0
+
+
+def stage_images(dataset: str | Path, tasks, shared: str | Path, dest: str | Path) -> tuple[int, int]:
+    """Copy the shared hpc-sandbox image cache entries of `tasks` to `dest` (node-local).
+    Returns (staged, missing)."""
+    shared, dest = Path(shared), Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     staged = missing = 0
-    for task in request.tasks:
-        uri = task_image(Path(request.dataset) / task)
+    for task in tasks:
+        uri = task_image(Path(dataset) / task)
         if uri is None or "://" not in uri:
             continue
         key = "uri-" + hashlib.sha256(uri.encode()).hexdigest()[:40]
@@ -91,8 +100,7 @@ def cmd_stage_images(args: argparse.Namespace) -> int:
                 shutil.copyfile(src, dest / (src.name + ".part"))
                 (dest / (src.name + ".part")).replace(dest / src.name)
         staged += 1
-    print(f"staged {staged} image(s) into {dest}; {missing} not in {shared} (pulled on first use)")
-    return 0
+    return staged, missing
 
 
 def main(argv: list[str] | None = None) -> int:
