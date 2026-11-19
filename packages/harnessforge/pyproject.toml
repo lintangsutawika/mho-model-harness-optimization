@@ -11,7 +11,11 @@ dependencies = []          # the core (records, contracts, statistics) is stdlib
 platoon = ["platoon[tinker,hpc]>=0.6,<0.7"]
 # Model pool client/launcher helpers
 pool = ["httpx>=0.27"]
-dev = ["pytest>=8"]
+# Probing harness dirs (micro-swe-agent's runtime deps; litellm is stubbed by the probes)
+bench = ["jinja2>=3.1", "pydantic>=2", "pyyaml>=6", "tenacity>=8"]
+# Faster Monte Carlo for `python -m harnessforge.stats.calibrate --backend numpy` (optional)
+calibrate = ["numpy>=1.24"]
+dev = ["pytest>=8", "harnessforge[bench]"]
 
 [build-system]
 requires = ["hatchling>=1.25"]
