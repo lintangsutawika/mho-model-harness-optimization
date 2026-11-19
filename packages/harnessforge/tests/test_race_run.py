@@ -144,3 +144,27 @@ def test_cli_replay(tmp_path, capsys):
     rep = json.loads((tmp_path / "rep.json").read_text())
     assert rep["decisions"]["states"]["B"]["verdict"] == "fail"
     assert "look 1 B" in capsys.readouterr().out
+
+
+def test_cli_drive_over_file_run_jobs(tmp_path, capsys):
+    """The pilot's path: one `evals run` job per side (records.jsonl, request.json, status.json), the driver attached
+    with --side; here both jobs have already finished everything."""
+    run, sched = start({"A": A_REWARDS, "B": B_BETTER})
+    run.wait()
+    recs = run.records()
+    for side in ("A", "B"):
+        d = tmp_path / f"race-{side}"
+        d.mkdir()
+        write_jsonl(d / "records.jsonl", [r for r in recs if r.candidate == side])
+        (d / "request.json").write_text(json.dumps({"tasks": list(sched.tasks), "trials": K}))
+        (d / "status.json").write_text(json.dumps({"done": True}))
+    out = tmp_path / "race.json"
+    assert main(["drive", "--side", f"A={tmp_path / 'race-A'}", "--side", f"B={tmp_path / 'race-B'}",
+                 "--reference", "A", "--out", str(out), "--poll", "0.01", "--reverse"]) == 0
+    s = json.loads(out.read_text())
+    assert s["decisions"]["states"]["B"]["verdict"] == "pass" and s["decisions"]["states"]["B"]["look"] == 2
+    assert s["design"]["c"] == pytest.approx(1.77)
+    assert (tmp_path / "race-B" / "B.stop").exists() and (tmp_path / "race-A" / "A.stop").exists()
+    assert s["reverse"]["decisions"]["states"]["A"]["verdict"] == "fail"
+    assert s["reverse"]["decisions"]["states"]["A"]["look"] == 1
+    assert (tmp_path / "race.records.jsonl").exists()

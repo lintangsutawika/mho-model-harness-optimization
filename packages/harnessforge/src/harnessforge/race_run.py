@@ -78,6 +78,7 @@ class RaceDriver:
     """Runs the race loop on `run` (see the module docstring)."""
 
     def __init__(self, run: EvalRun, race: Race, *, poll_s: float = 60.0, drain_timeout_s: float = 900.0,
+                 drain_poll_s: float = 10.0,
                  summary_path: str | Path | None = None, records_path: str | Path | None = None,
                  log: Callable[[str], None] | None = None, clock: Callable[[], float] = time.time,
                  meta: Mapping[str, Any] | None = None) -> None:
@@ -85,6 +86,7 @@ class RaceDriver:
         self.race = race
         self.poll_s = poll_s
         self.drain_timeout_s = drain_timeout_s
+        self.drain_poll_s = drain_poll_s   # poll faster once something was stopped, to time the stop latency
         self.summary_path = Path(summary_path) if summary_path else None
         self.records_path = Path(records_path) if records_path else None
         self.log = log or (lambda s: print(s, flush=True))
@@ -122,7 +124,7 @@ class RaceDriver:
             elif self.run.done():
                 self.log("evaluation ended before the race was decided")
                 break
-            self.run.wait(timeout=self.poll_s)
+            self.run.wait(timeout=min(self.poll_s, self.drain_poll_s) if self.stops else self.poll_s)
         self.step(final=True)
         summary = self.summary()
         self._write(summary)
