@@ -54,8 +54,8 @@ Found by reading the old trial logs and probing the pilot images (`probe.py` in 
    git, python3, python_pip)`, which in *every* trial ran `apt-get update && apt-get install -y curl bash
    build-essential git python3 python3-pip` (every pilot image lacks curl and git; most lack gcc and make). The agent
    then had git/curl/gcc in its environment. `harbor_system_deps` (default on) runs the same check-and-install as the
-   harness's `[install] commands`, as root, before the agent starts. This is the one network step left; baking these
-   packages into the task images would remove it (open problem).
+   harness's `[install] commands`, as root, before the agent starts. With prepared images (`image_map`, below) the
+   check finds everything and the step installs nothing.
 2. **Dockerfile steps.** The tmax tasks name their image only as the Dockerfile's `FROM`; `hpc_sandbox_env` ran that
    image and replayed the remaining `RUN` (`mkdir -p /workspace /output /logs/verifier /root && ([ -d /app ] || ln -sf
    /workspace /app)`). platoon runs a dataset directory's task only from `[environment] docker_image`, so `dataset.py`
@@ -108,6 +108,65 @@ no process left in the group). In both, the stopped candidate's in-flight trials
 
 A node runs about one sandbox per core (tmax tasks ask for 1 CPU): `concurrency x candidates <= cores - 4`
 (`jobs.max_concurrency`). On ABCI an `rt_HC` node has 32 cores here; a full `rt_HF` node 192.
+
+## Per-trial setup on hpc-sandbox: no network installs, capped starts
+
+Both eval paths (this backend, and harbor's `scripts/optimize/eval.sh` with `HARBOR_ENV=hpcsb`) share these:
+
+- **Prepared images** (`scripts/hpcsb/prepare_images.py`, at the repo root; run once per dataset in a CPU job). It
+  pulls every image the dataset's tasks name into the shared hpc-sandbox cache, probes each for the commands
+  harbor's agent setup ensures (`curl bash gcc make git python3 pip3`), builds a derived SIF with exactly the
+  packages harbor's per-trial apt would add for each one that lacks any (`singularity build --fakeroot` from a
+  node-local copy of the cached SIF; the build has network, the trials then need none), and writes
+  `/groups/.../mho/prepared-images/image-map.json` = {image reference: SIF}. The dataset is not changed. Here:
+  provider option `image_map` (backend option `image_map`, default `$HPCSB_IMAGE_MAP`); in harbor's path:
+  `HPCSB_IMAGE_MAP`, which `eval.sh` sets to that file when it exists. A mapped SIF is copied to node-local scratch
+  once per node (harbor path). Unmapped images start as before.
+- **Start cap**: at most `max_starting` sandboxes (`$HPCSB_MAX_STARTING`, default 16, 0 = none) of the batch job are
+  being started at once. The slots are `flock`s in `$PBS_LOCALDIR/hpcsb-start-slots`, so the cap spans platoon's
+  rollout worker processes and both paths' code (`harnessforge.evals.start_gate`, `mho.backends.start_gate`).
+  platoon times no single sandbox start (hpc-sandbox's `start_timeout_s` starts after the wait); the wait counts only
+  against whole-rollout deadlines, which allow `sandbox_start_budget_s` (600 s) per start. In harbor's path the
+  slot is held from the environment start through the agent setup and is taken in a wrapper of `Trial._prepare`,
+  i.e. before harbor's `wait_for` on `environment.start` (task `build_timeout_sec`, 600 s) and on `agent.setup`
+  (360 s): a trial waiting for a slot never times out for it, and the wait is not part of its `environment_setup`
+  timing (it is the gap between the trial's `started_at` and `environment_setup.started_at`).
+- **Agent toolchain**: this backend already runs candidates from the `hf-micro-swe-1` toolchain. harbor's path now
+  does too: `scripts/hpcsb/build_toolchain.sh` builds the same lock (`assets/hf-micro-swe-1.txt`, wheels for glibc
+  >= 2.28) into `/groups/.../mho/toolchains/hf-micro-swe-1`; `hpc_sandbox_env` copies it node-local once and mounts
+  it read-only at `/opt/mho/toolchain`; `MicroSweAgent.install` uploads the snapshot as before plus a
+  `$HOME/.local/bin/mini-swe-agent` launcher that runs the candidate's `[project.scripts] mini-swe-agent` entry
+  point with the toolchain's CPython (`-I`, candidate `src/` first on `sys.path`), checks `--help` and the model
+  stack's import, and otherwise (no toolchain, a candidate depending on a package the toolchain lacks, a failed
+  check, `MHO_AGENT_INSTALL=uv`) falls back to the old per-trial `uv tool install`. `run()`'s command line is
+  unchanged.
+
+**TB2.1 (89 images, `terminal-bench-2-1-t7200`), probed in a CPU job**: lacking curl 71, gcc 60, make 72, git 71,
+python3 26, pip3 35, bash 0; 87 of 89 lack at least one (`git-multibranch` and `sam-cell-seg` have all). All are
+apt-based glibc images (Debian 11/12/13, Ubuntu 24.04); the toolchain imports in all of them (a first build with the
+build node's wheels failed on the two Debian 11 / glibc 2.31 images through cryptography's manylinux_2_34 wheel,
+hence the glibc-2.28 wheels). 85 derived images were built (5 Ubuntu ones only on a second try: apt hung past the
+build timeout with ten builds at once); the two `qemu-*` images (Debian 11) cannot be prepared: their mirror 404s on
+python3-pip's packages, so their per-trial apt fails exactly as before. The map holds all 89: 85 derived, 4 plain
+cached SIFs (which still save the per-job pull).
+
+**Before and after** (harbor path, base micro-swe-agent, Qwen3.5-4B on the 4-node SGLang pool, all 89 TB2.1 tasks
+x 1 attempt at 96 concurrent on ONE `rt_HC` job, 32 cores; per-trial seconds, median / p90 / max). Before = the
+four identical jobs `base-hpcsb-t7200/a1..a4` of the same day; after = `sandbox-setup/full96` (`HPCSB_MAX_STARTING=16`,
+82 of 89 images prepared at the time: the five Ubuntu retries and the two `qemu-*` ones still apt-installed per trial).
+
+| | before (a1..a4) | after |
+|---|---|---|
+| environment start | 189-274 / 313-550 / 454-633 | 8 / 82 / 84 |
+| agent setup | 203-298 / 312-360 / 350-360 | 10 / 12 / 360 (the one timeout below) |
+| wait for a start slot (untimed) | - | 109 / 153 / 172 |
+| EnvironmentStartTimeoutError (600 s) | 0, 0, 7, 4 | 0 |
+| AgentSetupTimeoutError (360 s) | 0, 1, 19, 14 | 1 (`adaptive-rejection-sampler`, unprepared then: its apt hung; prepared since) |
+| agent installs from the network | 89 (uv + PyPI, plus apt in 87) | 0 uv; apt in the 7 unprepared |
+| reward (sum over 89) | 15, 15, 11, 13 | 12 |
+
+The rest of the trial is unchanged (NonZeroAgentExitCodeError 45 vs 38-44, AgentTimeoutError 6 vs 0-4: the
+agent's own behaviour). A trial now reaches its agent about two minutes after launch at worst instead of up to ten.
 
 ## Records and the outcome -> env_failed mapping
 
@@ -227,9 +286,9 @@ backend calls they make are the ones in "Running it".
 - **Grading guard off.** Parity keeps the agent's processes alive through grading (both kills off), so a process the
   agent left behind could rewrite the reward files; harbor had the same exposure. Turn `harbor_keep_processes` off
   for tasks that do not need a running service once we no longer compare with harbor.
-- **Network installs.** `harbor_system_deps` (on by default, for parity) apt-installs curl/git/gcc in every trial,
-  about a minute each and a dependency on the mirrors. Baking those into the task images (or turning it off when the
-  images have them, as for the bench) removes it.
+- **Network installs.** `harbor_system_deps` (on by default, for parity) still apt-installs curl/git/gcc in a trial
+  whose image is not in the prepared-images map (a dataset nobody ran `prepare_images.py` on, or an image whose
+  derived build failed); prepare the dataset once to remove it.
 - **Multi-step tasks** are refused by platoon's Harbor loader; no-network tasks use platoon's own isolated sandbox
   (needs `allow_network_none`), not a pod; tasks whose Dockerfile has more than one distinct RUN replay are refused.
 - **One toolchain.** A candidate that adds a dependency beyond micro-swe-agent's needs a new toolchain version

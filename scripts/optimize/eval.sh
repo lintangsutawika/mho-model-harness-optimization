@@ -95,6 +95,18 @@ _HPCSB_IMG_DEFAULT="/groups/gai51740/aci18914wh/mho/hpc-sandbox-images"
 [ -n "${PBS_LOCALDIR:-}" ] && [ -d "${PBS_LOCALDIR}" ] && _HPCSB_IMG_DEFAULT="${PBS_LOCALDIR}/hpcsb-images"
 HPCSB_IMAGE_CACHE="${HPCSB_IMAGE_CACHE:-${_HPCSB_IMG_DEFAULT}}"
 HPCSB_NETWORK="${HPCSB_NETWORK:-pod}"
+# Per-trial setup without network installs (see mho.backends.hpc_sandbox_env): prepared task images
+# (scripts/hpcsb/prepare_images.py: the shared cache's SIF, or one with curl/git/gcc/python3 baked in) and the
+# read-only agent toolchain (scripts/hpcsb/build_toolchain.sh), used when present; set either to "" to disable.
+# HPCSB_MAX_STARTING (default 16, 0 = no cap): sandboxes being started + agents being set up at once.
+# MHO_AGENT_INSTALL=uv forces the old per-trial `uv tool install`.
+_HPCSB_PREP="/groups/gai51740/aci18914wh/mho/prepared-images/image-map.json"
+_HPCSB_TC="/groups/gai51740/aci18914wh/mho/toolchains/hf-micro-swe-1"
+[ -f "${_HPCSB_PREP}" ] || _HPCSB_PREP=""
+[ -x "${_HPCSB_TC}/bin/python3" ] || _HPCSB_TC=""
+export HPCSB_IMAGE_MAP="${HPCSB_IMAGE_MAP-${_HPCSB_PREP}}"
+export HPCSB_TOOLCHAIN="${HPCSB_TOOLCHAIN-${_HPCSB_TC}}"
+export HPCSB_MAX_STARTING="${HPCSB_MAX_STARTING:-16}"
 HPCSB_LLM_PORT="${HPCSB_LLM_PORT:-39317}"   # vLLM's port INSIDE each pod (unusual: tasks pick 8000/5000/...)
 UDS_FWD_PID=""
 # Singularity (on-node) knobs. The .sif cache is a PERSISTENT SHARED dir for converted task
@@ -311,6 +323,7 @@ elif [ "${HARBOR_ENV}" = "hpcsb" ]; then
   [ -n "${HPCSB_DOCKERFILE_STEPS:-}" ] && ENV_FLAGS+=( --ek "hpc_dockerfile_steps=${HPCSB_DOCKERFILE_STEPS}" )
   [ -n "${SINGULARITY_MEMORY_MB}" ] && ENV_FLAGS+=( --ek "override_memory_mb=${SINGULARITY_MEMORY_MB}" )
   for _kv in ${HPCSB_EXTRA_EK:-}; do ENV_FLAGS+=( --ek "${_kv}" ); done
+  echo "[hpcsb] image map: ${HPCSB_IMAGE_MAP:-none}; agent toolchain: ${HPCSB_TOOLCHAIN:-none (per-trial uv install)}; max starting: ${HPCSB_MAX_STARTING}"
 elif [ "${HARBOR_ENV}" = "sail" ]; then
   ENV_FLAGS=( --environment-import-path "${SAIL_IMPORT}" )
   [ "${SAIL_FORCE_BUILD}" = "1" ] && ENV_FLAGS+=( --force-build )

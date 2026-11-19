@@ -33,7 +33,11 @@ Options (`EvalRequest.options`):
     provider_options  its options (image_cache, scratch_root, fakeroot, allow_network_none, pod_users, ...)
     agent_timeout_multiplier, verifier_timeout_multiplier   as harbor's --agent-timeout-multiplier (default 1.0)
     harbor_system_deps  apt/dnf/apk-install curl, bash, gcc/make, git, python3, pip3 when missing, before the agent
-                      runs, as harbor's installed-agent setup does in every trial (default True: parity with harbor)
+                      runs, as harbor's installed-agent setup does in every trial (default True: parity with harbor);
+                      a no-op check on prepared images (image_map)
+    image_map         prepared-images map {image reference: SIF} (scripts/hpcsb/prepare_images.py; default
+                      $HPCSB_IMAGE_MAP): tasks start from SIFs that already hold those packages, so no trial runs apt
+    max_starting      sandboxes being started at once in the job (default $HPCSB_MAX_STARTING, else 16; 0 = no cap)
     harbor_keep_processes  grade with the processes the agent left running alive, as harbor does (default True). platoon
                       kills them twice: every process of the harness launch when the harness exits (the runner's
                       --keep-children unmarks the agent's commands), and every process in the sandbox before the
@@ -250,6 +254,10 @@ class PlatoonBackend:
         if opts.get("provider", DEFAULT_PROVIDER) == DEFAULT_PROVIDER:
             # harbor grades with the agent's processes alive (servers a task asked for); platoon kills them first
             provider_options.setdefault("keep_agent_processes", bool(opts.get("harbor_keep_processes", True)))
+            if image_map := opts.get("image_map", os.environ.get("HPCSB_IMAGE_MAP")):
+                provider_options.setdefault("image_map", str(image_map))
+            if opts.get("max_starting") is not None:
+                provider_options.setdefault("max_starting", int(opts["max_starting"]))
         service_kwargs = {
             "dataset_dir": str(dataset_dir),
             "splits": {"eval": list(request.tasks)},

@@ -18,6 +18,20 @@ left running before the tests run (so nothing forges the reward), which fails ev
 the agent was asked to leave running (tmax has many: "start the API on 0.0.0.0:8080"). Harbor, and so our old path,
 grades with those processes alive; keep them for parity, at the cost of that guard.
 
+Two options keep per-trial setup cheap on a 32-core node running ~100 trials:
+
+- `image_map`: a JSON file {image reference: SIF path} (`scripts/hpcsb/prepare_images.py` at the repo root writes
+  it). A mapped task starts from that SIF: the image from the shared cache, or one derived from it with curl, git,
+  gcc/make, python3 and pip3 baked in, so the `harbor_system_deps` step finds them and installs nothing. References
+  match with or without `docker://`; an unmapped one starts as before.
+- `max_starting` (default `$HPCSB_MAX_STARTING`, else 16; 0 = no cap): at most that many sandboxes of the batch job
+  are being started at once (`start_gate`: flocks in a node-local directory, so the cap spans platoon's rollout
+  worker processes and is shared with the harbor path's `mho.backends.start_gate`). A start beyond the cap waits for
+  a slot before anything is started. platoon times no single sandbox start (hpc-sandbox's own `start_timeout_s`
+  starts after the wait); the wait counts only against the whole-rollout deadlines, which add
+  `sandbox_start_budget_s` (600 s) per start, and a slot is held for seconds, so with 96 trials and 16 slots the
+  longest wait is about six starts.
+
 Select it in a Harbor entry: `provider: harnessforge.evals.pods:PodSingularityProvider`, with the usual singularity
 `provider_options` (image_cache, scratch_root, fakeroot, ...) plus `pod_users` and `keep_agent_processes`.
 """
@@ -25,6 +39,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 from platoon.sandbox import cleanup
@@ -32,6 +49,23 @@ from platoon.sandbox.hpc import HpcSandbox
 from platoon.sandbox.routes import FIRST_PORT, parse_upstreams
 from platoon.sandbox.singularity import SingularityProvider
 from platoon.utils.stopping import let_finish
+
+from harnessforge.evals.start_gate import DEFAULT_MAX_STARTING, StartGate
+
+
+def load_image_map(path: str | os.PathLike | None) -> dict[str, str]:
+    """{image reference: SIF path} from a prepared-images map; {} when unset or missing."""
+    if not path or not Path(path).is_file():
+        return {}
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"image map {path} is not a JSON object")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def mapped_image(image_map: dict[str, str], ref: str) -> str | None:
+    bare = ref.removeprefix("docker://")
+    return image_map.get(ref) or image_map.get(bare) or image_map.get(f"docker://{bare}")
 
 
 class _PodRoutes:
@@ -72,14 +106,21 @@ class PodSandbox(_KeepingSandbox):
 
 
 class PodSingularityProvider(SingularityProvider):
-    def __init__(self, *, pod_users: str = "subids", keep_agent_processes: bool = False, **options: Any) -> None:
+    def __init__(self, *, pod_users: str = "subids", keep_agent_processes: bool = False,
+                 image_map: str | None = None, max_starting: int | None = None, **options: Any) -> None:
         if pod_users not in ("subids", "single"):
             raise ValueError(f"pod_users must be subids or single, not {pod_users!r}")
         super().__init__(**options)
         self.pod_users = pod_users
         self.keep_agent_processes = bool(keep_agent_processes)
+        self.image_map = load_image_map(image_map)
+        if max_starting is None:
+            raw = os.environ.get("HPCSB_MAX_STARTING", "").strip()
+            max_starting = int(raw) if raw else DEFAULT_MAX_STARTING
+        self.start_gate = StartGate(max_starting)
         # what a reap rebuilds the provider from
-        self.options = {**self.options, "pod_users": pod_users, "keep_agent_processes": self.keep_agent_processes}
+        self.options = {**self.options, "pod_users": pod_users, "keep_agent_processes": self.keep_agent_processes,
+                        "image_map": image_map, "max_starting": max_starting}
         # Its sandboxes do not share this host's network: the harness reaches the gateway through the pod's route.
         self.capabilities = frozenset(self.capabilities - {"host_loopback"})
 
@@ -87,8 +128,14 @@ class PodSingularityProvider(SingularityProvider):
         return _KeepingSandbox(self, inner, routes=routes)  # no-network tasks' single sandboxes
 
     async def start(self, spec: Any) -> HpcSandbox:
-        if spec.network == "none":
-            return await super().start(spec)
+        if mapped := mapped_image(self.image_map, spec.image or ""):
+            spec = dataclasses.replace(spec, image=mapped)
+        async with self.start_gate.slot():
+            if spec.network == "none":
+                return await super().start(spec)
+            return await self._start_pod(spec)
+
+    async def _start_pod(self, spec: Any) -> HpcSandbox:
         hs = self.hpc_sandbox
         upstreams: dict[str, str] = {}
         for upstream in parse_upstreams(spec.upstreams):

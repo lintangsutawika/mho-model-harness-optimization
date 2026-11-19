@@ -13,6 +13,19 @@ from harbor.models.task.config import EnvironmentConfig  # noqa: E402
 from harbor.models.trial.paths import TrialPaths  # noqa: E402
 
 from mho.backends import hpc_sandbox_env as he  # noqa: E402
+from mho.backends.start_gate import StartGate  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_setup_knobs(tmp_path, monkeypatch):
+    """No prepared images or toolchain from the caller's environment; a private start-slot dir."""
+    for var in ("HPCSB_IMAGE_MAP", "HPCSB_TOOLCHAIN", "HPCSB_TOOLCHAIN_STAGE", "HPCSB_IMAGE_STAGE",
+                "HPCSB_MAX_STARTING"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HPCSB_START_SLOT_DIR", str(tmp_path / "slots"))
+    monkeypatch.setattr(he, "_GATE", None)
+    monkeypatch.setattr(he, "_STAGED", {})
+    monkeypatch.setattr(he, "_STAGE_LOCKS", {})
 
 
 # --- Dockerfile parsing -------------------------------------------------------------------------
@@ -290,3 +303,122 @@ def test_uds_forward_round_trip():
         assert not (sockdir / "f.sock").exists()
     finally:
         sockdir.rmdir()
+
+
+# --- prepared images, agent toolchain, start cap -------------------------------------------------
+
+
+def test_image_map_replaces_the_reference(tmp_path, monkeypatch):
+    m = tmp_path / "image-map.json"
+    m.write_text('{"img:t": "/prep/img-sysdeps.sif"}')
+    monkeypatch.setenv("HPCSB_IMAGE_MAP", str(m))
+    e, prov = _env(tmp_path, monkeypatch, hpc_network="host")
+    asyncio.run(e.start(force_build=False))
+    assert prov.started[0].spec.image == "/prep/img-sysdeps.sif"
+    e2, prov2 = _env(tmp_path / "2", monkeypatch, hpc_network="host", hpc_image_map=str(tmp_path / "absent.json"))
+    asyncio.run(e2.start(force_build=False))
+    assert prov2.started[0].spec.image == "docker://img:t"  # a missing map maps nothing
+
+
+def test_mapped_sif_staged_to_node_local_scratch(tmp_path, monkeypatch):
+    sif = tmp_path / "shared" / "sha256-abc.sif"
+    sif.parent.mkdir()
+    sif.write_bytes(b"SIF")
+    m = tmp_path / "image-map.json"
+    m.write_text('{"docker://img:t": "%s"}' % sif)
+    monkeypatch.setenv("HPCSB_IMAGE_MAP", str(m))
+    e, prov = _env(tmp_path, monkeypatch, hpc_network="host", hpc_scratch_root=str(tmp_path / "scr"))
+    asyncio.run(e.start(force_build=False))
+    staged = Path(prov.started[0].spec.image)
+    assert staged.parent == tmp_path / "scr" / "mho-images" and staged.read_bytes() == b"SIF"
+    assert staged.name.endswith("sha256-abc.sif")
+    monkeypatch.setenv("HPCSB_IMAGE_STAGE", "0")
+    e2, prov2 = _env(tmp_path / "2", monkeypatch, hpc_network="host")
+    asyncio.run(e2.start(force_build=False))
+    assert prov2.started[0].spec.image == str(sif)
+
+
+def _toolchain(root):
+    (root / "bin").mkdir(parents=True)
+    (root / "bin" / "python3").write_text("#!/bin/sh\n")
+    (root / "bin" / "python3").chmod(0o755)
+    (root / "manifest.json").write_text('{"packages": {"litellm": "1", "PyYAML": "6", "Jinja2": "3"}}')
+    return root
+
+
+def test_toolchain_staged_once_and_mounted_read_only(tmp_path, monkeypatch):
+    tc = _toolchain(tmp_path / "tc")
+    scratch = tmp_path / "scr"
+    e, prov = _env(tmp_path / "a", monkeypatch, hpc_network="host", hpc_toolchain=str(tc), hpc_scratch_root=str(scratch))
+    assert e.agent_toolchain == (he.TOOLCHAIN_MOUNT, frozenset({"litellm", "pyyaml", "jinja2"}))
+    asyncio.run(e.start(force_build=False))
+    (mount,) = [m for m in prov.started[0].spec.mounts if m.target == he.TOOLCHAIN_MOUNT]
+    assert mount.read_only and Path(mount.source).parent == scratch / "mho-toolchains"
+    assert (Path(mount.source) / "bin" / "python3").is_file()
+    he._STAGED.clear()  # another process on the node: reuses the copy
+    (tc / "bin" / "python3").write_text("changed")
+    e2, prov2 = _env(tmp_path / "b", monkeypatch, hpc_network="host", hpc_toolchain=str(tc), hpc_scratch_root=str(scratch))
+    asyncio.run(e2.start(force_build=False))
+    (mount2,) = [m for m in prov2.started[0].spec.mounts if m.target == he.TOOLCHAIN_MOUNT]
+    assert mount2.source == mount.source and (Path(mount.source) / "bin" / "python3").read_text() == "#!/bin/sh\n"
+    monkeypatch.setenv("HPCSB_TOOLCHAIN_STAGE", "0")
+    e3, prov3 = _env(tmp_path / "c", monkeypatch, hpc_network="host", hpc_toolchain=str(tc))
+    asyncio.run(e3.start(force_build=False))
+    assert [m.source for m in prov3.started[0].spec.mounts if m.target == he.TOOLCHAIN_MOUNT] == [str(tc)]
+    e4, _ = _env(tmp_path / "d", monkeypatch, hpc_toolchain=str(tmp_path / "nothing"))
+    assert e4.agent_toolchain is None
+
+
+def test_start_gate_caps_concurrency_across_gates(tmp_path):
+    gate = StartGate(2, tmp_path / "s", poll_s=(0.01, 0.02))
+    active, peak = [0], [0]
+
+    async def one():
+        async with gate.slot():
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+            await asyncio.sleep(0.05)
+            active[0] -= 1
+
+    async def main():
+        await asyncio.gather(*(one() for _ in range(7)))
+    asyncio.run(main())
+    assert peak[0] == 2 and gate.held() == 0
+    other = StartGate(2, tmp_path / "s")  # another process's gate on the same dir: the flocks conflict
+    a, _ = asyncio.run(gate.acquire())
+    b, _ = asyncio.run(other.acquire())
+    assert gate.held() == 2 and gate._try_take() is None
+    gate.release(a)
+    other.release(b)
+    assert gate.held() == 0
+    off = StartGate(0, tmp_path / "s")
+    assert asyncio.run(off.acquire()) == (None, 0.0) and not off.enabled
+
+
+def test_trial_wrapper_holds_slot_outside_harbor_timeouts(tmp_path, monkeypatch):
+    """The slot is taken before harbor's wait_for(environment.start(), ...): a long wait for a slot does not time
+    out the start, start() does not take a second slot, and the slot is free again after agent setup."""
+    monkeypatch.setenv("HPCSB_MAX_STARTING", "1")
+    e, prov = _env(tmp_path, monkeypatch, hpc_network="host")
+    gate = he.start_gate()
+    seen = {}
+
+    async def original(trial):  # harbor's _prepare: timed env start, then agent setup
+        await asyncio.wait_for(trial.agent_environment.start(force_build=False), timeout=0.3)
+        seen["held"], seen["flag"] = gate.held(), trial.agent_environment._slot_from_trial
+
+    class FakeTrial:
+        agent_environment = e
+
+    async def main():
+        blocker, _ = await gate.acquire()
+        asyncio.get_running_loop().call_later(0.6, gate.release, blocker)  # longer than the 0.3 s start timeout
+        await he.gated_prepare(original)(FakeTrial())
+    asyncio.run(main())
+    assert seen == {"held": 1, "flag": True} and prov.started
+    assert gate.held() == 0 and not e._slot_from_trial
+
+
+def test_trial_gate_installed_on_harbor():
+    from harbor.trial.trial import Trial
+    assert getattr(Trial._prepare, "_hpcsb_gated", False) and he._install_trial_gate()

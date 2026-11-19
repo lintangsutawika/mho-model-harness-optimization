@@ -24,10 +24,14 @@ Run it:
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
+import shlex
 import tarfile
 import tempfile
+import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,6 +45,55 @@ _SCAFFOLD_SANDBOX_DIR = "/tmp/micro-scaffold"
 # micro_swe_agent.py is at <repo>/src/harness/ (3 levels); parents[2] = repo root, so a
 # relative mini_fork_local resolves against the repo, not <repo>/src.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+# MHO_AGENT_INSTALL=uv forces the old per-trial `uv tool install` (network) even when the environment mounts a
+# toolchain; "auto" (default) uses the toolchain when it can run the candidate.
+_INSTALL_MODE_ENV = "MHO_AGENT_INSTALL"
+# The console script the inherited run() calls.
+_SCRIPT = "mini-swe-agent"
+# What the old install added next to the candidate's own dependencies (`--with ...`).
+_WITH = ("litellm", "mcp", "orjson", "fastapi")
+
+
+def _dist_name(requirement: str) -> str:
+    return re.split(r"[<>=!~;\[ (@]", requirement.strip(), maxsplit=1)[0].strip().lower().replace("_", "-").replace(".", "-")
+
+
+def toolchain_plan(scaffold: Path, packages: frozenset[str]) -> tuple[str, str, str] | str:
+    """How to run the candidate at `scaffold` from a toolchain holding `packages`: (sys.path entry relative to the
+    snapshot, module, function) of its `mini-swe-agent` console script, or a string saying why it cannot (then the
+    agent installs per trial, as before).
+
+    The candidate's `[project] dependencies` must all be in the toolchain (a candidate that adds one needs the
+    per-trial install or a toolchain rebuild with the new lock); its entry point must be `module:function` in a
+    package under `src/` (hatch's layout) or at the snapshot root."""
+    try:
+        project = tomllib.loads((scaffold / "pyproject.toml").read_text()).get("project", {})
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return f"unreadable pyproject.toml: {e}"
+    if not packages:
+        return "the toolchain lists no packages (no manifest.json)"
+    missing = sorted({_dist_name(d) for d in project.get("dependencies", [])} - packages)
+    if missing:
+        return f"needs {missing}, which the toolchain does not hold"
+    entry = (project.get("scripts") or {}).get(_SCRIPT, "")
+    module, _, func = entry.partition(":")
+    if not module or not func or not re.fullmatch(r"[A-Za-z_][\w.]*", module) or not func.isidentifier():
+        return f"no `{_SCRIPT} = module:function` entry point (got {entry!r})"
+    top = module.split(".")[0]
+    for rel in ("src", "."):
+        base = scaffold / rel
+        if (base / top).is_dir() or (base / f"{top}.py").is_file():
+            return rel, module, func
+    return f"package {top!r} is neither under src/ nor at the snapshot root"
+
+
+def launcher(python: str, path_entry: str, module: str, func: str) -> str:
+    """The `mini-swe-agent` script put on the agent's PATH: the toolchain's interpreter, isolated (-I: no PYTHON*
+    variables, no user site, no cwd on sys.path), with the candidate's code first on sys.path, calling its entry
+    point the way a console script does."""
+    code = (f"import sys; sys.path.insert(0, {path_entry!r}); sys.argv[0] = {_SCRIPT!r}; "
+            f"from {module} import {func} as _main; sys.exit(_main())")
+    return f"#!/bin/sh\nexec {shlex.quote(python)} -I -c {shlex.quote(code)} \"$@\"\n"
 
 
 class MicroSweAgent(MiniSweAgent):
@@ -80,8 +133,14 @@ class MicroSweAgent(MiniSweAgent):
         )
 
     async def install(self, environment) -> None:  # type: ignore[override]
-        """Agent-setup hook (runs in the sandbox). Upload the snapshot + `uv tool install`
-        it, giving the sandbox the `mini-swe-agent` binary from THIS candidate's code."""
+        """Agent-setup hook (runs in the sandbox): give the sandbox a `mini-swe-agent` that runs THIS candidate.
+
+        With a toolchain mounted by the environment (hpc_sandbox_env's `agent_toolchain`, $HPCSB_TOOLCHAIN) and a
+        candidate it can run (`toolchain_plan`), nothing is downloaded: the snapshot is uploaded as before and a
+        small launcher in $HOME/.local/bin runs its entry point with the toolchain's CPython. Otherwise -- no
+        toolchain (modal/sail/singularity), a candidate needing a package the toolchain lacks, a launcher that does
+        not start, or MHO_AGENT_INSTALL=uv -- the old per-trial `uv tool install` from PyPI runs. Either way run()
+        calls the same `mini-swe-agent` command line."""
         if not self._scaffold_dir:
             raise ValueError(
                 "No scaffold snapshot set. Pass --ak mini_fork_local=<dir> or set "
@@ -93,6 +152,12 @@ class MicroSweAgent(MiniSweAgent):
         if not (src / "pyproject.toml").exists():
             raise FileNotFoundError(f"scaffold {src} is not an installable package (no pyproject.toml)")
 
+        plan: tuple[str, str, str] | str = "MHO_AGENT_INSTALL=uv"
+        force = False  # a failed launcher left $HOME/.local/bin/mini-swe-agent, which uv must overwrite
+        toolchain = getattr(environment, "agent_toolchain", None)
+        if os.environ.get(_INSTALL_MODE_ENV, "auto") != "uv":
+            plan = toolchain_plan(src, toolchain[1]) if toolchain else "the environment mounts no agent toolchain"
+
         # Ship the candidate into the sandbox as a single tarball rather than
         # environment.upload_dir() (which stages via copytree + a two-`cp` merge and
         # races under concurrent trials). The sandbox's writable-tmpfs is fuse-overlayfs,
@@ -101,8 +166,8 @@ class MicroSweAgent(MiniSweAgent):
         # spuriously fails ("rm: cannot remove '.../models': Is a directory"). So we do
         # NEITHER: extract to a FRESH, unique dir per install via a single `tar` that
         # creates the dir itself when extracting into the always-present /tmp. The
-        # sandbox is ephemeral (per-trial, delete=True), so nothing needs cleaning up,
-        # and `uv tool install` below points at this unique dir.
+        # sandbox is ephemeral (per-trial, delete=True), so nothing needs cleaning up.
+        # The toolchain path also ships its launcher in the same tarball (<dir>/.mho-bin/).
         _parent = str(Path(_SCAFFOLD_SANDBOX_DIR).parent)          # /tmp
         _uid = uuid.uuid4().hex
         _leaf = f"{Path(_SCAFFOLD_SANDBOX_DIR).name}-{_uid}"       # micro-scaffold-<uid>
@@ -112,6 +177,13 @@ class MicroSweAgent(MiniSweAgent):
             tar_path = Path(_td) / tar_name
             with tarfile.open(tar_path, "w:gz") as _tf:
                 _tf.add(src, arcname=_leaf)
+                if not isinstance(plan, str):
+                    rel, module, func = plan
+                    entry = scaffold_dir if rel == "." else f"{scaffold_dir}/{rel}"
+                    data = launcher(f"{toolchain[0]}/bin/python3", entry, module, func).encode()
+                    info = tarfile.TarInfo(f"{_leaf}/.mho-bin/{_SCRIPT}")
+                    info.size, info.mode = len(data), 0o755
+                    _tf.addfile(info, io.BytesIO(data))
             remote_tar = f"/tmp/{tar_name}"
             await environment.upload_file(tar_path, remote_tar)
         await self.exec_as_root(
@@ -119,13 +191,36 @@ class MicroSweAgent(MiniSweAgent):
             command=f"set -eu; tar xzf {remote_tar} -C {_parent}",
         )
 
-        # Mirror harbor's own mini install (system deps + uv bootstrap), but install from
-        # the uploaded snapshot. Same console-script name (`mini-swe-agent`) + the same
-        # `--with` extras, so the inherited run() invocation resolves unchanged.
+        # Mirror harbor's own mini install: system deps first (a no-op check on a prepared image, see
+        # scripts/hpcsb/prepare_images.py; the agent's environment keeps git/curl/gcc/python3 either way).
         await self.ensure_system_dependencies(
             environment,
             ("curl", "bash", "build_tools", "git", "python3", "python_pip"),
         )
+        if not isinstance(plan, str):
+            # Put the launcher where run() looks ($HOME/.local/bin, on PATH there); retried because a fresh
+            # directory on fuse-overlayfs can be briefly invisible under load (see above).
+            try:
+                await self.exec_as_agent(
+                    environment,
+                    command=(
+                        'for i in 1 2 3; do mkdir -p "$HOME/.local/bin" && '
+                        f'cp {scaffold_dir}/.mho-bin/{_SCRIPT} "$HOME/.local/bin/{_SCRIPT}.tmp" && '
+                        f'mv -f "$HOME/.local/bin/{_SCRIPT}.tmp" "$HOME/.local/bin/{_SCRIPT}" && break; sleep 1; done; '
+                        'export PATH="$HOME/.local/bin:$PATH"; '
+                        f"{_SCRIPT} --help >/dev/null && "
+                        # --help may not import the model stack; a toolchain whose wheels need a newer glibc than
+                        # the image's must fall back here, not crash the agent's first model call.
+                        f'{shlex.quote(toolchain[0])}/bin/python3 -I -c "import litellm, mcp.types"'
+                    ),
+                    env={"LITELLM_LOCAL_MODEL_COST_MAP": "True"},
+                    timeout_sec=300,
+                )
+                self.logger.debug(f"mini-swe-agent runs from the toolchain at {toolchain[0]}")
+                return
+            except RuntimeError as e:
+                plan, force = f"the toolchain launcher failed: {str(e)[-300:]}", True
+        self.logger.info(f"installing mini-swe-agent per trial with uv: {plan}")
         await self.exec_as_agent(
             environment,
             command=(
@@ -142,10 +237,10 @@ class MicroSweAgent(MiniSweAgent):
                 # Pin the interpreter: with no python >=3.11 in the image, uv downloads the newest
                 # CPython, and on a release too new for wheels (3.15) fastuuid/orjson build from
                 # Rust source and fail.
-                f"uv tool install --python 3.12 {scaffold_dir} "
+                f"uv tool install {'--force ' if force else ''}--python 3.12 {scaffold_dir} "
                 # mcp: litellm's response handler imports mcp.types; without it every agent
                 # trial crashes with ModuleNotFoundError. Pin alongside litellm.
-                "--with litellm --with mcp --with orjson --with fastapi && "
+                + " ".join(f"--with {w}" for w in _WITH) + " && "
                 "mini-swe-agent --help"
             ),
         )

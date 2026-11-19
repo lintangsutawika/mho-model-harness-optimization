@@ -32,6 +32,24 @@ command under the WORKDIR/ENV in effect at that line, plain COPY/ADD (build-cont
 "ignore" skips build steps, "warn" skips and logs them, "error" fails any task that has them.
 docker-compose files are ignored (single-service tasks only).
 
+Prepared images (hpc_image_map / $HPCSB_IMAGE_MAP): a JSON file {image reference: /abs/path.sif} written by
+scripts/hpcsb/prepare_images.py. A mapped task starts from that SIF instead of pulling its reference: the image from
+the shared cache, or one derived from it with the system packages harbor's agent setup would otherwise apt-install in
+every trial (curl, bash, gcc/make, git, python3, pip3). The dataset is not changed. A mapped SIF is copied to node-local
+scratch once per node before use ($HPCSB_IMAGE_STAGE=0 starts it from shared storage).
+
+Agent toolchain (hpc_toolchain / $HPCSB_TOOLCHAIN): a prebuilt CPython 3.12 with the agent's packages
+(scripts/hpcsb/build_toolchain.sh), copied once per node to local scratch and bind-mounted read-only at
+/opt/mho/toolchain in every sandbox; harness.micro_swe_agent runs the candidate from it instead of `uv tool install`ing
+it from PyPI in every trial ($HPCSB_TOOLCHAIN_STAGE=0 mounts it from where it is).
+
+Start cap ($HPCSB_MAX_STARTING, default 16, 0 = none; mho.backends.start_gate): at most that many trials of the job
+are between "start the sandbox" and "agent set up" at once. Importing this module wraps harbor's Trial._prepare
+(environment start + healthcheck + agent setup) so the slot is taken BEFORE harbor's timed regions: the wait does not
+count against the environment-start (task build_timeout_sec, 600 s) or agent-setup (360 s) timeouts, and is not part
+of the trial's environment_setup timing (logged instead). Without that wrapper (another trial class), start() takes
+the slot for the sandbox start only.
+
 Docker Hub pulls are authenticated if SINGULARITY_DOCKER_USERNAME / SINGULARITY_DOCKER_PASSWORD
 (or APPTAINER_*) are set in the environment, as singularity reads them itself.
 
@@ -40,16 +58,23 @@ hpc_image_cache, hpc_fakeroot (default True: root inside, as Docker tasks expect
 hpc_exec_timeout_s (default 86400: harbor passes no timeout for whole agent loops),
 hpc_output_limit_mb (default 64), hpc_allow_network_none (default False),
 hpc_dockerfile_steps ("run" | "error" | "warn" | "ignore", default "run"), hpc_start_timeout_s,
-hpc_network ("pod" | "host" | "none"), hpc_pod_users ("subids" | "single"), hpc_upstreams.
-Env: HPC_SANDBOX_* as hpc-sandbox documents (e.g. HPC_SANDBOX_IMAGE_CACHE).
+hpc_network ("pod" | "host" | "none"), hpc_pod_users ("subids" | "single"), hpc_upstreams, hpc_image_map,
+hpc_toolchain.
+Env: HPC_SANDBOX_* as hpc-sandbox documents (e.g. HPC_SANDBOX_IMAGE_CACHE); HPCSB_IMAGE_MAP, HPCSB_TOOLCHAIN,
+HPCSB_TOOLCHAIN_STAGE, HPCSB_MAX_STARTING, HPCSB_START_SLOT_DIR.
 """
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import functools
+import hashlib
 import json
 import os
 import shlex
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -59,7 +84,109 @@ from harbor.environments.capabilities import (
     EnvironmentResourceCapabilities,
 )
 
+from mho.backends.start_gate import StartGate
+
 _PROVIDERS: dict[tuple, Any] = {}
+#: Where the agent toolchain appears in every sandbox (harness.micro_swe_agent runs mini-swe-agent from it).
+TOOLCHAIN_MOUNT = "/opt/mho/toolchain"
+_GATE: StartGate | None = None
+_STAGED: dict[str, Path] = {}
+_STAGE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def start_gate() -> StartGate:
+    global _GATE
+    if _GATE is None:
+        _GATE = StartGate.from_env()
+    return _GATE
+
+
+@functools.lru_cache(maxsize=8)
+def _read_image_map(path: str, mtime: float) -> dict[str, str]:
+    data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"image map {path} is not a JSON object")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def load_image_map(path: str | None) -> dict[str, str]:
+    """{image reference: SIF path} from a prepared-images map; {} when unset or missing."""
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        return {}
+    return _read_image_map(str(p), p.stat().st_mtime)
+
+
+def mapped_image(image_map: dict[str, str], ref: str) -> str | None:
+    """The prepared SIF for `ref`, spelled with or without docker://."""
+    bare = ref.removeprefix("docker://")
+    return image_map.get(ref) or image_map.get(bare) or image_map.get(f"docker://{bare}")
+
+
+def toolchain_packages(toolchain: str | Path) -> frozenset[str]:
+    """Normalized distribution names the toolchain holds (its manifest.json), lower-case with '-'."""
+    try:
+        packages = json.loads((Path(toolchain) / "manifest.json").read_text()).get("packages", {})
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(_norm(name) for name in packages)
+
+
+def _norm(name: str) -> str:
+    return name.strip().lower().replace("_", "-").replace(".", "-")
+
+
+def _stage_copy(src: Path, scratch: Path) -> Path:
+    """Copy `src` (a file, or a directory such as the toolchain) into node-local `scratch` once per node: a lock and
+    a done-marker make concurrent processes share one copy. The copy's name carries a key of the source (a
+    directory's manifest.json hash, a file's size and mtime), so a rebuilt source is copied anew."""
+    if src.is_dir():
+        manifest = src / "manifest.json"
+        key = hashlib.sha256(manifest.read_bytes()).hexdigest()[:12] if manifest.is_file() else "nomanifest"
+        dest = scratch / f"{src.name}-{key}"
+    else:
+        st = src.stat()
+        dest = scratch / f"{st.st_size}-{int(st.st_mtime)}-{src.name}"
+    done = scratch / f".{dest.name}.done"
+    if done.is_file() and dest.exists():
+        return dest
+    scratch.mkdir(parents=True, exist_ok=True)
+    fd = os.open(scratch / f".{dest.name}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        if done.is_file() and dest.exists():
+            return dest
+        if dest.exists():
+            dest.rename(scratch / f".{dest.name}.partial-{os.getpid()}-{int(time.time())}")
+        tmp = scratch / f".{dest.name}.tmp-{os.getpid()}"
+        if src.is_dir():
+            shutil.copytree(src, tmp, symlinks=True)
+        else:
+            shutil.copyfile(src, tmp)
+            tmp.chmod(0o444)
+        tmp.rename(dest)
+        done.touch()
+        return dest
+    finally:
+        os.close(fd)
+
+
+async def stage_copy(src: str | Path, scratch: str | Path) -> Path:
+    """The node-local copy of `src` (copied in a thread on first use; once per process and per node)."""
+    key = f"{Path(src).resolve()}|{scratch}"
+    if key in _STAGED:
+        return _STAGED[key]
+    async with _STAGE_LOCKS.setdefault(key, asyncio.Lock()):  # one copy per source; different sources in parallel
+        if key not in _STAGED:
+            _STAGED[key] = await asyncio.to_thread(_stage_copy, Path(src).resolve(), Path(scratch))
+    return _STAGED[key]
+
+
+stage_toolchain = stage_copy
+
+
 # Harbor agents write bash; images without bash (alpine) still get sh.
 _BASH_OR_SH = 'if command -v bash >/dev/null 2>&1; then exec bash -c "$1"; else exec sh -c "$1"; fi'
 # Dockerfile instructions that only describe the image (or are harmless to skip).
@@ -243,6 +370,8 @@ class HpcSandboxEnvironment(BaseEnvironment):
         hpc_network: str = "pod",
         hpc_pod_users: str = "subids",
         hpc_upstreams: str | None = None,
+        hpc_image_map: str | None = None,
+        hpc_toolchain: str | None = None,
         **kwargs: Any,
     ):
         # capabilities/_validate_definition read these during super().__init__
@@ -254,6 +383,13 @@ class HpcSandboxEnvironment(BaseEnvironment):
         self._allow_network_none = _truthy(hpc_allow_network_none)
         self._dockerfile_steps = hpc_dockerfile_steps
         self._dockerfile = DockerfileInfo(Path(environment_dir) / "Dockerfile")
+        self._image_map_path = hpc_image_map if hpc_image_map is not None else os.environ.get("HPCSB_IMAGE_MAP")
+        tc = hpc_toolchain if hpc_toolchain is not None else os.environ.get("HPCSB_TOOLCHAIN")
+        self._toolchain = Path(tc) if tc and (Path(tc) / "bin" / "python3").exists() else None
+        if tc and self._toolchain is None and logger is not None:
+            logger.warning(f"hpc_toolchain {tc} has no bin/python3: agents install per trial")
+        self._scratch_root = hpc_scratch_root
+        self._slot_from_trial = False  # set by the Trial._prepare wrapper while it holds this trial's start slot
         super().__init__(environment_dir=environment_dir, environment_name=environment_name,
                          session_id=session_id, trial_paths=trial_paths,
                          task_env_config=task_env_config, logger=logger, **kwargs)
@@ -350,8 +486,17 @@ class HpcSandboxEnvironment(BaseEnvironment):
     def _workdir(self) -> str:
         return self.task_env_config.workdir or self._dockerfile.workdir or "/app"
 
+    @property
+    def agent_toolchain(self) -> tuple[str, frozenset[str]] | None:
+        """(where the agent toolchain is mounted in the sandbox, the packages it holds), or None without one."""
+        if self._toolchain is None:
+            return None
+        return TOOLCHAIN_MOUNT, toolchain_packages(self._toolchain)
+
     def _image_ref(self) -> str:
         ref = self.image or ""
+        if mapped := mapped_image(load_image_map(self._image_map_path), ref):
+            return mapped
         if ref.endswith(".sif") or ref.endswith(".sqsh") or "://" in ref:
             return ref
         return f"docker://{ref}"
@@ -364,10 +509,18 @@ class HpcSandboxEnvironment(BaseEnvironment):
                   for m in self._mounts if m.get("type", "bind") == "bind" and m.get("source")]
         for m in mounts:
             Path(m.source).mkdir(parents=True, exist_ok=True)
+        if self._toolchain is not None:
+            source = self._toolchain
+            if os.environ.get("HPCSB_TOOLCHAIN_STAGE", "1") not in ("0", "false", "no"):
+                try:
+                    source = await stage_copy(self._toolchain, self._stage_scratch() / "mho-toolchains")
+                except Exception as e:  # noqa: BLE001 - the shared copy still works, only slower
+                    self.logger.warning(f"staging toolchain {self._toolchain} failed ({e}); mounting it in place")
+            mounts.append(hs.Mount(source=str(source), target=TOOLCHAIN_MOUNT, read_only=True))
         labels = {"harbor": "1", "pbs_job": os.environ.get("PBS_JOBID", "")[:60]}
         no_net = self._network_disabled or self._network_mode == "none"
         spec = hs.SandboxSpec(
-            image=self._image_ref(),
+            image=await self._staged_image(self._image_ref()),
             workdir=self._workdir,
             env={**self._dockerfile.env, **self._startup_env()},
             mounts=mounts,
@@ -383,10 +536,11 @@ class HpcSandboxEnvironment(BaseEnvironment):
             except Exception as e:  # a refresh is best-effort; start() pulls if needed
                 self.logger.warning(f"refresh pull of {spec.image} failed: {e}")
         try:
-            if self._network_mode == "pod":
-                await self._start_pod(provider, spec, labels, egress=not no_net)
+            if self._slot_from_trial:  # the Trial._prepare wrapper holds this trial's slot
+                await self._start_sandbox(provider, spec, labels, no_net)
             else:
-                self._sandbox = await provider.start(spec)
+                async with start_gate().slot():
+                    await self._start_sandbox(provider, spec, labels, no_net)
         except Exception as e:
             await self.stop(delete=True)
             raise RuntimeError(f"hpc-sandbox start of {spec.image} failed: {e}") from e
@@ -397,6 +551,29 @@ class HpcSandboxEnvironment(BaseEnvironment):
         except BaseException:
             await self.stop(delete=True)  # a half-set-up sandbox would otherwise outlive the trial
             raise
+
+    def _stage_scratch(self) -> Path:
+        return Path(self._scratch_root or os.environ.get("PBS_LOCALDIR") or f"/tmp/hpcsb-{os.getuid()}")
+
+    async def _staged_image(self, ref: str) -> str:
+        """A prepared SIF (an absolute path from the image map) copied to node-local scratch once per node: the
+        prepared images live on shared storage, which hundreds of concurrent starts should not all read, and whose
+        group-only directories a fakeroot runtime cannot always traverse."""
+        if not ref.startswith("/") or not ref.endswith(".sif") or not Path(ref).is_file():
+            return ref
+        if os.environ.get("HPCSB_IMAGE_STAGE", "1") in ("0", "false", "no"):
+            return ref
+        try:
+            return str(await stage_copy(ref, self._stage_scratch() / "mho-images"))
+        except Exception as e:  # noqa: BLE001 - starting from the shared copy still works
+            self.logger.warning(f"staging {ref} failed ({e}); starting from it in place")
+            return ref
+
+    async def _start_sandbox(self, provider: Any, spec: Any, labels: dict[str, str], no_net: bool) -> None:
+        if self._network_mode == "pod":
+            await self._start_pod(provider, spec, labels, egress=not no_net)
+        else:
+            self._sandbox = await provider.start(spec)
 
     async def _start_pod(self, provider: Any, spec: Any, labels: dict[str, str], *, egress: bool) -> None:
         """One-service pod: the trial gets its own network namespace (any port is free), egress
@@ -499,3 +676,44 @@ class HpcSandboxEnvironment(BaseEnvironment):
                 elif dest.exists() or dest.is_symlink():
                     dest.unlink()
                 shutil.move(str(item), str(dest))
+
+
+# --------------------------------------------------------------------------------------------- #
+# Start cap: take a slot before harbor's timed environment start and release it once the agent is
+# set up (Trial._prepare = environment start + healthcheck + agent setup). See the module docstring.
+# --------------------------------------------------------------------------------------------- #
+def gated_prepare(original: Any) -> Any:
+    """Trial._prepare wrapped: an HpcSandboxEnvironment trial takes a start slot first (untimed), keeps it through
+    environment start, healthcheck and agent setup, and releases it before the agent runs."""
+
+    @functools.wraps(original)
+    async def _prepare(self: Any) -> None:
+        env = getattr(self, "agent_environment", None)
+        gate = start_gate()
+        if not isinstance(env, HpcSandboxEnvironment) or not gate.enabled:
+            return await original(self)
+        slot, waited = await gate.acquire()
+        env._slot_from_trial = True
+        if waited >= 1.0:
+            env.logger.info(f"hpc-sandbox: waited {waited:.1f}s for a start slot (HPCSB_MAX_STARTING={gate.limit})")
+        try:
+            return await original(self)
+        finally:
+            env._slot_from_trial = False
+            gate.release(slot)
+
+    _prepare._hpcsb_gated = True  # type: ignore[attr-defined]
+    return _prepare
+
+
+def _install_trial_gate() -> bool:
+    try:
+        from harbor.trial.trial import Trial
+    except Exception:  # noqa: BLE001 - another harbor layout: start() still caps the sandbox start
+        return False
+    if not getattr(Trial._prepare, "_hpcsb_gated", False):
+        Trial._prepare = gated_prepare(Trial._prepare)
+    return True
+
+
+_install_trial_gate()
