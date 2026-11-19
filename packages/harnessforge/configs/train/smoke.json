@@ -1,0 +1,54 @@
+{
+ "extends": "abci-base.json",
+ "run_id": "platoon-grpo-smoke1",
+ "gateway": {
+  "rollout_nodes": 1,
+  "walltime": "2:30:00",
+  "max_tokens_per_gpu": 32768,
+  "sglang": {
+   "context-length": 32768
+  }
+ },
+ "driver": {
+  "walltime": "2:30:00"
+ },
+ "data": {
+  "tasks": [
+   "task_000001_1a03ebc5",
+   "task_000007_654ab1c7",
+   "task_000009_dbc34e08",
+   "task_000010_7c427a6f",
+   "task_000011_24e54d45",
+   "task_000013_df6cd2ad"
+  ]
+ },
+ "env": {
+  "agent_timeout_multiplier": 1.0,
+  "harbor_system_deps": false
+ },
+ "train": {
+  "batch_size": 2,
+  "max_training_steps": 4,
+  "max_staleness": 1,
+  "context_window_length": 32768,
+  "workflow_config": {
+   "group_size": 4,
+   "rollout_config": {
+    "max_steps": 30,
+    "timeout": 1200,
+    "inference_params": {
+     "max_completion_tokens": 4096
+    }
+   }
+  }
+ },
+ "export": {
+  "every": 2
+ },
+ "stats": {
+  "wandb": {
+   "mode": "disabled"
+  }
+ },
+ "_comment": "Smoke: 1 trainer + 1 rollout node, 6 mixed-pass-rate tmax tasks, 4 steps of 2 tasks x 4. harbor_system_deps off: the per-trial apt install took >10 min per sandbox here (pp/sandbox-setup removes it for good)."
+}

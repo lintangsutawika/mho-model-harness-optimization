@@ -3,12 +3,19 @@ container). It
 
   * starts dp = gpus // tp SGLang engines on this node's GPUs for the pool's active policy,
   * registers them in <pool>/nodes/<i>.json once healthy (host, advertised IP, URLs),
-  * restarts an engine whose process died (with the pool's *current* active policy),
+  * restarts an engine whose process died (with the pool's *current* active policy; on a node
+    lent to a trainer, with the trainer's latest published weights or not at all, see below),
   * on node 0 also runs the sglang-router, publishes <pool>/router.json, and keeps the router's
     worker list equal to the ready engines of every node (add new / remove gone),
   * exits cleanly when <pool>/STOP appears or the job is cancelled (SIGTERM).
 
     python -m harnessforge.pool.node --pool-dir <root>/<pool_id> --node <i>
+
+Lent nodes (pool.json "lent", set by SGLangPool.lend): the trainer owns the engines' weights,
+so an engine that dies is never restarted on the pool's policy (that would silently put the
+base model back into training). With on_restart="latest" it restarts on the weights named by
+the lend's policy_file ({"id", "path"}: the trainer's latest full HF export), else it is
+*held* down and reported ("held": <reason> in the node file) until the node is returned.
 
 Stdlib only; reads everything else from pool.json.
 """
@@ -29,6 +36,9 @@ from harnessforge.pool import http
 from harnessforge.pool.state import PoolDir, write_json
 
 POLL = float(os.environ.get("HF_POOL_POLL", 5))
+#: what this agent supports; the controller checks it before lending a node (an older agent
+#: would route lent engines or restart them on the base policy)
+FEATURES = ("lend",)
 
 
 _LOG_FILE: Path | None = None      # live agent log (the batch log only lands at job end on PBS)
@@ -204,6 +214,7 @@ class Engine:
         self.restarts = 0
         self.started_at = 0.0
         self.policy: str | None = None
+        self.held: str | None = None        # why a lent engine is not (re)started
 
 
 class NodeAgent:
@@ -245,8 +256,34 @@ class NodeAgent:
             argv += ["--context-length", str(spec["max_context"])]
         return argv + render_args(spec.get("engine_args") or {})
 
+    def lent_policy(self, lend: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+        """The policy a lent engine may (re)start on: the trainer's latest published weights
+        (lend["policy_file"] -> {"id", "path"}) when on_restart == "latest", else none."""
+        if lend.get("on_restart", "down") != "latest":
+            return None, f"lent to {lend.get('to')}; on_restart=down"
+        pf = lend.get("policy_file")
+        pol = None
+        if pf:
+            from harnessforge.pool.state import read_json
+            pol = read_json(Path(pf))
+        if not pol or not pol.get("path") or not Path(pol["path"]).exists():
+            return None, f"lent to {lend.get('to')}; no published weights at {pf}"
+        return {"id": pol.get("id") or Path(pol["path"]).name, "path": pol["path"],
+                "base_model": pol.get("base_model")}, ""
+
     def start_engine(self, e: Engine) -> None:
-        policy = self.d.pool()["policy"]          # always the CURRENT active policy
+        cfg = self.d.pool()
+        policy = cfg["policy"]                    # always the CURRENT active policy
+        lend = (cfg.get("lent") or {}).get(str(self.i))
+        if lend is not None:
+            lp, why = self.lent_policy(lend)
+            if lp is None:
+                if e.held != why:
+                    log(f"engine {e.k} held down: {why}")
+                e.proc, e.ready, e.held = None, False, why
+                return
+            policy = lp
+        e.held = None
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(e.gpus)
         env.update({k: str(v) for k, v in (self.cfg.get("engine_env") or {}).items()})
@@ -263,6 +300,8 @@ class NodeAgent:
 
     def check_engine(self, e: Engine) -> None:
         if e.proc is None:
+            if e.held is not None and not self.stop:
+                self.start_engine(e)              # re-evaluate: returned, or weights published
             return
         if e.proc.poll() is not None:
             log(f"engine {e.k} exited rc={e.proc.returncode}")
@@ -286,8 +325,10 @@ class NodeAgent:
             "index": self.i, "host": self.host, "ip": self.ip, "status": status,
             "job_id": os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID") or "",
             "pid": os.getpid(), "tp": self.tp, "updated_at": time.time(),
+            "features": list(FEATURES),
             "engines": [{"k": e.k, "url": self.engine_url(e), "gpus": e.gpus, "port": e.port,
                          "ready": e.ready, "restarts": e.restarts, "policy": e.policy,
+                         "held": e.held, "pid": e.proc.pid if e.proc is not None else None,
                          "alive": e.proc is not None and e.proc.poll() is None}
                         for e in self.engines]})
 
@@ -363,7 +404,7 @@ class NodeAgent:
             while not self.stop and not self.d.stopping():
                 for e in self.engines:
                     self.check_engine(e)
-                if all(e.proc is not None and e.proc.poll() is not None
+                if all(e.held is None and e.proc is not None and e.proc.poll() is not None
                        and e.restarts >= self.max_restarts for e in self.engines):
                     self.publish("failed")
                     log("all engines failed")

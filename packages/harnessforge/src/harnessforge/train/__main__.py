@@ -1,0 +1,231 @@
+"""Training CLI.
+
+    python -m harnessforge.train render --config configs/train/smoke.json     # resolved run + job specs
+    python -m harnessforge.train launch --config configs/train/smoke.json     # gateway job (+ driver job)
+    python -m harnessforge.train status --run-dir <run>
+    python -m harnessforge.train stop   --run-dir <run> [--grace 600]
+    python -m harnessforge.train export --run-dir <run> [--follow] [--version N]
+    python -m harnessforge.train mapping                                        # old run -> new settings
+
+Inside jobs (launched by `launch`): gateway-job, driver-job.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+from harnessforge.contracts import JobSpec, JobState
+from harnessforge.train.config import OLD_RUN_MAPPING, TrainRun
+
+
+def driver_job(run: TrainRun) -> JobSpec:
+    from harnessforge.evals.jobs import ABCI_CPUS
+    d, L = run.driver, run.get("launcher", {})
+    py = run.get("python") or sys.executable
+    hf_src = run.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
+    res = d.get("resource", "rt_HC")
+    opts = {"resource_type": res, **{k: L[k] for k in ("queue", "account") if L.get(k)}}
+    return JobSpec(name=f"hftrain-drv-{run.run_id}"[:63],
+                   command=[py, "-m", "harnessforge.train", "driver-job", "--run-dir", str(run.dir)],
+                   nodes=1, cpus=ABCI_CPUS.get(res, 0), walltime=str(d.get("walltime", "4:00:00")),
+                   env={"PYTHONPATH": hf_src, "PYTHONUNBUFFERED": "1"},
+                   log=run.paths.logs / "driver.job.log", options=opts)
+
+
+def _launcher(run: TrainRun):
+    from harnessforge.launch import make_launcher
+    L = run.get("launcher", {})
+    return make_launcher(L.get("kind", "pbs"))
+
+
+def _jobs(run: TrainRun) -> dict:
+    p = run.dir / "jobs.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def cmd_render(a) -> int:
+    from harnessforge.train.gateway import gateway_job, serve_args
+    run = TrainRun.load(a.config)
+    out = {"run_dir": str(run.dir),
+           "gateway_job": _spec(gateway_job(run)),
+           "serve_args": serve_args(run, port=0, local_ckpt="$PBS_LOCALDIR/hf-local"),
+           "driver_job": _spec(driver_job(run)) if run.driver.get("where", "hc") == "hc" else "on the gateway head",
+           "train": run["train"]}
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+def _spec(s: JobSpec) -> dict:
+    return {"name": s.name, "nodes": s.nodes, "walltime": s.walltime, "command": list(s.command),
+            "options": s.options, "log": str(s.log)}
+
+
+def cmd_launch(a) -> int:
+    from harnessforge.train.gateway import gateway_job
+    run = TrainRun.load(a.config)
+    if run.paths.config.exists() and not a.force:
+        print(f"error: {run.dir} already has a run (use a new run_id, or --force to relaunch it)",
+              file=sys.stderr)
+        return 2
+    if run.paths.stop_file.exists():
+        run.paths.stop_file.rename(run.paths.stop_file.with_name(f"STOP.{int(time.time())}"))
+    for f in (run.paths.gateway_file, run.paths.driver_file):
+        if f.exists():
+            f.rename(f.with_name(f"{f.name}.{int(time.time())}"))
+    run.write()
+    run.paths.logs.mkdir(parents=True, exist_ok=True)
+    L = _launcher(run)
+    jobs = {"gateway": L.submit(gateway_job(run))}
+    if run.driver.get("where", "hc") == "hc" and not a.no_driver:
+        jobs["driver"] = L.submit(driver_job(run))
+    (run.dir / "jobs.json").write_text(json.dumps({**jobs, "submitted_at": time.time()}, indent=1))
+    print(json.dumps({"run_dir": str(run.dir), **jobs}))
+    return 0
+
+
+def cmd_driver(a) -> int:
+    """(Re)submit only the driver job of an existing run, against its running gateway (e.g. after
+    changing run.json's env/train sections). The previous driver must have ended."""
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    if a.set:
+        from harnessforge.train.config import merge
+        for kv in a.set:
+            key, _, val = kv.partition("=")
+            node: dict = {}
+            cur = node
+            parts = key.split(".")
+            for k in parts[:-1]:
+                cur = cur.setdefault(k, {})
+            cur[parts[-1]] = json.loads(val)
+            run.raw = merge(run.raw, node)
+        run.write()
+    jobs = _jobs(run)
+    f = run.paths.driver_file
+    if f.exists():
+        f.rename(f.with_name(f"{f.name}.{int(time.time())}"))
+    jobs["driver"] = _launcher(run).submit(driver_job(run))
+    (run.dir / "jobs.json").write_text(json.dumps(jobs, indent=1))
+    print(json.dumps({"driver": jobs["driver"]}))
+    return 0
+
+
+def cmd_status(a) -> int:
+    from harnessforge.train.export import versions
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    P = run.paths
+    L = _launcher(run)
+    out = {"run_id": run.run_id, "jobs": {}}
+    for k, jid in _jobs(run).items():
+        if k == "submitted_at":
+            continue
+        try:
+            st = L.status(jid)
+            out["jobs"][k] = {"id": jid, "state": st.state.value, "exit": st.exit_code}
+        except Exception as e:
+            out["jobs"][k] = {"id": jid, "error": str(e)}
+    for name, f in (("gateway", P.gateway_file), ("driver", P.driver_file)):
+        out[name] = json.loads(f.read_text()) if f.exists() else None
+    out["weight_versions"] = (versions(P.delta_dir) or [None])[-1] if P.delta_dir.exists() else None
+    out["hf_exports"] = sorted(p.name for p in P.hf_dir.glob("step_*")) if P.hf_dir.exists() else []
+    out["stopping"] = P.stop_file.exists()
+    print(json.dumps(out, indent=1))
+    return 0
+
+
+def cmd_stop(a) -> int:
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    L = _launcher(run)
+    jobs = {k: v for k, v in _jobs(run).items() if k != "submitted_at"}
+    if a.driver_only:
+        # the driver stops the gateway on exit unless told not to; qdel = SIGTERM to platoon
+        (run.dir / "KEEP_GATEWAY").write_text(str(time.time()))
+        jobs = {k: v for k, v in jobs.items() if k == "driver"}
+        for j in jobs.values():
+            L.cancel(j)
+    else:
+        run.paths.stop_file.write_text(f"stop requested {time.time()}\n")
+    deadline = time.time() + a.grace
+    while time.time() < deadline:
+        if all(L.status(j).state == JobState.DONE for j in jobs.values()):
+            print("stopped")
+            return 0
+        time.sleep(10)
+    for k, j in jobs.items():
+        if L.status(j).state != JobState.DONE:
+            print(f"cancelling {k} {j}")
+            L.cancel(j)
+    return 0
+
+
+def cmd_export(a) -> int:
+    from harnessforge.train.export import DeltaExporter
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    P = run.paths
+    m = run["model"]
+    ex = DeltaExporter(base=m["hf_checkpoint"], deltas=P.delta_dir, work=P.export_work, out=P.hf_dir,
+                       every=int(a.every if a.every is not None else run.get("export", {}).get("every", 10)),
+                       policy_file=P.latest_policy, run_id=run.run_id, base_model=m.get("name"),
+                       version_offset=int(run.get("export", {}).get("version_offset", 1)),
+                       log=lambda s: print(s, flush=True))
+    if a.follow:
+        final = P.dir / "export" / "FINAL"
+        ex.run(stop=lambda: final.exists() or P.stop_file.exists(), interval=a.interval)
+    else:
+        ex.poll(final=True)
+        if a.version is not None and ex.version != a.version:
+            print(f"error: latest published version is {ex.version}, not {a.version}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_mapping(a) -> int:
+    print("| old setting | old value | platoon / miles-tinker | status |")
+    print("|---|---|---|---|")
+    for row in OLD_RUN_MAPPING:
+        print("| " + " | ".join(c.replace("|", "\\|") for c in row) + " |")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="python -m harnessforge.train", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("render", "launch"):
+        s = sub.add_parser(name)
+        s.add_argument("--config", required=True)
+        if name == "launch":
+            s.add_argument("--force", action="store_true")
+            s.add_argument("--no-driver", action="store_true")
+    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver"):
+        s = sub.add_parser(name)
+        s.add_argument("--run-dir", required=True)
+        if name == "stop":
+            s.add_argument("--grace", type=float, default=600)
+            s.add_argument("--driver-only", action="store_true",
+                           help="stop the driver (platoon) and keep the gateway serving")
+        if name == "driver":
+            s.add_argument("--set", action="append", default=[],
+                           help="run.json override, dotted key = JSON value, e.g. env.harbor_system_deps=false")
+        if name == "export":
+            s.add_argument("--follow", action="store_true")
+            s.add_argument("--every", type=int)
+            s.add_argument("--interval", type=float, default=30)
+            s.add_argument("--version", type=int)
+    sub.add_parser("mapping")
+    a = ap.parse_args(argv)
+    if a.cmd == "gateway-job":
+        from harnessforge.train.gateway import run_gateway_job
+        return run_gateway_job(a.run_dir)
+    if a.cmd == "driver-job":
+        from harnessforge.train.driver import run_driver_job
+        return run_driver_job(a.run_dir)
+    return {"render": cmd_render, "launch": cmd_launch, "status": cmd_status, "stop": cmd_stop,
+            "driver": cmd_driver,
+            "export": cmd_export, "mapping": cmd_mapping}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -14,6 +14,13 @@
 Any other process (an eval job on another node) attaches with `SGLangPool.attach(pool_id)` or
 just reads the endpoint with `harnessforge.pool.endpoint_of(pool_id)`.
 
+Lending to a trainer: `pool.lend([3], to="grpo-run", policy_file=...)` hands node 3's engines to
+a trainer (miles-tinker attaches them as external rollout engines and owns their weights). While
+lent they are out of the router (no evals), `load()` skips them, and an engine that dies does not
+come back on the pool's policy (node agent: held down, or on the trainer's latest published
+weights). `pool.unlend([3])` reloads the pool's active policy into them, verifies it, and puts
+them back into the router.
+
 Design: the controller (this object) only writes pool.json, submits/cancels jobs and makes
 control HTTP calls (load/health). Everything long-lived runs in the node jobs (pool/node.py):
 engines, the router (node 0), router membership, engine restarts. So the controller can exit
@@ -182,11 +189,12 @@ class SGLangPool:
 
     def wait_ready(self, *, timeout: float | None = None, poll: float = 5.0,
                    all_engines: bool = True) -> None:
-        """Block until the router serves every engine of every node (or, all_engines=False,
-        until it serves at least one)."""
+        """Block until the router serves every engine of every node that is not lent (or,
+        all_engines=False, until it serves at least one)."""
         timeout = self.startup_timeout + 600 if timeout is None else timeout
         t0 = time.time()
-        want = self.spec.nodes * max(1, self.spec.gpus_per_node // self.spec.tp)
+        serving = self.spec.nodes - len(self.dir.lent())
+        want = serving * max(1, self.spec.gpus_per_node // self.spec.tp)
         last = ""
         while True:
             jobs = self.dir.pool().get("jobs", {})
@@ -236,24 +244,130 @@ class SGLangPool:
         return policy_from_dict(self.dir.pool()["policy"])
 
     def engines(self) -> list[str]:
+        """Ready engines of the nodes that are not lent (what the router serves and load()
+        swaps)."""
         return self.dir.engine_urls()
 
-    def load(self, policy: PolicyRef, *, drain: bool = True, timeout: float = 3600,
-             verify: bool = True) -> None:
-        """Swap every engine to `policy` (SGLang /update_weights_from_disk, all engines in
-        parallel). drain=True: each engine finishes its in-flight requests first (SGLang's model
-        update writer lock; new requests wait for the swap); drain=False: in-flight requests are
-        aborted. pool.json records the target policy before the swap (so an engine that
-        restarts mid-swap comes up on it) and the outcome after; a partial failure leaves
-        status="degraded" and raises."""
+    # ------------------------------------------------------------------ lending to a trainer
+    def lent(self) -> dict[int, dict[str, Any]]:
+        return self.dir.lent()
+
+    def lent_engines(self, nodes: list[int] | None = None, *, ready_only: bool = True) -> list[str]:
+        """Engine URLs of lent nodes (all lent nodes, or `nodes`)."""
+        want = set(self.dir.lent()) if nodes is None else set(nodes)
+        return self.dir.engine_urls(include_lent=True, nodes=want, ready_only=ready_only)
+
+    def lend(self, nodes: list[int], *, to: str, policy_file: str | None = None,
+             on_restart: str = "down", drain_timeout: float = 600.0, poll: float = 2.0,
+             wait_router: float = 120.0) -> list[str]:
+        """Hand `nodes`' engines to a trainer `to`. Marks them lent in pool.json (node 0's agent
+        then drops them from the router; load() and wait_ready() skip them), waits until the
+        router no longer lists them and their in-flight requests finished (up to
+        drain_timeout; then raises, leaving them lent), and returns their engine URLs.
+
+        on_restart: "down" (default) = an engine that dies stays down until the node is returned;
+        "latest" = it restarts on policy_file's {"id", "path"} (the trainer's latest full HF
+        export) if that exists, else stays down. Never on the pool's policy."""
+        if on_restart not in ("down", "latest"):
+            raise PoolError(f"on_restart must be 'down' or 'latest', not {on_restart!r}")
+        if on_restart == "latest" and not policy_file:
+            raise PoolError("on_restart='latest' needs a policy_file")
+        nodes = sorted(set(int(i) for i in nodes))
         cfg = self.dir.pool()
-        prev = cfg["policy"]
-        urls = self.engines()
-        if not urls:
-            raise PoolError("no ready engines to load into")
-        self.dir.update_pool(policy=policy_to_dict(policy), previous_policy=prev,
-                             status="loading")
+        known = {int(i) for i in cfg.get("jobs", {})}
+        node_files = self.dir.nodes()
+        lent = {str(k): v for k, v in (cfg.get("lent") or {}).items()}
+        for i in nodes:
+            if i not in known:
+                raise PoolError(f"node {i} is not part of pool {self.pool_id!r}")
+            if str(i) in lent and lent[str(i)].get("to") != to:
+                raise PoolError(f"node {i} is already lent to {lent[str(i)].get('to')!r}")
+        # the agents that must honour the lend: node 0 (router) and every lent node (restarts)
+        for i in sorted({0, *nodes}):
+            if "lend" not in (node_files.get(i) or {}).get("features", []):
+                raise PoolError(
+                    f"node {i}'s agent predates lending (no 'lend' feature): restart it with this "
+                    f"code first (python -m harnessforge.pool restart-node --node {i})")
+        if not self.dir.engine_urls(include_lent=True, nodes=set(nodes)):
+            raise PoolError(f"nodes {nodes} have no ready engines to lend")
+        now = time.time()
+        for i in nodes:
+            lent[str(i)] = {"to": to, "since": now, "policy_file": policy_file,
+                            "on_restart": on_restart}
+        self.dir.update_pool(lent=lent, lend_history=cfg.get("lend_history", []) + [
+            {"op": "lend", "nodes": nodes, "to": to, "at": now}])
+        urls = self.lent_engines(nodes)
+        # 1. out of the router
         t0 = time.time()
+        while self.router_url() and set(urls) & set(self.router_workers()):
+            if time.time() - t0 > wait_router:
+                raise PoolError(f"router still routes lent engines after {wait_router:.0f}s "
+                                f"(is node 0's agent running this code?)")
+            time.sleep(poll)
+        # 2. drain what the router had already sent them
+        t0 = time.time()
+        while True:
+            busy = {u: n for u in urls if (n := self._inflight(u))}
+            if not busy:
+                break
+            if time.time() - t0 > drain_timeout:
+                raise PoolError(f"lent engines still busy after {drain_timeout:.0f}s: {busy}")
+            time.sleep(poll)
+        return urls
+
+    def _inflight(self, url: str) -> int:
+        try:
+            _, text = http.request("GET", url + "/metrics", timeout=5)
+        except http.HTTPError:
+            return 0
+        m = http.prometheus_values(text, ("sglang:num_running_reqs", "sglang:num_queue_reqs"))
+        return int(sum(v or 0 for v in m.values()))
+
+    def unlend(self, nodes: list[int] | None = None, *, reload: bool = True,
+               timeout: float = 3600) -> None:
+        """Return lent nodes (all, or `nodes`) to the pool. reload=True first swaps their running
+        engines to the pool's active policy (update_weights_from_disk, verified via
+        weight_version); on any failure the nodes stay lent and this raises, so an engine with
+        trainer weights never re-enters the router. Held (down) engines start on the active
+        policy once the node is returned."""
+        lent = {str(k): v for k, v in (self.dir.pool().get("lent") or {}).items()}
+        nodes = sorted(int(k) for k in lent) if nodes is None else sorted(set(map(int, nodes)))
+        nodes = [i for i in nodes if str(i) in lent]
+        if not nodes:
+            return
+        urls = self._alive_engines(nodes, timeout=min(timeout, 1800))
+        if reload and urls:
+            errors = self._swap(urls, self.policy(), drain=False, timeout=timeout, verify=True)
+            if errors:
+                raise PoolError(f"unlend: reloading {self.policy().id} failed on "
+                                f"{len(errors)}/{len(urls)} engines (nodes stay lent): {errors}")
+        cfg = self.dir.pool()
+        lent = {k: v for k, v in (cfg.get("lent") or {}).items() if int(k) not in nodes}
+        self.dir.update_pool(lent=lent, lend_history=cfg.get("lend_history", []) + [
+            {"op": "unlend", "nodes": nodes, "at": time.time(), "reloaded": bool(reload),
+             "engines": len(urls)}])
+
+    def _alive_engines(self, nodes: list[int], *, timeout: float, poll: float = 2.0) -> list[str]:
+        """Every engine of `nodes` whose process is alive (not held down), waiting until each
+        answers /health: an engine that restarted on trainer weights and is still loading must
+        be reloaded too, not slip into the router afterwards."""
+        t0 = time.time()
+        while True:
+            urls, waiting = [], []
+            for i in nodes:
+                for e in (self.dir.node(i) or {}).get("engines", []):
+                    if e.get("held") or e.get("alive") is False:
+                        continue
+                    (urls if http.ok(e["url"] + "/health", timeout=5) else waiting).append(e["url"])
+            if not waiting:
+                return urls
+            if time.time() - t0 > timeout:
+                raise PoolError(f"unlend: engines {waiting} alive but not healthy after "
+                                f"{timeout:.0f}s (nodes stay lent)")
+            time.sleep(poll)
+
+    def _swap(self, urls: list[str], policy: PolicyRef, *, drain: bool, timeout: float,
+              verify: bool) -> dict[str, str]:
         payload = {"model_path": policy.path, "weight_version": policy.id,
                    "abort_all_requests": not drain, "flush_cache": True}
 
@@ -270,12 +384,30 @@ class SGLangPool:
             except http.HTTPError as e:
                 return url, str(e)
 
-        with cf.ThreadPoolExecutor(max_workers=min(64, len(urls))) as ex:
-            results = list(ex.map(one, urls))
-        errors = {u: e for u, e in results if e}
+        with cf.ThreadPoolExecutor(max_workers=min(64, max(1, len(urls)))) as ex:
+            return {u: e for u, e in ex.map(one, urls) if e}
+
+    def load(self, policy: PolicyRef, *, drain: bool = True, timeout: float = 3600,
+             verify: bool = True) -> None:
+        """Swap every engine to `policy` (SGLang /update_weights_from_disk, all engines in
+        parallel). drain=True: each engine finishes its in-flight requests first (SGLang's model
+        update writer lock; new requests wait for the swap); drain=False: in-flight requests are
+        aborted. pool.json records the target policy before the swap (so an engine that
+        restarts mid-swap comes up on it) and the outcome after; a partial failure leaves
+        status="degraded" and raises. Lent nodes are skipped (they get the active policy when
+        they are returned, see unlend)."""
+        cfg = self.dir.pool()
+        prev = cfg["policy"]
+        urls = self.engines()
+        if not urls:
+            raise PoolError("no ready engines to load into")
+        self.dir.update_pool(policy=policy_to_dict(policy), previous_policy=prev,
+                             status="loading")
+        t0 = time.time()
+        errors = self._swap(urls, policy, drain=drain, timeout=timeout, verify=verify)
         entry = {"policy": policy_to_dict(policy), "at": time.time(), "drain": drain,
                  "seconds": round(time.time() - t0, 2), "engines": len(urls),
-                 "errors": errors}
+                 "errors": errors, "skipped_lent_nodes": sorted(self.dir.lent())}
         cfg = self.dir.pool()
         hist = cfg.get("history", []) + [entry]
         self.dir.update_pool(history=hist, status="degraded" if errors else "ready")
@@ -296,8 +428,10 @@ class SGLangPool:
     def health(self) -> dict[str, Any]:
         cfg = self.dir.pool()
         nodes_state = self.dir.nodes()
+        lent = {int(k): v for k, v in (cfg.get("lent") or {}).items()}
         out: dict[str, Any] = {"pool_id": self.pool_id, "status": cfg.get("status"),
-                               "policy": cfg.get("policy"), "router": None, "nodes": []}
+                               "policy": cfg.get("policy"), "router": None, "nodes": [],
+                               "lent": {str(k): v for k, v in lent.items()}}
         url = self.router_url()
         if url:
             out["endpoint"] = url + "/v1"
@@ -307,7 +441,7 @@ class SGLangPool:
         def engine(e: dict[str, Any]) -> dict[str, Any]:
             u = e["url"]
             r = {"url": u, "ok": http.ok(u + "/health", timeout=5), "gpus": e.get("gpus"),
-                 "restarts": e.get("restarts", 0)}
+                 "restarts": e.get("restarts", 0), "held": e.get("held")}
             if r["ok"]:
                 try:
                     info = self.engine_info(u)
@@ -337,7 +471,8 @@ class SGLangPool:
                 out["nodes"].append({
                     "index": int(i), "job_id": jid, "job": job, "host": n.get("host"),
                     "status": n.get("status", "pending"),
-                    "updated_at": n.get("updated_at"),
+                    "updated_at": n.get("updated_at"), "lent_to": (lent.get(int(i)) or {}).get("to"),
+                    "features": n.get("features", []),
                     "engines": list(ex.map(engine, n.get("engines", [])))})
         out["engines_ok"] = sum(e["ok"] for n in out["nodes"] for e in n["engines"])
         out["engines_total"] = sum(len(n["engines"]) for n in out["nodes"])
