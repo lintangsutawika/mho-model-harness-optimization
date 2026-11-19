@@ -517,6 +517,8 @@ def inner_head(run_dir: str, ip: str, port: int, gpus: int, local_ckpt: str) -> 
                                       "TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
                                       "FLASHINFER_WORKSPACE_DIR", "XDG_CACHE_HOME", "WANDB_MODE")
            if k in os.environ},
+        # gateway.env (e.g. PYTORCH_CUDA_ALLOC_CONF) reaches the Ray actors explicitly
+        **{k: os.environ[k] for k in (run.gateway.get("env") or {}) if k in os.environ},
     }
     cmd = (f"ray job submit --address=http://127.0.0.1:{DASH_PORT} "
            f"--runtime-env-json={shlex.quote(json.dumps({'env_vars': env_vars}))} "

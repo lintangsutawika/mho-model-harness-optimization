@@ -222,6 +222,8 @@ def test_naive_ext_131k_config():
     val = lambda f: a[a.index(f) + 1]
     assert val("--tinker-max-tokens-per-datum") == "131072"
     assert val("--max-tokens-per-gpu") == "131072" and val("--context-parallel-size") == "1"
+    assert val("--tensor-model-parallel-size") == "4"
+    assert r.gateway["env"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
     # everything else as naive_ext
     strip = lambda t: {k: v for k, v in t.items() if k != "context_window_length"}
     assert strip(r["train"]) == strip(base["train"]) and X.rollout_cfg(r) == X.rollout_cfg(base)

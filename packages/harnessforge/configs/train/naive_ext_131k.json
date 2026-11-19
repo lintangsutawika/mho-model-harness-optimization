@@ -1,11 +1,42 @@
 {
- "_comment": "naive_ext.json at a 131072-token context (per-call max_tokens stays 16384). No KL. The platoon driver is held (driver.hold) until the 131k memory probe passed on the trainer node: `train probe`, then `train driver`.",
+ "_comment": "naive_ext.json at a 131072-token context (per-call max_tokens 16384). No KL. TP4 + expandable segments: TP2 passed a single-datum probe (129.7/140 GB) but OOMed on the first real batch (26 GiB allocation, 33 GiB fragmented). Driver held until `train probe` passes, then `train driver`. Recovery checkpoints every 10 steps (keep 2).",
  "extends": "naive_ext.json",
  "run_id": "platoon-grpo200-tmax-naive-uniform-noKL-ctx131k-ext--Qwen3.5-4B",
- "labels": {"kl": "none (no-KL)", "context": "131072", "rollout": "external: n4hf72 nodes 1-3",
-            "compares_to": "grpo200-tmax-naive-4node-64k--Qwen3.5-4B (64k context, had KL 0.01 low_var_kl)"},
- "gateway": {"tp": 2, "max_tokens_per_gpu": 131072, "sglang": {"context-length": 131072}},
- "driver": {"hold": true},
- "train": {"context_window_length": 131072},
- "stats": {"wandb": {"tags": ["no-KL", "external-engines", "platoon", "ctx131k"]}}
+ "labels": {
+  "kl": "none (no-KL)",
+  "context": "131072",
+  "rollout": "external: n4hf72 nodes 1-3",
+  "compares_to": "grpo200-tmax-naive-4node-64k--Qwen3.5-4B (64k context, had KL 0.01 low_var_kl)"
+ },
+ "gateway": {
+  "tp": 4,
+  "max_tokens_per_gpu": 131072,
+  "sglang": {
+   "context-length": 131072
+  },
+  "env": {
+   "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+  }
+ },
+ "driver": {
+  "hold": true
+ },
+ "train": {
+  "context_window_length": 131072
+ },
+ "stats": {
+  "wandb": {
+   "tags": [
+    "no-KL",
+    "external-engines",
+    "platoon",
+    "ctx131k"
+   ]
+  }
+ },
+ "checkpoint": {
+  "every": 50,
+  "recovery_every": 10,
+  "keep_recovery": 2
+ }
 }
