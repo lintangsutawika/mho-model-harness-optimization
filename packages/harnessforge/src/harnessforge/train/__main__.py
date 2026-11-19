@@ -116,6 +116,8 @@ def cmd_driver(a) -> int:
             run.raw = merge(run.raw, node)
         run.write()
     jobs = _jobs(run)
+    if run.driver.get("where", "hc") == "gateway":
+        return _stop_driver_only(run, _launcher(run), jobs, grace=a.grace, restart=True)
     f = run.paths.driver_file
     if f.exists():
         f.rename(f.with_name(f"{f.name}.{int(time.time())}"))
@@ -155,11 +157,7 @@ def cmd_stop(a) -> int:
     L = _launcher(run)
     jobs = {k: v for k, v in _jobs(run).items() if k != "submitted_at"}
     if a.driver_only:
-        # the driver stops the gateway on exit unless told not to; qdel = SIGTERM to platoon
-        (run.dir / "KEEP_GATEWAY").write_text(str(time.time()))
-        jobs = {k: v for k, v in jobs.items() if k == "driver"}
-        for j in jobs.values():
-            L.cancel(j)
+        return _stop_driver_only(run, L, jobs, grace=a.grace, restart=False)
     else:
         run.paths.stop_file.write_text(f"stop requested {time.time()}\n")
     deadline = time.time() + a.grace
@@ -173,6 +171,31 @@ def cmd_stop(a) -> int:
             print(f"cancelling {k} {j}")
             L.cancel(j)
     return _return_nodes(run, L, jobs)
+
+
+def _stop_driver_only(run: TrainRun, L, jobs: dict, *, grace: float, restart: bool) -> int:
+    """Stop the platoon driver, keep the gateway (trainer + engines). A driver on the gateway's
+    head node is stopped through DRIVER_STOP and restarted by the gateway (KEEP_GATEWAY) with
+    the current run.json and code; a separate driver job is cancelled (resubmit: `train driver`)."""
+    from harnessforge.train.driver import DRIVER_STOP, KEEP_GATEWAY
+    (run.dir / KEEP_GATEWAY).write_text(str(time.time()))
+    if run.driver.get("where", "hc") == "gateway":
+        before = (json.loads(run.paths.driver_file.read_text()) if run.paths.driver_file.exists()
+                  else {}).get("started_at")
+        (run.dir / DRIVER_STOP).write_text(str(time.time()))
+        print("asked the head-node driver to stop; the gateway restarts it")
+        deadline = time.time() + grace
+        while time.time() < deadline:
+            d = json.loads(run.paths.driver_file.read_text()) if run.paths.driver_file.exists() else {}
+            if d.get("started_at") != before and d.get("status") in ("waiting", "training"):
+                print(f"driver restarted ({d.get('status')})")
+                return 0
+            time.sleep(10)
+        print("driver not restarted yet; see logs/driver.events.log and logs/gateway.log", file=sys.stderr)
+        return 1
+    for j in [v for k, v in jobs.items() if k == "driver"]:
+        L.cancel(j)
+    return 0
 
 
 def _return_nodes(run: TrainRun, L, jobs: dict) -> int:
@@ -283,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         if name == "scan-secrets":
             s.add_argument("--also", action="append", default=[], help="more files/dirs to scan")
         if name == "driver":
+            s.add_argument("--grace", type=float, default=900,
+                           help="driver on the gateway head: seconds to wait for its restart")
             s.add_argument("--set", action="append", default=[],
                            help="run.json override, dotted key = JSON value, e.g. env.harbor_system_deps=false")
         if name == "export":

@@ -95,12 +95,16 @@ def test_lend_for_run_and_serve_args(tmp_path, engines):
     assert "--rollout-num-gpus" not in a                              # miles derives it
     local = a[a.index("--update-weight-local-checkpoint-dir") + 1]
     assert run.run_id in local and local.startswith("/dev/shm/")      # run-unique, host-local
+    assert local == info["engine_local_dir"]                          # fixed at lend time
     assert a[a.index("--update-weight-transfer-mode") + 1] == "disk-delta"
     assert gateway_job(run).nodes == 1                                # only the trainer node
     # returned: reloaded to the pool policy, back in the router
     assert X.unlend_for_run(run, pool=pool, log=lambda m: None)
     assert pool.lent() == {} and X.read_rollout(run)["status"] == "returned"
     assert X.unlend_for_run(run, pool=pool)                           # idempotent
+    # a relaunch of the same run id gets a different engine-local dir
+    later = X.engine_local_dir(run, launch="29990101-000000")
+    assert later != local and "29990101-000000" in later
 
 
 def test_lend_refusals(tmp_path, engines):
@@ -177,7 +181,9 @@ def test_cli_launch_stop_unlend(tmp_path, engines, monkeypatch):
     assert [j.nodes for j in L.jobs] == [1]
     assert SGLangPool.attach("ext", tmp_path / "state").lent()[1]["to"] == run.run_id
     # stop --driver-only never returns the gateway's engines
-    assert cli.main(["stop", "--driver-only", "--grace", "0", "--run-dir", str(run.dir)]) == 0
+    # (head-node driver: asks it to stop and the gateway to restart it; no restart seen within grace 0)
+    assert cli.main(["stop", "--driver-only", "--grace", "0", "--run-dir", str(run.dir)]) == 1
+    assert (run.dir / "DRIVER_STOP").exists() and (run.dir / "KEEP_GATEWAY").exists()
     assert 1 in SGLangPool.attach("ext", tmp_path / "state").lent()
     # gateway still running: unlend refuses; once it ended, the nodes go back
     monkeypatch.setattr(cli.time, "sleep", lambda s: None)
