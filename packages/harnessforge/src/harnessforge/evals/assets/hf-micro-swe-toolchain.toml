@@ -1,0 +1,21 @@
+# The toolchain micro-swe-agent candidates run from inside task sandboxes (harnessforge.evals.harness): a uv-managed
+# CPython 3.12 with micro-swe-agent's dependencies and the extras our harbor adapter installed next to it
+# (`uv tool install <candidate> --with litellm --with mcp --with orjson --with fastapi`), hash-locked in
+# hf-micro-swe-1.txt. Build it once per site (on a node with network access):
+#
+#   PLATOON_SITE=<site.yaml> platoon toolchain build <this file>
+#
+# This spec only builds the toolchain; each candidate gets a generated spec that names it.
+name = "hf-micro-swe-toolchain"
+version = "1"
+dialect = "openai_chat"
+
+[install]
+toolchain = "hf-micro-swe-1"
+
+[install.recipe]
+python = "3.12"
+lock = "hf-micro-swe-1.txt"
+
+[launch]
+argv = ["{toolchain}/bin/python3", "-c", "import litellm, mcp, jinja2, pydantic, tenacity, yaml, orjson, fastapi"]
