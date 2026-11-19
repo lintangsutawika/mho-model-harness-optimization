@@ -5,6 +5,13 @@
         every candidate is done. Creating <out_dir>/<run_id>/<candidate>.stop stops that candidate. status.json there
         says whether every candidate's process has exited ("done": true is written after the final records).
 
+        --harbor-export DIR: also write harbor-compatible trial dirs, DIR/<candidate>/<task>__r<k>/ (result.json,
+        agent/, verifier/), on every poll (harnessforge.evals.harbor_export).
+
+    python -m harnessforge.evals export RUN_DIR DIR [--candidate C ...] [--final | --not-final]
+        The same harbor-compatible export, once, over an existing run dir (<out_dir>/<run_id>). Unfinished trials are
+        exported as env_failed "stopped" when the run is over (status.json done, or --final).
+
     python -m harnessforge.evals stage-images REQUEST.json --from SHARED_CACHE --to NODE_CACHE
         Copy the hpc-sandbox image cache entries of the request's tasks (by their docker_image, else their
         Dockerfile's FROM) from a shared cache to a node-local one; missing ones are pulled on first use.
@@ -26,6 +33,7 @@ from pathlib import Path
 from harnessforge.contracts import Candidate, EvalRequest
 from harnessforge.evals.backend import PlatoonBackend
 from harnessforge.evals.dataset import dockerfile_info
+from harnessforge.evals.harbor_export import RunExport, export_run
 
 
 def load_request(path: str | Path) -> tuple[EvalRequest, dict]:
@@ -45,12 +53,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     run = backend.start(request)
     run_dir = Path(request.out_dir) / request.run_id
     print(json.dumps(run.status(), indent=1), flush=True)
+    exporter = RunExport(run_dir, args.harbor_export) if args.harbor_export else None
     while True:
         for candidate in request.candidates:
             if (run_dir / f"{candidate.id}.stop").exists():
                 run.stop(candidate.id)
         records = run.write_records(run_dir / "records.jsonl")
         done = run.done()
+        if exporter is not None:
+            _harbor_sync(exporter, run, final=False)
         finished = sum(r.finished for r in records)
         print(f"[{time.strftime('%H:%M:%S')}] {finished} finished, {len(records) - finished} in flight", flush=True)
         if done:
@@ -58,8 +69,25 @@ def cmd_run(args: argparse.Namespace) -> int:
         _write_status(run_dir, run, done=False)
         time.sleep(args.poll)
     run.write_records(run_dir / "records.jsonl")
+    if exporter is not None:
+        _harbor_sync(exporter, run, final=True)
     _write_status(run_dir, run, done=True)  # after the final records: a reader seeing done=true has them
     print(json.dumps(run.status(), indent=1), flush=True)
+    return 0
+
+
+def _harbor_sync(exporter: RunExport, run, *, final: bool) -> None:
+    """One harbor export pass; an export error is reported, never fatal to the evaluation."""
+    try:
+        stopped = [c for c, s in run.status().items() if s["stopped"] and s["returncode"] is not None]
+        exporter.sync(stopped=stopped, final=final)
+    except Exception as exc:  # noqa: BLE001 - the records are the result; the export is a view of them
+        print(f"[harbor-export] failed: {exc!r}", file=sys.stderr, flush=True)
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    summary = export_run(args.run_dir, args.dest, candidates=args.candidate or None, final=args.final)
+    print(json.dumps(summary, indent=1))
     return 0
 
 
@@ -120,12 +148,22 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run", help="run a request with PlatoonBackend")
     run.add_argument("request")
     run.add_argument("--poll", type=float, default=30.0)
+    run.add_argument("--harbor-export", metavar="DIR", default=None,
+                     help="also write harbor-compatible trial dirs under DIR/<candidate>/ on every poll")
+    export = sub.add_parser("export", help="write harbor-compatible trial dirs from an existing run dir")
+    export.add_argument("run_dir")
+    export.add_argument("dest")
+    export.add_argument("--candidate", action="append", help="only this candidate (repeatable)")
+    final = export.add_mutually_exclusive_group()
+    final.add_argument("--final", dest="final", action="store_true", default=None,
+                       help="the run is over: export unfinished trials as env_failed 'stopped'")
+    final.add_argument("--not-final", dest="final", action="store_false")
     stage = sub.add_parser("stage-images", help="copy cached sandbox images to node-local disk")
     stage.add_argument("request")
     stage.add_argument("--from", dest="from_", required=True)
     stage.add_argument("--to", required=True)
     args = parser.parse_args(argv)
-    return {"run": cmd_run, "stage-images": cmd_stage_images}[args.cmd](args)
+    return {"run": cmd_run, "export": cmd_export, "stage-images": cmd_stage_images}[args.cmd](args)
 
 
 if __name__ == "__main__":

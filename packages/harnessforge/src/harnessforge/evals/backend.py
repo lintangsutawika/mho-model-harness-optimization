@@ -38,6 +38,9 @@ Options (`EvalRequest.options`):
     image_map         prepared-images map {image reference: SIF} (scripts/hpcsb/prepare_images.py; default
                       $HPCSB_IMAGE_MAP): tasks start from SIFs that already hold those packages, so no trial runs apt
     max_starting      sandboxes being started at once in the job (default $HPCSB_MAX_STARTING, else 16; 0 = no cap)
+    collect           copy each trial's tests' output and the agent's own trajectory out of its sandbox before it stops,
+                      into <run>/<candidate>/collected/<rollout id>/ (default True; the pod provider's collect_dir), for
+                      `harbor_export` (python -m harnessforge.evals run --harbor-export DIR / export)
     harbor_keep_processes  grade with the processes the agent left running alive, as harbor does (default True). platoon
                       kills them twice: every process of the harness launch when the harness exits (the runner's
                       --keep-children unmarks the agent's commands), and every process in the sandbox before the
@@ -258,6 +261,9 @@ class PlatoonBackend:
                 provider_options.setdefault("image_map", str(image_map))
             if opts.get("max_starting") is not None:
                 provider_options.setdefault("max_starting", int(opts["max_starting"]))
+            if opts.get("collect", True):
+                # the tests' output and the agent's own trajectory, which platoon does not keep (harbor_export)
+                provider_options.setdefault("collect_dir", str(out / "collected"))
         service_kwargs = {
             "dataset_dir": str(dataset_dir),
             "splits": {"eval": list(request.tasks)},

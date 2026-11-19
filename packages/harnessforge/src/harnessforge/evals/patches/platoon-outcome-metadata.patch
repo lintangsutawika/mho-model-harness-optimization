@@ -1,0 +1,52 @@
+--- a/platoon/gateway/trace.py	2026-11-19 15:16:55
++++ b/platoon/gateway/trace.py	2026-11-19 15:17:04
+@@ -37,6 +37,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ from collections.abc import Iterable, Mapping
+ from typing import Any, Protocol
+ 
+@@ -59,6 +60,10 @@
+ AGENT_RESULT_MISC_KEY = "agent_result"
+ JUDGE_CALLS_MISC_KEY = "judge_calls"
+ TOOL_CALLS_MISC_KEY = "tool_calls"
++# The outcome's metadata in its record (``misc["outcome"]["metadata"]``): what the env reported beside the verdict,
++# such as a Harbor task's ``test_output`` (the tail of the tests' output), ``verifier_exit_code`` and
++# ``verifier_seconds``; only its JSON values are kept.
++OUTCOME_METADATA_KEY = "metadata"
+ JUDGE_KIND = "judge"
+ 
+ # The trajectory marker that keeps each untrainable outcome out of policy training and out of the group
+@@ -249,6 +254,8 @@
+         grade_reason = metadata.get(GRADE_REASON_KEY)
+         if grade_reason is not None:
+             summary[GRADE_REASON_KEY] = grade_reason  # the grader's own reason, when the rollout reports another
++        if kept := _json_values(metadata):
++            summary[OUTCOME_METADATA_KEY] = kept  # e.g. the tests' output tail, which explains a Harbor 0
+         if outcome.status == "scored":
+             if outcome.reward is None:
+                 raise ValueError("A scored outcome must carry a reward")
+@@ -260,8 +267,21 @@
+             error_message = f"Outcome {outcome.status}" + (f": {outcome.reason}" if outcome.reason else "")
+             return cls(0.0, None, _UNTRAINABLE_MARKERS[outcome.status], error_message, summary)
+         raise ValueError(f"Unknown outcome status {outcome.status!r}")
++
++
++def _json_values(metadata: Mapping[str, Any]) -> dict[str, Any]:
++    """The entries of an outcome's metadata whose values are JSON (the record is written as JSON)."""
+ 
++    kept: dict[str, Any] = {}
++    for key, value in metadata.items():
++        try:
++            json.dumps(value)
++        except (TypeError, ValueError):
++            continue
++        kept[str(key)] = value
++    return kept
+ 
++
+ def _action_misc(call: ChatResponse, kind: str = "policy") -> dict[str, Any]:
+     """A call's ``action_misc``: its id, model and usage; its kind when it is not ``policy``; and a hosted call's
+     provider record (served model, ids, attempts, cost: ``ProviderRecord.action_misc``)."""
