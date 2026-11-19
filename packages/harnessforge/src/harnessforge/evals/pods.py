@@ -188,10 +188,19 @@ class PodSandbox(_KeepingSandbox):
             self._token = None
 
 
+#: where a sysdeps bundle (provider option `sysdeps`: a dir holding bundle.tar) is mounted in each sandbox
+SYSDEPS_MOUNT = "/opt/mho/sysdeps"
+#: run in the sandbox right after it starts, inside the start-gate slot: the files harbor's per-trial
+#: `apt-get install curl bash build-essential git python3 python3-pip` would add, without the network and
+#: without overwriting anything the image already has
+SYSDEPS_EXTRACT = (f"tar -xf {SYSDEPS_MOUNT}/bundle.tar --skip-old-files -C / && "
+                   "{ command -v ldconfig >/dev/null 2>&1 && ldconfig || true; }")
+
+
 class PodSingularityProvider(SingularityProvider):
     def __init__(self, *, pod_users: str = "subids", keep_agent_processes: bool = False,
                  image_map: str | None = None, max_starting: int | None = None, collect_dir: str | None = None,
-                 **options: Any) -> None:
+                 sysdeps: str | None = None, **options: Any) -> None:
         if pod_users not in ("subids", "single"):
             raise ValueError(f"pod_users must be subids or single, not {pod_users!r}")
         super().__init__(**options)
@@ -203,9 +212,12 @@ class PodSingularityProvider(SingularityProvider):
             max_starting = int(raw) if raw else DEFAULT_MAX_STARTING
         self.start_gate = StartGate(max_starting)
         self.collect_dir = str(collect_dir) if collect_dir else None
+        # a sysdeps bundle replaces harbor's per-trial apt step (see SYSDEPS_EXTRACT)
+        self.sysdeps = str(sysdeps) if sysdeps else None
         # what a reap rebuilds the provider from
         self.options = {**self.options, "pod_users": pod_users, "keep_agent_processes": self.keep_agent_processes,
-                        "image_map": image_map, "max_starting": max_starting, "collect_dir": self.collect_dir}
+                        "image_map": image_map, "max_starting": max_starting, "collect_dir": self.collect_dir,
+                        "sysdeps": self.sysdeps}
         # Its sandboxes do not share this host's network: the harness reaches the gateway through the pod's route.
         self.capabilities = frozenset(self.capabilities - {"host_loopback"})
 
@@ -216,13 +228,32 @@ class PodSingularityProvider(SingularityProvider):
         requested = time.time()
         if mapped := mapped_image(self.image_map, spec.image or ""):
             spec = dataclasses.replace(spec, image=mapped)
+        if self.sysdeps:
+            from platoon.sandbox.base import Mount
+            spec = dataclasses.replace(spec, mounts=[*spec.mounts, Mount(source=self.sysdeps, target=SYSDEPS_MOUNT,
+                                                                         read_only=True)])
+        sysdeps_s = None
         async with self.start_gate.slot():
             if spec.network == "none":
                 sandbox = await super().start(spec)
             else:
                 sandbox = await self._start_pod(spec)
+            if self.sysdeps:
+                # inside the slot: the copy is part of starting, and cannot add to start contention
+                t0 = time.time()
+                res = await sandbox.exec(["/bin/sh", "-c", SYSDEPS_EXTRACT], timeout_s=900)
+                sysdeps_s = round(time.time() - t0, 2)
+                if res.exit_code != 0 or res.timed_out:
+                    try:
+                        await sandbox.stop()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f"sysdeps bundle extraction failed (exit {res.exit_code}): "
+                                       f"{(res.stderr or res.stdout)[-300:]}")
         sandbox._hf_labels = dict(spec.labels or {})  # what collect() files it under
         sandbox._hf_times = {"start_requested": requested, "started": time.time()}
+        if sysdeps_s is not None:
+            sandbox._hf_times["sysdeps_s"] = sysdeps_s
         return sandbox
 
     async def _start_pod(self, spec: Any) -> HpcSandbox:
