@@ -305,6 +305,11 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         os.write(fd, os.urandom(32).hex().encode())
         os.close(fd)
     if run.gateway.get("weight_sync", "disk-delta") == "disk-delta":
+        # miles wipes the delta dir at warmup (a new stream from the base); keep a previous
+        # launch's stream (e.g. before a resume) aside instead of losing it
+        if P.delta_dir.is_dir() and any(P.delta_dir.iterdir()):
+            aside = P.delta_dir.with_name(f"delta.{time.strftime('%Y%m%d-%H%M%S')}")
+            os.replace(P.delta_dir, aside)
         P.delta_dir.mkdir(parents=True, exist_ok=True)
     P.tinker_root.mkdir(parents=True, exist_ok=True)
     local_ckpt = f"{node_local}/hf-local"
@@ -321,6 +326,15 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         head = subprocess.Popen(head_cmd, stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
     procs.append(head)
+    # GPU memory of the trainer node, every 5 s (peak = the memory probe's number)
+    try:
+        gmon = open(P.logs / f"gpu_mem.{job_id.split('.')[0]}.csv", "ab")
+        procs.append(subprocess.Popen(
+            ["nvidia-smi", "--query-gpu=timestamp,index,memory.used,memory.total,utilization.gpu",
+             "--format=csv,noheader,nounits", "-l", "5"], stdout=gmon, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True))
+    except OSError:
+        pass
     for k, (h, vnode) in enumerate(nodes[1:], start=1):
         # pbsdsh gives a bare environment: everything is in the argv; node-local dirs first
         wcmd = (f"mkdir -p {shlex.quote(node_local)}/tmp && exec env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin "
@@ -373,9 +387,18 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
                                         stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                         start_new_session=True)
 
-        if run.driver.get("where") == "gateway":
-            driver = start_driver()
+        held = bool(run.driver.get("hold"))
+        if run.driver.get("where") == "gateway" and held:
+            _log(log, "driver held: start it with `python -m harnessforge.train driver --run-dir ...` "
+                      "(writes START_DRIVER)")
         while True:
+            if driver is None and run.driver.get("where") == "gateway" and \
+                    (not held or (P.dir / "START_DRIVER").exists()):
+                if held:
+                    sd = P.dir / "START_DRIVER"
+                    sd.rename(sd.with_name(f"START_DRIVER.{int(time.time())}"))
+                    _log(log, "START_DRIVER: starting the driver")
+                driver = start_driver()
             if P.stop_file.exists() or stopping["flag"]:
                 _log(log, "STOP requested")
                 break
@@ -396,7 +419,9 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         if driver is not None and driver.poll() is None:
             driver.send_signal(signal.SIGTERM)
             try:
-                driver.wait(timeout=300)
+                # platoon's graceful stop finishes the in-flight forward_backward (~30 min at
+                # 131k) and then writes its interrupted checkpoint: give it the time
+                driver.wait(timeout=float(run.driver.get("stop_timeout", 900)))
             except subprocess.TimeoutExpired:
                 os.killpg(driver.pid, signal.SIGKILL)
         for p in procs:
@@ -499,6 +524,8 @@ def inner_head(run_dir: str, ip: str, port: int, gpus: int, local_ckpt: str) -> 
                                       "TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR",
                                       "FLASHINFER_WORKSPACE_DIR", "XDG_CACHE_HOME", "WANDB_MODE")
            if k in os.environ},
+        # gateway.env (e.g. PYTORCH_CUDA_ALLOC_CONF) reaches the Ray actors explicitly
+        **{k: os.environ[k] for k in (run.gateway.get("env") or {}) if k in os.environ},
     }
     cmd = (f"ray job submit --address=http://127.0.0.1:{DASH_PORT} "
            f"--runtime-env-json={shlex.quote(json.dumps({'env_vars': env_vars}))} "
