@@ -219,6 +219,41 @@ def cmd_export(a) -> int:
     return 0
 
 
+def scan_for(values: list[bytes], roots: list[Path], max_bytes: int = 512 << 20) -> tuple[int, list[str]]:
+    """(files scanned, paths of files containing any of `values`). Values are never printed."""
+    hits, n = [], 0
+    for root in roots:
+        files = [root] if root.is_file() else (p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+        for f in files:
+            try:
+                if f.stat().st_size > max_bytes:
+                    continue
+                data = f.read_bytes()
+            except OSError:
+                continue
+            n += 1
+            if any(v in data for v in values):
+                hits.append(str(f))
+    return n, hits
+
+
+def cmd_scan_secrets(a) -> int:
+    """Check that no W&B credential value (from driver.wandb_env_file / the env) appears in the run
+    dir or extra paths; prints counts and file paths only."""
+    from harnessforge.train.driver import DEFAULT_WANDB_ENV_FILE, WANDB_ENV_NAMES, read_env_file
+    import os
+    run = TrainRun.load(Path(a.run_dir) / "run.json")
+    vals = read_env_file(run.driver.get("wandb_env_file", DEFAULT_WANDB_ENV_FILE))
+    vals.update({k: os.environ[k] for k in WANDB_ENV_NAMES if os.environ.get(k)})
+    secrets = [v.encode() for k, v in vals.items() if k == "WANDB_API_KEY" and len(v) >= 16]
+    if not secrets:
+        print("no WANDB_API_KEY value found to scan for")
+        return 2
+    n, hits = scan_for(secrets, [run.dir, *map(Path, a.also)])
+    print(json.dumps({"scanned_files": n, "files_containing_key": hits}, indent=1))
+    return 1 if hits else 0
+
+
 def cmd_mapping(a) -> int:
     print("| old setting | old value | platoon / miles-tinker | status |")
     print("|---|---|---|---|")
@@ -237,13 +272,16 @@ def main(argv: list[str] | None = None) -> int:
         if name == "launch":
             s.add_argument("--force", action="store_true")
             s.add_argument("--no-driver", action="store_true")
-    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver", "unlend"):
+    for name in ("status", "stop", "export", "gateway-job", "driver-job", "driver", "unlend",
+                 "scan-secrets"):
         s = sub.add_parser(name)
         s.add_argument("--run-dir", required=True)
         if name == "stop":
             s.add_argument("--grace", type=float, default=600)
             s.add_argument("--driver-only", action="store_true",
                            help="stop the driver (platoon) and keep the gateway serving")
+        if name == "scan-secrets":
+            s.add_argument("--also", action="append", default=[], help="more files/dirs to scan")
         if name == "driver":
             s.add_argument("--set", action="append", default=[],
                            help="run.json override, dotted key = JSON value, e.g. env.harbor_system_deps=false")
@@ -261,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         from harnessforge.train.driver import run_driver_job
         return run_driver_job(a.run_dir)
     return {"render": cmd_render, "launch": cmd_launch, "status": cmd_status, "stop": cmd_stop,
-            "driver": cmd_driver, "unlend": cmd_unlend,
+            "driver": cmd_driver, "unlend": cmd_unlend, "scan-secrets": cmd_scan_secrets,
             "export": cmd_export, "mapping": cmd_mapping}[a.cmd](a)
 
 

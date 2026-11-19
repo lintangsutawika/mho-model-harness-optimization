@@ -109,7 +109,9 @@ def train_config(run: TrainRun, tasks: Sequence[str], url: str, spec: Path) -> d
     from harnessforge.train.config import merge
     train = merge(TRAIN_DEFAULTS, {"model_name": run["model"]["name"], **run["train"]})
     stats = merge({"experiment_name": run.run_id, "trial_name": "train",
-                   "wandb": {"mode": "disabled"}}, run.get("stats", {}))
+                   "wandb": {"mode": "disabled", "name": run.run_id}}, run.get("stats", {}))
+    # credentials go through the platoon process env (driver.wandb_secrets), never the config
+    stats.get("wandb", {}).pop("api_key", None)
     return {
         "log_path": str(run.paths.platoon_dir),
         "tinker_base_url": url,

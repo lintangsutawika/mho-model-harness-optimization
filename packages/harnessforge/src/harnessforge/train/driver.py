@@ -29,6 +29,56 @@ from harnessforge.train.config import TrainRun
 from harnessforge.train.gateway import _write_json, container_argv
 
 TINKER_API_KEY = "tml-local"          # miles-tinker has no auth: the key only names the tenant
+#: read from driver.wandb_env_file (only these names); passed to the platoon process env only
+WANDB_ENV_NAMES = ("WANDB_API_KEY", "WANDB_ENTITY")
+DEFAULT_WANDB_ENV_FILE = "~/mho-model-harness-optimization/mho-platoon-port/.env"
+
+
+def read_env_file(path: str | Path, names: tuple[str, ...] = WANDB_ENV_NAMES) -> dict[str, str]:
+    """`NAME=value` / `export NAME="value"` lines of a .env file, for `names` only (other lines,
+    comments and values of other variables are never looked at beyond the name). Missing file: {}."""
+    out: dict[str, str] = {}
+    try:
+        text = Path(path).expanduser().read_text()
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        name, sep, value = line.partition("=")
+        name = name.strip()
+        if not sep or name not in names:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        if value:
+            out[name] = value
+    return out
+
+
+def wandb_secrets(run: TrainRun, environ: dict[str, str] | None = None) -> tuple[dict[str, str], str]:
+    """(W&B variables for the platoon process, a log line naming only their sources). The
+    process env wins over driver.wandb_env_file (default ~/mho-model-harness-optimization/mho-platoon-port/.env). Nothing when W&B is
+    not online."""
+    environ = os.environ if environ is None else environ
+    mode = (run.get("stats", {}).get("wandb") or {}).get("mode", "disabled")
+    if mode != "online":
+        return {}, f"wandb mode {mode}: no W&B credentials needed"
+    path = run.driver.get("wandb_env_file", DEFAULT_WANDB_ENV_FILE)
+    from_file = read_env_file(path)
+    out, src = {}, []
+    for name in WANDB_ENV_NAMES:
+        if environ.get(name):
+            out[name] = environ[name]
+            src.append(f"{name} from the environment")
+        elif name in from_file:
+            out[name] = from_file[name]
+            src.append(f"{name} from {path}")
+    return out, "; ".join(src) or f"no W&B credentials in the environment or {path}"
 
 
 def _log(run: TrainRun, msg: str) -> None:
@@ -58,7 +108,7 @@ def exporter_argv(run: TrainRun, *, follow: bool) -> list[str]:
     return container_argv(run, node_local=node_local) + py + (["--follow"] if follow else [])
 
 
-def platoon_env(run: TrainRun, url: str) -> dict[str, str]:
+def platoon_env(run: TrainRun, url: str, secrets: dict[str, str] | None = None) -> dict[str, str]:
     d = run.driver
     hf_src = run.get("harnessforge_src") or str(Path(__file__).resolve().parents[2])
     from harnessforge.train.gateway import node_local_dir
@@ -75,6 +125,7 @@ def platoon_env(run: TrainRun, url: str) -> dict[str, str]:
     if d.get("site"):
         env["PLATOON_SITE"] = str(d["site"])
     env.update({k: str(v) for k, v in (d.get("env") or {}).items()})
+    env.update(secrets or {})          # this process env only: never logged, never written to disk
     return env
 
 
@@ -127,8 +178,14 @@ def run_driver_job(run_dir: str | Path) -> int:
         g = wait_gateway(run)
         url = g["url"]
         _log(run, f"gateway ready at {url}")
+        secrets, how = wandb_secrets(run)
+        _log(run, how)                                   # variable names and sources only
+        if (run.get("stats", {}).get("wandb") or {}).get("mode") == "online" and \
+                "WANDB_API_KEY" not in secrets:
+            _log(run, "WARNING: no WANDB_API_KEY; logging to W&B offline instead (wandb sync later)")
+            run.raw.setdefault("stats", {}).setdefault("wandb", {})["mode"] = "offline"
         cfg = prepare(run, url)
-        env = platoon_env(run, url)
+        env = platoon_env(run, url, secrets)
         final = P.dir / "export" / "FINAL"
         if final.exists():                                  # a previous driver's end marker
             final.rename(final.with_name(f"FINAL.{int(time.time())}"))

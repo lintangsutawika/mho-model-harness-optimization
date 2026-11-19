@@ -3,7 +3,11 @@
  "runs_root": "/groups/gai51740/aci18914wh/mho/runs",
  "python": "/home/aci18914wh/.local/bin/python3.12",
  "harnessforge_src": "/home/aci18914wh/hf-dev/train/harnessforge/src",
- "launcher": {"kind": "pbs", "queue": "R9920261300", "account": "gai51740"},
+ "launcher": {
+  "kind": "pbs",
+  "queue": "R9920261300",
+  "account": "gai51740"
+ },
  "model": {
   "name": "Qwen/Qwen3.5-4B",
   "hf_checkpoint": "/home/aci18914wh/.cache/huggingface/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
@@ -20,34 +24,72 @@
   "tp": 2,
   "max_tokens_per_gpu": 65536,
   "log_probs_chunk_size": 1024,
-  "sglang": {"mem-fraction-static": 0.85, "context-length": 65536, "max-running-requests": 256},
-  "binds": ["/groups"]
+  "sglang": {
+   "mem-fraction-static": 0.85,
+   "context-length": 65536,
+   "max-running-requests": 256
+  },
+  "binds": [
+   "/groups"
+  ]
  },
  "driver": {
   "where": "hc",
   "walltime": "4:00:00",
   "platoon": "/home/aci18914wh/hf-dev/evals/venv/bin/platoon",
   "site": "/home/aci18914wh/hf-dev/evals/site.yaml",
-  "seed_image_cache": "/groups/gai51740/aci18914wh/mho/hpc-sandbox-images"
+  "seed_image_cache": "/groups/gai51740/aci18914wh/mho/hpc-sandbox-images",
+  "wandb_env_file": "/home/aci18914wh/mho-model-harness-optimization/mho-platoon-port/.env"
  },
- "data": {"dataset": "/home/aci18914wh/mho-model-harness-optimization/data-harbor/tmax-v11-train-naive", "seed": 0},
- "harness": {"id": "base", "dir": "/home/aci18914wh/mho-model-harness-optimization/micro-swe-agent"},
- "env": {"agent_timeout_multiplier": 6.0, "harbor_system_deps": true, "harbor_keep_processes": true},
+ "data": {
+  "dataset": "/home/aci18914wh/mho-model-harness-optimization/data-harbor/tmax-v11-train-naive",
+  "seed": 0
+ },
+ "harness": {
+  "id": "base",
+  "dir": "/home/aci18914wh/mho-model-harness-optimization/micro-swe-agent"
+ },
+ "env": {
+  "agent_timeout_multiplier": 6.0,
+  "harbor_system_deps": true,
+  "harbor_keep_processes": true
+ },
  "train": {
   "context_window_length": 65536,
-  "optimizer": {"learning_rate": 1e-6, "beta1": 0.9, "beta2": 0.98, "eps": 1e-8, "weight_decay": 0.1, "grad_clip_norm": 1.0},
+  "optimizer": {
+   "learning_rate": 1e-06,
+   "beta1": 0.9,
+   "beta2": 0.98,
+   "eps": 1e-08,
+   "weight_decay": 0.1,
+   "grad_clip_norm": 1.0
+  },
   "loss_fn": "ppo",
-  "loss_fn_config": {"clip_low_threshold": 0.8, "clip_high_threshold": 1.28},
+  "loss_fn_config": {
+   "clip_low_threshold": 0.8,
+   "clip_high_threshold": 1.28
+  },
   "task_sampler": "uniform",
   "workflow_config": {
    "rollout_config": {
     "max_steps": 500,
     "timeout": 7200,
     "sampling_precedence": "config",
-    "inference_params": {"temperature": 1.0, "top_p": 1.0, "max_completion_tokens": 16384}
+    "inference_params": {
+     "temperature": 1.0,
+     "top_p": 1.0,
+     "max_completion_tokens": 16384
+    }
    }
   }
  },
- "export": {"every": 10},
- "stats": {"wandb": {"mode": "offline", "project": "mho-harness"}}
+ "export": {
+  "every": 10
+ },
+ "stats": {
+  "wandb": {
+   "mode": "online",
+   "project": "mho-harness"
+  }
+ }
 }
