@@ -1,0 +1,16 @@
+{
+  "_model": "nvidia/Nemotron-Terminal-8B",
+  "_note": "Qwen3-8B SFT (Qwen3ForCausalLM, native ctx 40960, hermes-style <tool_call> template with enable_thinking). For our micro-swe-agent harness (tool calls): --tool-call-parser hermes, and WITHOUT a reasoning parser (same gotcha as Qwen3.5: a <tool_call> before an omitted </think> would be swallowed).",
+  "extra_args": [
+    "--enable-chunked-prefill",
+    "--max-num-batched-tokens",
+    "32768",
+    "--enable-prefix-caching",
+    "--enable-auto-tool-choice",
+    "--tool-call-parser",
+    "hermes"
+  ],
+  "spec_config": null,
+  "max_model_len": 40960,
+  "native_max_context": 40960
+}

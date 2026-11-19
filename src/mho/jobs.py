@@ -12,6 +12,15 @@ from pathlib import Path
 from utils.env import _ACCOUNT, _data_env, _phase_env, _phase_res, child_job_env
 from utils.state import detect_scheduler
 
+_TRANSIENT_SUBMIT = ("under maintenance", "cannot connect to server", "communication failure",
+                     "timed out", "timeout", "temporarily unavailable", "connection refused",
+                     "socket_resource_unavailable", "slurm_load", "try again")
+
+
+def _transient_submit_error(msg: str) -> bool:
+    m = msg.lower()
+    return any(t in m for t in _TRANSIENT_SUBMIT)
+
 REPO_DIR = Path(__file__).resolve().parents[2]
 
 # Phase job scripts submitted by the loop (one per phase). Each dispatches to the concrete
@@ -100,7 +109,17 @@ class Scheduler:
         else:
             _n = next((cmd[i+1] for i, c in enumerate(cmd) if c == "-N"), "job")
             print(f"  submit[{self.kind}] {_n}", flush=True)
-        r = subprocess.run(cmd, cwd=str(REPO_DIR), env=job_env, capture_output=True, text=True)
+        # Transient scheduler outages (e.g. PBS "PTL is under maintenance", server timeouts) used to
+        # crash the whole loop; retry those for up to MHO_SUBMIT_RETRY_SECONDS (default 2h).
+        deadline = time.time() + float(os.environ.get("MHO_SUBMIT_RETRY_SECONDS", 7200))
+        while True:
+            r = subprocess.run(cmd, cwd=str(REPO_DIR), env=job_env, capture_output=True, text=True)
+            msg = (r.stderr.strip() or r.stdout.strip())
+            if r.returncode == 0 or not _transient_submit_error(msg) or time.time() > deadline:
+                break
+            print(f"  submit transient failure rc={r.returncode}: {msg[:200]}; retrying in 60s",
+                  flush=True)
+            time.sleep(60)
         if r.returncode != 0:
             raise RuntimeError(f"submit failed rc={r.returncode}: {r.stderr.strip() or r.stdout.strip()}")
         out = r.stdout.strip()
@@ -170,9 +189,31 @@ class Scheduler:
             time.sleep(POLL_SECONDS)
 
 
+def submit_eval_group(sched: Scheduler, members: list[dict], *, model: str | None, data: str,
+                      n_trials: int, n_concurrent: int, group_file: Path, logs: Path,
+                      job_name: str, base_model: str | None = None) -> str:
+    """ONE eval job for several harnesses of the SAME model on the SAME data: eval.sh serves the
+    model once (one vLLM on the node) and runs one `harbor run` per member side by side, each
+    with its own harness, output dir and log, at `n_concurrent` trials each.
+    members: [{"harness", "out_dir", "job_name", "logs"}]; trials land at
+    <out_dir>/<job_name>/ exactly as submit_eval would put them. Written to `group_file`
+    (MHO_EVAL_GROUP) so the job is self-describing. `logs` is the shared job log (vLLM etc.)."""
+    import json as _json
+    group_file.parent.mkdir(parents=True, exist_ok=True)
+    rows = [{"harness": str(m["harness"]), "out_dir": str(m["out_dir"]),
+             "job_name": m["job_name"], "logs": str(m["logs"])} for m in members]
+    group_file.write_text(_json.dumps(rows, indent=1) + "\n")
+    first = rows[0]
+    return submit_eval(sched, "", model=model, harness=first["harness"], data=data,
+                       n_trials=n_trials, n_concurrent=n_concurrent, out_dir=Path(first["out_dir"]),
+                       logs=logs, job_name=job_name, base_model=base_model,
+                       extra_env={"MHO_EVAL_GROUP": str(group_file)})
+
+
 def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str | None,
                 data: str, n_trials: int, n_concurrent: int, out_dir: Path, logs: Path,
-                job_name: str, base_model: str | None = None) -> str:
+                job_name: str, base_model: str | None = None,
+                extra_env: dict | None = None) -> str:
     # The loop hands eval.sh the (model, harness, data) explicitly via MHO_* -- exactly the
     # manual form `MHO_MODEL=<model> MHO_DATA=<data> MHO_HARNESS=<harness> bash .../eval.sh`.
     # Trials land at MHO_OUT/<job_name>/ (eval.sh: EVAL_JOBS_DIR= MHO_OUT, EVAL_JOB_NAME= job_name).
@@ -195,6 +236,8 @@ def submit_eval(sched: Scheduler, task: str, *, model: str | None, harness: str 
         extra["MHO_BASE_MODEL"] = base_model
     if logs.suffix == ".out":       # <activity>.out -> <activity>-vllm.out
         extra["MHO_VLLM_LOG"] = str(logs.with_name(logs.stem + "-vllm.out"))
+    if extra_env:
+        extra.update(extra_env)
     # eval self-serves the model with vLLM on the node -> needs GPU(s). Default 1 (Qwen3.5-4B
     # fits on one H200); set MHO_EVAL_NGPUS=0 for an API/litellm model (no self-serve).
     return sched.submit(EVAL_SCRIPT, _phase_env(extra, None), name=f"mho-eval-{job_name}",
@@ -208,7 +251,10 @@ def submit_train(sched: Scheduler, trainer: str, *, model: str | None, harness: 
     """One training run (scripts/optimize/train.sh) from `model` with `harness`. `objective`
     (MHO_TRAIN_OBJECTIVE: grpo | rsft) and `steps` (NUM_ROLLOUT: rollout+update steps) default
     to the training script's own defaults when None."""
-    extra = {"MHO_TRAINER": trainer, "MHO_OUT": str(out_dir)}
+    extra = {"MHO_TRAINER": trainer, "MHO_OUT": str(out_dir),
+             # W&B run name (train.sh's RUN_NAME): <run>--<tag>, so each candidate's training is
+             # findable. out_dir is <run_dir>/candidates/<tag>/train.
+             "RUN_NAME": f"{Path(out_dir).parents[2].name}--{tag}"}
     if objective:
         extra["MHO_TRAIN_OBJECTIVE"] = objective
     if steps:

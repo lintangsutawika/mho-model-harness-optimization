@@ -11,6 +11,11 @@ from .base import Kind, Pair
 class HarnessKind(Kind):
     name = "harness"
 
+    def __init__(self, accept: str = "gate") -> None:
+        if accept not in ("gate", "train"):
+            raise ValueError(f"harness accept must be gate|train, got {accept!r}")
+        self.accept_on_train = accept == "train"
+
     def proposal_ok(self, cand_dir: Path) -> tuple[bool, str]:
         ok = (cand_dir / "harness" / "pyproject.toml").exists()
         return ok, "" if ok else "no harness/pyproject.toml"

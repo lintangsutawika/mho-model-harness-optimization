@@ -40,16 +40,30 @@ def fetch_archive(category: str) -> Path:
 
 
 def task_ids(archive: Path, category: str) -> list[str]:
-    """Sorted task directories ``./<category>/<task_id>/`` (images.json is not a task)."""
-    ids = set()
+    """Sorted task directories ``./<category>/<task_id>/`` (images.json is not a task).
+
+    Skips tasks whose image can never build: the Dockerfile does ``COPY files/`` but the task
+    ships no ``environment/files/`` (65 such tasks upstream; every attempt would fail with
+    ImageBuildError, whatever the harness or model)."""
+    ids, has_files, copies_files = set(), set(), set()
     with tarfile.open(archive) as tar:
-        for name in tar.getnames():
-            parts = Path(name).parts
+        for member in tar.getmembers():
+            parts = Path(member.name).parts
             if parts and parts[0] == ".":
                 parts = parts[1:]
             if len(parts) >= 3 and parts[0] == category:
                 ids.add(parts[1])
-    return sorted(ids)
+                rel = "/".join(parts[2:])
+                if rel.startswith("environment/files/"):
+                    has_files.add(parts[1])
+                elif rel == "environment/Dockerfile" and member.isfile():
+                    with tar.extractfile(member) as f:
+                        if b"COPY files/" in f.read():
+                            copies_files.add(parts[1])
+    broken = copies_files - has_files
+    if broken:
+        print(f"{category}: skipping {len(broken)} tasks that COPY files/ but have no files/")
+    return sorted(ids - broken)
 
 
 def select(category: str, pool: list[str], per_category: int, seed: int) -> list[str]:

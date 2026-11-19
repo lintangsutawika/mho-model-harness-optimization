@@ -182,7 +182,109 @@ def _install_registry_swap() -> None:
     log.info("EnvironmentType.SINGULARITY -> RemoteSingularityEnvironment (registry swap installed)")
 
 
-_install_registry_swap()
+def _install_sail_swap() -> None:
+    """MHO_SANDBOX=sail: trials run in Sail cloud sandboxes instead of host singularity.
+
+    The connector still builds EnvironmentConfig(type=singularity); repoint that registry
+    entry at sail.harbor:SailboxEnvironment (the class `harbor run --environment-import-path`
+    uses for SAIL evals). A task without docker_image is built from environment/Dockerfile."""
+    from harbor.environments import factory
+    from harbor.models.environment_type import EnvironmentType
+    # Default: Sail with retried start on transient API errors (mho/backends/sail_retry.py).
+    mod, _, cls = _os_env.get("MHO_SAIL_IMPORT",
+                              "mho.backends.sail_retry:RetryingSailboxEnvironment").partition(":")
+    factory._ENVIRONMENT_REGISTRY[EnvironmentType.SINGULARITY] = factory._EnvEntry(mod, cls, None)
+    log.info("EnvironmentType.SINGULARITY -> %s:%s (MHO_SANDBOX=sail)", mod, cls)
+
+
+def _relay_session_url(base_url: str) -> str:
+    """Session URL for an agent inside a Sail sandbox. It cannot reach this node, so its
+    model calls go to the Modal relay (MHO_RELAY_URL = https://<relay>/k/<secret>), whose
+    bridge on this node forwards the path to the session server. base_url is
+    http://<host>:<port>/sessions/<id>; the policy URL is that path + /v1."""
+    from urllib.parse import urlparse
+    # Keep host:port: each session lives on one of N session-server instances
+    # (node IP, ports base..base+N-1); the bridge routes /_hp/<host>:<port> there.
+    u = urlparse(base_url)
+    return (_relay_base().rstrip("/") + f"/_hp/{u.hostname}:{u.port or 80}"
+            + u.path.rstrip("/") + "/v1")
+
+
+def _relay_base() -> str:
+    """The relay to send a NEW trial to. train.sh rotates relays (a Sandbox lives <= 24 h) by
+    rewriting MHO_RELAY_URL_FILE; trials already running keep the URL they started with, and the
+    old relay stays up until they have finished."""
+    f = _os_env.get("MHO_RELAY_URL_FILE")
+    if f:
+        try:
+            url = Path(f).read_text().strip()
+            if url:
+                return url
+        except OSError as e:
+            log.warning("cannot read MHO_RELAY_URL_FILE (%s); using MHO_RELAY_URL", e)
+    return _os_env["MHO_RELAY_URL"]
+
+
+def _node_address(host: str) -> str:
+    """An address of this node that a pod reaches over its egress (slirp4netns). A pod has its
+    own /etc/hosts and resolves names through slirp's DNS forwarder, so the node's hostname
+    (which Miles puts in session URLs, e.g. hnode657) does not resolve there; and slirp runs with
+    --disable-host-loopback, so 127.x is never reachable. MHO_SESSION_HOST overrides."""
+    import ipaddress
+    import socket
+    if override := _os_env.get("MHO_SESSION_HOST", "").strip():
+        return override
+    try:
+        ipaddress.ip_address(host)
+        addr = host
+    except ValueError:
+        try:
+            addr = socket.gethostbyname(host)
+        except OSError:
+            addr = "127.0.0.1"
+    if addr.startswith("127."):
+        # The primary outbound address (no packet is sent for a UDP connect).
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            addr = s.getsockname()[0]
+    return addr
+
+
+def _pod_session_url(*args: Any, **kwargs: Any) -> str:
+    """resolve_session_url for MHO_SANDBOX=hpcsb: Miles' URL with the host replaced by the
+    node's IP address (see _node_address)."""
+    from urllib.parse import urlparse
+    url = _ORIG_RESOLVE_SESSION_URL(*args, **kwargs)
+    u = urlparse(url)
+    if not u.hostname:
+        return url
+    netloc = _node_address(u.hostname) + (f":{u.port}" if u.port else "")
+    return u._replace(netloc=netloc).geturl()
+
+
+def _install_hpcsb_swap() -> None:
+    """MHO_SANDBOX=hpcsb: trials run in hpc-sandbox pods on this node, provisioned and driven by
+    the host executor (service.py /hpcsb/*). The agent in a pod reaches the session servers at
+    the node's IP address over the pod's egress (_pod_session_url rewrites the hostname)."""
+    from harbor.environments import factory
+    from harbor.models.environment_type import EnvironmentType
+    factory._ENVIRONMENT_REGISTRY[EnvironmentType.SINGULARITY] = factory._EnvEntry(
+        "mho.backends.hpcsb_remote", "RemoteHpcSandboxEnvironment", None)
+    log.info("EnvironmentType.SINGULARITY -> RemoteHpcSandboxEnvironment (MHO_SANDBOX=hpcsb)")
+
+
+import os as _os  # noqa: E402
+_os_env = _os.environ
+_MODE = _os_env.get("MHO_SANDBOX", "").strip().lower()
+_SAIL = _MODE == "sail"
+if _SAIL:
+    if not _os_env.get("MHO_RELAY_URL"):
+        raise RuntimeError("MHO_SANDBOX=sail needs MHO_RELAY_URL (train.sh deploys the relay)")
+    _install_sail_swap()
+elif _MODE == "hpcsb":
+    _install_hpcsb_swap()
+else:
+    _install_registry_swap()
 # Arm the AgentFactory swap (mini-swe-agent -> our MicroSweAgent, whose install adds
 # --with mcp so litellm's mcp.types import resolves). Importing runs the idempotent swap.
 import harness.micro_swe_agent  # noqa: E402,F401
@@ -195,4 +297,10 @@ import harness.micro_swe_agent  # noqa: E402,F401
 # at this module.
 # --------------------------------------------------------------------------- #
 import harbor_agent_function as _haf  # noqa: E402
+if _SAIL:
+    # run() resolves the agent's policy URL through this module-level name.
+    _haf.resolve_session_url = _relay_session_url
+elif _MODE == "hpcsb":
+    _ORIG_RESOLVE_SESSION_URL = _haf.resolve_session_url
+    _haf.resolve_session_url = _pod_session_url
 run = _haf.run

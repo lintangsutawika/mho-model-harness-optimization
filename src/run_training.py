@@ -19,7 +19,7 @@ from typing import Literal
 import typer
 from launch_common import agentic_pythonpath_dirs, agentic_train_args, harbor_env_vars
 # per-objective loss / filter flags (mho is on PYTHONPATH: train.sh adds <repo>/src)
-from mho.train.objectives import objective_group_filter, objective_train_args, rollout_temperature
+from mho.train.objectives import async_train_args, objective_group_filter, objective_train_args, rollout_temperature
 
 import miles.utils.external_utils.command_utils as U
 
@@ -47,9 +47,13 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_batch_size: int = 4
     n_samples_per_prompt: int = 8
     global_batch_size: int = 32
-    save_interval: int = 100
-    # HF-format checkpoint path (Megatron backend). A format string: "{}" is filled with
-    # the rollout id, e.g. ".../hf/step_{}" -> .../hf/step_100. Empty = no HF save.
+    # MILES_SAVE_INTERVAL (train.sh SAVE_INTERVAL, default 5): HF + Megatron weights every N
+    # updates (and at the last), so intermediate checkpoints can be evaluated while training
+    # runs (scripts/run/ckpt-eval.sh). Optimizer state is not saved (--no-save-optim: 67 GB
+    # per save for 4B; the loop continues from the HF checkpoint, never a Megatron resume).
+    save_interval: int = int(os.environ.get("MILES_SAVE_INTERVAL", "5") or 5)
+    # HF-format checkpoint path (Megatron backend). A format string: "{rollout_id}" is filled with
+    # the rollout id, e.g. ".../hf/step_{rollout_id}" -> .../hf/step_100. Empty = no HF save.
     save_hf: str = os.environ.get("MILES_SAVE_HF", "")
     save_traces_dir: str = ""
 
@@ -83,8 +87,17 @@ class ScriptArgs(U.ExecuteTrainConfig):
     wandb_run_name: str = "glm47-flash-harbor-inprocess"
 
 
+def _env_int(name: str, default: int) -> int:
+    v = os.environ.get(name, "").strip()
+    return int(v) if v else default
+
+
 def cleanup():
     """Kill old Ray jobs and stale processes to free GPU resources."""
+    if os.environ.get("MILES_SCRIPT_EXTERNAL_RAY", "") in ("1", "true"):
+        # multi-node: train.sh just started this Ray cluster, and inside the container Ray runs
+        # from /opt/sglang/bin, so the 'sglang' sweep below would kill the Ray head itself.
+        return
     my_pid = os.getpid()
     ppid = os.getppid()
     exclude = f"grep -v '^{my_pid}$' | grep -v '^{ppid}$'"
@@ -110,6 +123,7 @@ def execute(args: ScriptArgs):
         f"--ref-load {args.ref_load} "
         f"--save {args.save_dir} "
         f"--save-interval {args.save_interval} "
+        "--no-save-optim "
         + (f"--save-hf {args.save_hf} " if args.save_hf else "")
     )
     rollout_args = (
@@ -127,21 +141,25 @@ def execute(args: ScriptArgs):
         f"--rollout-batch-size {args.rollout_batch_size} "
         f"--n-samples-per-prompt {args.n_samples_per_prompt} "
         f"--rollout-temperature {rollout_temperature(args.objective)} "
-        "--rollout-max-response-len 8192 "
+        f"--rollout-max-response-len {_env_int('ROLLOUT_MAX_RESPONSE_LEN', 8192)} "
         f"--max-seq-len {args.max_seq_len} "
         f"--global-batch-size {args.global_batch_size} "
         "--balance-data "
     )
     perf_args = (
-        "--tensor-model-parallel-size 2 "
+        f"--tensor-model-parallel-size {_env_int('MHO_TP', 2)} "
         "--sequence-parallel "
         "--pipeline-model-parallel-size 1 "
-        "--context-parallel-size 1 "
+        f"--context-parallel-size {_env_int('MHO_CP', 1)} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 16384 "
+        f"--max-tokens-per-gpu {_env_int('MAX_TOKENS_PER_GPU', 16384)} "
+        # MHO_LOG_PROBS_CHUNK: compute log-probs over chunks of tokens instead of materializing the
+        # full [tokens x vocab/TP] logits (a 65k-token sample at TP2 needs ~26 GiB for them alone).
+        + (f"--log-probs-chunk-size {_env_int('MHO_LOG_PROBS_CHUNK', 0)} " if _env_int('MHO_LOG_PROBS_CHUNK', 0) > 0 else "")
+        + 
         "--optimizer-cpu-offload "
         "--overlap-cpu-optimizer-d2h-h2d "
         "--use-precision-aware-optimizer "
@@ -177,15 +195,18 @@ def execute(args: ScriptArgs):
         "--custom-agent-function-path mho.backends.local_singularity.backend.run",
     )
     agent_args = objective_group_filter(agent_args, args.objective)
+    agent_args = async_train_args(agent_args, args.objective)
     misc_args = (
         "--attention-dropout 0.0 "
         "--hidden-dropout 0.0 "
         "--accumulate-allreduce-grads-in-fp32 "
         "--attention-softmax-in-fp32 "
         "--attention-backend flash "
-        f"--actor-num-nodes {args.num_nodes} "
-        "--actor-num-gpus-per-node 2 "
-        "--rollout-num-gpus 6 "
+        # single node (default): 2 trainer + 6 rollout GPUs. Multi-node (train.sh NUM_NODES>1): e.g.
+        # ACTOR_NUM_NODES=1 ACTOR_GPUS_PER_NODE=8 ROLLOUT_NUM_GPUS=24 for 1 trainer + 3 rollout nodes.
+        f"--actor-num-nodes {_env_int('ACTOR_NUM_NODES', args.num_nodes)} "
+        f"--actor-num-gpus-per-node {_env_int('ACTOR_GPUS_PER_NODE', 2)} "
+        f"--rollout-num-gpus {_env_int('ROLLOUT_NUM_GPUS', 6)} "
     )
     debug_args = "--debug-rollout-only " if args.mode == "debug_rollout_only" else ""
     trace_args = f"--dump-details {args.save_traces_dir} " if args.save_traces_dir else ""
@@ -207,11 +228,16 @@ def execute(args: ScriptArgs):
     if args.miles_host_ip:
         extra_env_vars["MILES_HOST_IP"] = args.miles_host_ip
     # the RSFT filters run in the rollout workers and read their knobs from the env
-    for var in ("MHO_RSFT_THRESHOLD", "MHO_RSFT_GROUP_FILTER"):
+    for var in ("MHO_RSFT_THRESHOLD", "MHO_RSFT_GROUP_FILTER", "MHO_DRGRPO_DIVISOR",
+                "MHO_DPPO_DELTA", "MHO_DPPO_CAP", "MHO_DPPO_DIVERGENCE",
+                "MHO_AGENT_TURN_CAP",
+                "EXECUTOR_URLS", "EXECUTOR_TOKEN_FILE"):
         if os.environ.get(var):
             extra_env_vars[var] = os.environ[var]
     print(f"[run_training] objective={args.objective} lr={lr} "
-          f"temperature={rollout_temperature(args.objective)}", flush=True)
+          f"temperature={rollout_temperature(args.objective)} "
+          f"fully_async={'--fully-async' in agent_args} "
+          f"dr_grpo={'--disable-grpo-std-normalization' in objective_args}", flush=True)
 
     U.execute_train(
         train_args=train_args,

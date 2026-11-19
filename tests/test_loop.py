@@ -244,6 +244,20 @@ def test_proposer_down_aborts_after_consecutive_failures(tmp_path):
     assert loop.st["propose_count"] == 0
 
 
+def test_proposer_abort_persists_state_for_restart(tmp_path):
+    """The abort must save the reset counter and the failed member: a restart re-reads
+    state.json, and a stale propose_fails=2 + a still-'running' failed job aborted it at once."""
+    loop, fake = make(tmp_path, scripted(val=[0.5], a=[0.3], b=[]), iterations=2,
+                      proposes=lambda tag: False)
+    with pytest.raises(LoopAbort, match="consecutive proposals"):
+        loop.run()
+    import json
+    saved = json.loads(loop.state_path.read_text())
+    assert saved["propose_fails"] == 0
+    members = (saved.get("round") or {}).get("members") or []
+    assert all(m["status"] != "running" or m["job"] is None for m in members)
+
+
 def test_one_log_file_per_job_under_run_logs(tmp_path):
     loop, fake = make(tmp_path, scripted(val=[None, 0.5, 0.6], a=[0.3], b=[0.5]), iterations=1)
     loop.run()
@@ -727,3 +741,21 @@ def test_model_update_that_fails_to_train_moves_on(tmp_path):
 def test_model_kind_rejects_unknown_settings():
     with pytest.raises(ValueError):
         ModelKind(train_data="t", trainer="miles", submit_train=None, source="mined")
+
+
+def test_harness_accept_train_skips_val(tmp_path):
+    """--harness-accept train: the train-gate winner is accepted with no val eval, and the
+    next round's A is that harness."""
+    better = flip(BASE, up=[1, 3, 5, 7, 9, 11, 13, 15])
+    loop, fake = make(tmp_path, scripted(val=[tasks(BASE)], a=[tasks(BASE), tasks(better)],
+                                         b=[tasks(better), tasks(better)]), iterations=2)
+    loop.kinds["harness"] = HarnessKind(accept="train")
+    loop.run()
+    rows = summary(loop)
+    assert [r["outcome"] for r in rows] == ["baseline", "accepted", "train_fail"]
+    assert rows[1]["path"] == "train_only" and rows[1]["train_score"] == rows[1]["ts_B"]
+    assert [c["stage"] for c in fake.calls].count("val") == 1          # baseline only
+    fr = json.loads(loop.frontier_path.read_text())
+    assert fr["_best"]["candidate"] == "candidate_1_0_1"
+    a_calls = [c for c in fake.calls if c["stage"] == "eval_a"]
+    assert a_calls[1]["harness"].endswith("candidate_1_0_1/harness")
