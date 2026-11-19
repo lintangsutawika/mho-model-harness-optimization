@@ -18,7 +18,11 @@
   "stop_timeout": 3600
  },
  "env": {
-  "on_context_overflow": "grade"
+  "on_context_overflow": "grade",
+  "harbor_system_deps": false,
+  "provider_options": {
+   "sysdeps": "/groups/gai51740/aci18914wh/mho/sysdeps/jammy-harbor-deps-2"
+  }
  },
  "checkpoint": {
   "every": 50,
