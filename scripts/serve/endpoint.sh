@@ -60,7 +60,7 @@ cleanup() {
   if [ "${RELAY_STOP_ON_EXIT:-0}" = 1 ]; then
     uv run -q --no-project --with modal modal app stop -y "$RELAY_APP" >/dev/null 2>&1 \
       || log "could not stop ${RELAY_APP}"
-  else
+  elif [ -n "${RELAY_URL:-}" ]; then
     log "relay app ${RELAY_APP} left deployed (stop: modal app stop ${RELAY_APP})"
   fi
 }
@@ -69,7 +69,10 @@ trap 'exit 143' TERM INT
 
 # 1. SGLang, DP over this slice, bound to localhost only.
 HF_CACHE_REAL="$(readlink -f "${HOME}/.cache/huggingface" 2>/dev/null || true)"
-BINDS=(--bind /home:/home)
+# miles_latest.sif keeps a root-only /root/Megatron-LM on sys.path; SGLang's scheduler dies importing
+# it. Mask /root with an empty dir (as harnessforge's pool does).
+mkdir -p "${SERVE_DIR}/emptyroot"
+BINDS=(--bind /home:/home --bind "${SERVE_DIR}/emptyroot:/root")
 [ -d /groups ] && BINDS+=(--bind /groups:/groups)
 case "$HF_CACHE_REAL" in /home/*|/groups/*|"") ;; *) BINDS+=(--bind "${HF_CACHE_REAL}:${HF_CACHE_REAL}") ;; esac
 # shellcheck disable=SC2086   # SGLANG_EXTRA_ARGS is deliberately word-split
