@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import os
+import shutil
 import sys
 import time
 from dataclasses import asdict
@@ -76,7 +77,7 @@ class SGLangPool:
                  router_args: dict[str, Any] | None = None, advertise: str = "auto",
                  engine_cmd: list[str] | None = None, router_cmd: list[str] | None = None,
                  python: str | None = None, startup_timeout: float = 1800,
-                 job_env: dict[str, str] | None = None):
+                 job_env: dict[str, str] | None = None, container_bin: str | None = None):
         self.spec = spec
         self._policy = policy
         self.pool_id = pool_id
@@ -92,6 +93,7 @@ class SGLangPool:
         self.python = python or ("python" if sif else sys.executable)
         self.startup_timeout = startup_timeout
         self.job_env = dict(job_env or {})
+        self.container_bin = container_bin
 
     # ------------------------------------------------------------------ construction
     @classmethod
@@ -107,7 +109,7 @@ class SGLangPool:
                    router_args=cfg.get("router_args"), advertise=cfg.get("advertise", "auto"),
                    engine_cmd=cfg.get("engine_cmd"), router_cmd=cfg.get("router_cmd"),
                    python=o.get("python"), startup_timeout=cfg.get("startup_timeout", 1800),
-                   job_env=o.get("job_env"))
+                   job_env=o.get("job_env"), container_bin=o.get("container_bin"))
 
     @property
     def launcher(self) -> Launcher:
@@ -125,7 +127,10 @@ class SGLangPool:
                  "--node", str(i)]
         if not self.sif:
             return agent
-        argv = ["singularity", "exec", "--nv"]
+        # absolute path: PBS execs a `--` command without a login PATH
+        container = (self.container_bin or shutil.which("singularity")
+                     or shutil.which("apptainer") or "singularity")
+        argv = [container, "exec", "--nv"]
         for b in self.binds:
             argv += ["--bind", b]
         return argv + [self.sif] + agent
@@ -150,7 +155,8 @@ class SGLangPool:
             "startup_timeout": self.startup_timeout,
             "engine_port": int(self.spec.launcher.get("engine_port", 31000)),
             "router_port": int(self.spec.launcher.get("router_port", 30000)),
-            "options": {"binds": self.binds, "python": self.python, "job_env": self.job_env},
+            "options": {"binds": self.binds, "python": self.python, "job_env": self.job_env,
+                        "container_bin": self.container_bin},
             "status": "starting", "jobs": {}, "history": [],
             "created_at": time.time()}
 

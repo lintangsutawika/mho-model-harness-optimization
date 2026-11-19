@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from harnessforge.contracts import JobSpec, JobState, JobStatus
 from harnessforge.launch.base import child_job_env
-
-import socket
 
 
 class LocalLauncher:
@@ -81,19 +81,27 @@ class LocalLauncher:
             pass
         return JobStatus(JobState.RUNNING, None, host)
 
-    def cancel(self, job_id: str) -> None:
+    def cancel(self, job_id: str, timeout: float = 30.0) -> None:
         pid = self._pid(job_id)
         try:
             os.killpg(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             return
+        # the job is over when its whole process group is gone, not just the wrapper shell
         p = self._procs.get(job_id)
-        if p is not None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if p is not None:
+                p.poll()
             try:
-                p.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                p.wait()
+                os.killpg(pid, 0)
+            except (ProcessLookupError, PermissionError):
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if p is not None:
+            p.wait()

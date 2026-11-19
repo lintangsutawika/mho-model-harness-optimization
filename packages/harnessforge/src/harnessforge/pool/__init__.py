@@ -39,4 +39,5 @@ def from_config(cfg: dict, launcher=None) -> SGLangPool:
         engine_env=cfg.get("engine_env"), router_args=cfg.get("router_args"),
         advertise=cfg.get("advertise", "auto"), engine_cmd=cfg.get("engine_cmd"),
         router_cmd=cfg.get("router_cmd"), python=cfg.get("python"),
-        startup_timeout=float(cfg.get("startup_timeout", 1800)), job_env=cfg.get("job_env"))
+        startup_timeout=float(cfg.get("startup_timeout", 1800)), job_env=cfg.get("job_env"),
+        container_bin=cfg.get("container_bin"))

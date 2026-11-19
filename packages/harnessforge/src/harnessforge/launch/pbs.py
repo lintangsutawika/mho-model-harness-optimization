@@ -20,6 +20,7 @@ The job's environment is the submitter's minus its own PBS_*/RTYPE/CUDA_VISIBLE_
 from __future__ import annotations
 
 import os
+import shutil
 
 from harnessforge.contracts import JobSpec, JobState, JobStatus
 from harnessforge.launch.base import BatchLauncher, child_job_env, job_command
@@ -75,12 +76,29 @@ def parse_qstat_f(text: str) -> JobStatus:
     return JobStatus(state=state, exit_code=exit_code, hosts=tuple(hosts))
 
 
+def pbs_bin(name: str, bin_dir: str | None = None) -> str:
+    """Path of a PBS client command. Batch jobs often have a minimal PATH without the PBS
+    clients (ABCI: /opt/pbs/bin), so fall back to $PBS_EXEC/bin and /opt/pbs/bin."""
+    if bin_dir:
+        return os.path.join(bin_dir, name)
+    if shutil.which(name):
+        return name
+    for d in (os.path.join(os.environ.get("PBS_EXEC", "/opt/pbs"), "bin"), "/opt/pbs/bin"):
+        if os.access(os.path.join(d, name), os.X_OK):
+            return os.path.join(d, name)
+    return name
+
+
 class PBSLauncher(BatchLauncher):
     kind = "pbs"
 
+    def __init__(self, *, bin_dir: str | None = None, **kw):
+        super().__init__(**kw)
+        self.bin_dir = bin_dir
+
     def render(self, spec: JobSpec) -> list[str]:
         rtype = self.opt(spec, "resource_type", "rtype")
-        argv = ["qsub", "-V"]
+        argv = [pbs_bin("qsub", self.bin_dir), "-V"]
         if rtype:
             argv += ["-v", f"RTYPE={rtype}"]
         argv += ["-N", spec.name]
@@ -107,13 +125,13 @@ class PBSLauncher(BatchLauncher):
 
     def status(self, job_id: str) -> JobStatus:
         # -x includes finished jobs, so Exit_status is read rather than guessed
-        r = self.runner(["qstat", "-x", "-f", job_id], None)
+        r = self.runner([pbs_bin("qstat", self.bin_dir), "-x", "-f", job_id], None)
         if r.returncode != 0:
             return JobStatus(JobState.DONE)       # purged from the server => finished
         return parse_qstat_f(r.stdout)
 
     def cancel(self, job_id: str) -> None:
-        r = self.runner(["qdel", job_id], None)
+        r = self.runner([pbs_bin("qdel", self.bin_dir), job_id], None)
         msg = (r.stderr + r.stdout).lower()
         if r.returncode != 0 and not any(s in msg for s in ("unknown job", "finished",
                                                              "job has finished")):

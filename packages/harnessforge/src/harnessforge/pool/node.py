@@ -31,8 +31,18 @@ from harnessforge.pool.state import PoolDir, write_json
 POLL = float(os.environ.get("HF_POOL_POLL", 5))
 
 
+_LOG_FILE: Path | None = None      # live agent log (the batch log only lands at job end on PBS)
+
+
 def log(msg: str) -> None:
-    print(f"[node {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[node {time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if _LOG_FILE is not None:
+        try:
+            with open(_LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass          # the state dir may be moved aside by stop(); never fail on logging
 
 
 # ----------------------------------------------------------------------------- helpers
@@ -270,6 +280,8 @@ class NodeAgent:
                 killpg(e.proc)
 
     def publish(self, status: str) -> None:
+        if not self.d.pool_file.exists():       # pool stopped and moved aside: don't recreate
+            return
         write_json(self.d.node_file(self.i), {
             "index": self.i, "host": self.host, "ip": self.ip, "status": status,
             "job_id": os.environ.get("PBS_JOBID") or os.environ.get("SLURM_JOB_ID") or "",
@@ -365,14 +377,17 @@ class NodeAgent:
                     self.reconcile_router()
                 time.sleep(POLL)
         finally:
+            # kill children first: nothing below may prevent it
             log("shutting down")
-            self.publish("stopping")
             if self.router_proc is not None:
                 killpg(self.router_proc, 10)
             for e in self.engines:
                 if e.proc is not None:
                     killpg(e.proc)
-            self.publish("stopped")
+            try:
+                self.publish("stopped")
+            except OSError:
+                pass
         return 0
 
 
@@ -381,7 +396,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--pool-dir", required=True)
     ap.add_argument("--node", type=int, required=True)
     a = ap.parse_args(argv)
-    return NodeAgent(PoolDir.at(a.pool_dir), a.node).run()
+    global _LOG_FILE
+    d = PoolDir.at(a.pool_dir)
+    d.logs.mkdir(parents=True, exist_ok=True)
+    _LOG_FILE = d.logs / f"node{a.node}.agent.log"
+    return NodeAgent(d, a.node).run()
 
 
 if __name__ == "__main__":

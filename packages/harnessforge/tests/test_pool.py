@@ -94,7 +94,8 @@ def test_node_jobs_and_pool_file(tmp_path):
     job = L.jobs["2.pbs1"]
     assert job.name == "hfpool-t-1" and job.gpus == 8 and job.walltime == "12:00:00"
     assert job.options == {"queue": "R99", "account": "gai", "resource_type": "rt_HF"}
-    assert list(job.command[:6]) == ["singularity", "exec", "--nv", "--bind", "/groups",
+    assert job.command[0].endswith(("singularity", "apptainer"))
+    assert list(job.command[1:6]) == ["exec", "--nv", "--bind", "/groups",
                                      "/s/miles.sif"]
     assert list(job.command[-4:]) == ["--pool-dir", str(tmp_path / "t"), "--node", "1"]
     assert job.env["HF_HUB_OFFLINE"] == "1" and job.env["PYTHONPATH"].endswith("src")
