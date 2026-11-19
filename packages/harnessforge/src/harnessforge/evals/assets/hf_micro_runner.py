@@ -4,10 +4,17 @@ Launched by the harnessforge harness spec with the toolchain's interpreter (`{to
 package is installed in the sandbox: the candidate's `src/` (mounted read-only) goes first on sys.path and its own
 `micro_swe.__main__.main` runs with the command line harbor's MiniSweAgent passes to the `mini-swe-agent` binary.
 
-    hf_micro_runner.py --candidate DIR --task-file FILE [mini-swe-agent args...]
+    hf_micro_runner.py [--keep-children] --candidate DIR --task-file FILE [mini-swe-agent args...]
+
+`--keep-children` drops platoon's launch marker (PLATOON_HARNESS_AGENT) from the environment the agent's commands
+inherit. platoon kills every sandbox process carrying the marker when the harness exits, which ends a server the
+agent was asked to leave running before the tests can reach it; harbor's agent left such processes alive. This
+process keeps its own marker, so a timeout still kills the agent loop.
 """
 import os
 import sys
+
+MARKER_ENV = "PLATOON_HARNESS_AGENT"  # platoon.harness.runner.AGENT_MARKER_ENV
 
 
 def main() -> None:
@@ -18,6 +25,9 @@ def main() -> None:
     while i < len(args):
         if args[i] == "--candidate":
             candidate, i = args[i + 1], i + 2
+        elif args[i] == "--keep-children":
+            os.environ.pop(MARKER_ENV, None)  # unsetenv: children started from here on are not marked
+            i += 1
         elif args[i] == "--task-file":
             task_file, i = args[i + 1], i + 2
         else:

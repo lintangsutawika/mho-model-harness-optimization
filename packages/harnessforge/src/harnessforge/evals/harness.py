@@ -64,7 +64,7 @@ def spec_name(candidate: Candidate) -> str:
 
 def render_spec(candidate: Candidate, out_dir: str | Path, *, agent_config: str | Path | None = None,
                 toolchain: str = TOOLCHAIN, prepare: Sequence[str] = (), timeout_s: int = 86400,
-                memory_mb: int = 0, llm_timeout_s: int = 3600) -> Path:
+                memory_mb: int = 0, llm_timeout_s: int = 3600, keep_children: bool = True) -> Path:
     """Write the candidate's harness spec (and its assets) into `out_dir`; returns the spec's path.
 
     `agent_config` is the sampling YAML layered after `-c mini` (eval.sh's `configs/sampling/<model>.yaml`).
@@ -72,11 +72,14 @@ def render_spec(candidate: Candidate, out_dir: str | Path, *, agent_config: str 
     `[install] commands`): what our harbor path did to the environment before its agent ran (see `PlatoonBackend`).
     `timeout_s` is the spec's own limit; the task's `[agent] timeout_sec` x `agent_timeout_multiplier` normally binds
     first, as harbor's agent timeout did. `memory_mb` (default 0) is added to the task's memory limit for the agent's
-    own processes; 0 counts them against the task's limit, as harbor did."""
+    own processes; 0 counts them against the task's limit, as harbor did. `keep_children` (default, harbor parity)
+    leaves what the agent's commands started running after the harness exits (the runner's `--keep-children`);
+    platoon otherwise kills every process of the launch when it ends."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(RUNNER, out / RUNNER.name)
     argv = ["{toolchain}/bin/python3", "-I", "{state_dir}/" + RUNNER.name,
+            *(["--keep-children"] if keep_children else []),
             "--candidate", CANDIDATE_MOUNT, "--task-file", "{state_dir}/instruction.md",
             "--yolo", "--model=litellm_proxy/{model}", "--output={state_dir}/trajectory.json", "--cost-limit", "0",
             "-c", "mini", "-c", f"model.model_kwargs.timeout={int(llm_timeout_s)}"]

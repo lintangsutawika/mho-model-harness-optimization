@@ -34,8 +34,11 @@ Options (`EvalRequest.options`):
     agent_timeout_multiplier, verifier_timeout_multiplier   as harbor's --agent-timeout-multiplier (default 1.0)
     harbor_system_deps  apt/dnf/apk-install curl, bash, gcc/make, git, python3, pip3 when missing, before the agent
                       runs, as harbor's installed-agent setup does in every trial (default True: parity with harbor)
-    harbor_keep_processes  grade with the processes the agent left running alive, as harbor does (default True; platoon
-                      kills them before the tests, which fails tasks that check a server the agent started)
+    harbor_keep_processes  grade with the processes the agent left running alive, as harbor does (default True). platoon
+                      kills them twice: every process of the harness launch when the harness exits (the runner's
+                      --keep-children unmarks the agent's commands), and every process in the sandbox before the
+                      tests (the pod provider's keep_agent_processes); either fails tasks that check a server the
+                      agent started
     materialize       copy the tasks into the run dir and give Dockerfile-only tasks their FROM image (default True)
     toolchain         toolchain name (default harness.TOOLCHAIN)
     hosted_timeout_s  seconds one model call may take at the gateway (default 3600, the agent's own litellm timeout)
@@ -226,7 +229,8 @@ class PlatoonBackend:
         for candidate in request.candidates:
             out = run_dir / _slug(candidate.id)
             spec = render_spec(candidate, out / "harness", agent_config=opts.get("agent_config"),
-                               toolchain=opts.get("toolchain", TOOLCHAIN), prepare=prepare)
+                               toolchain=opts.get("toolchain", TOOLCHAIN), prepare=prepare,
+                               keep_children=bool(opts.get("harbor_keep_processes", True)))
             config = out / "eval.yaml"  # JSON, which is YAML
             config.write_text(json.dumps(self._config(request, candidate, model, spec, dataset_dir, out, opts),
                                          indent=1))

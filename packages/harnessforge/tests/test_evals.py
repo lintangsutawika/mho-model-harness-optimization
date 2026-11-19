@@ -158,12 +158,34 @@ def test_render_spec_parses(tmp_path):
     assert data["name"] == "hf-micro-swe-cand-7" and data["install"]["toolchain"] == "hf-micro-swe-1"
     assert data["install"]["commands"] == ["set -e\necho 'x' && echo \"$HOME\""]
     argv = data["launch"]["argv"]
-    assert argv[:3] == ["{toolchain}/bin/python3", "-I", "{state_dir}/hf_micro_runner.py"]
+    assert argv[:4] == ["{toolchain}/bin/python3", "-I", "{state_dir}/hf_micro_runner.py", "--keep-children"]
     assert argv[argv.index("-c") + 1] == "mini" and "{state_dir}/agent-config.yaml" in argv
     assert "--cost-limit" in argv and argv[-1] == "--exit-immediately"
     assert data["launch"]["env"]["LITELLM_PROXY_API_BASE"] == "{base_url}/v1"
     assert (tmp_path / "h" / "hf_micro_runner.py").exists() and (tmp_path / "h" / "agent-config.yaml").exists()
     assert "resources" not in data
+
+
+@pytest.mark.parametrize("keep", [True, False])
+def test_runner_unmarks_the_agents_commands(tmp_path, keep):
+    """platoon kills every process carrying its launch marker when the harness exits; with --keep-children the
+    commands the agent starts (a server it was asked to leave running) do not carry it, the runner itself does."""
+    import subprocess
+    from harnessforge.evals.harness import RUNNER
+
+    cand = micro_checkout(tmp_path / "c")
+    (cand / "src" / "micro_swe" / "__main__.py").write_text(
+        "import subprocess\n"
+        "def main(argv=None):\n"
+        "    out = [a for a in argv if a.startswith('--output=')][0].split('=', 1)[1]\n"
+        "    cmd = ['sh', '-c', 'echo ${PLATOON_HARNESS_AGENT:-unmarked}']\n"
+        "    open(out, 'w').write(subprocess.run(cmd, capture_output=True, text=True).stdout)\n")
+    (tmp_path / "task.md").write_text("do it")
+    env = {"PATH": "/usr/bin:/bin", "PLATOON_HARNESS_AGENT": "agent.123"}
+    argv = [sys.executable, "-I", str(RUNNER), *(["--keep-children"] if keep else []), "--candidate", str(cand),
+            "--task-file", str(tmp_path / "task.md"), f"--output={tmp_path / 'out'}"]
+    subprocess.run(argv, env=env, check=True, timeout=60)
+    assert (tmp_path / "out").read_text().strip() == ("unmarked" if keep else "agent.123")
 
 
 def test_check_candidate(tmp_path):
@@ -172,6 +194,36 @@ def test_check_candidate(tmp_path):
         check_candidate(tmp_path)
     with pytest.raises(CandidateError, match="numpy"):
         check_candidate(micro_checkout(tmp_path / "np", deps=("litellm", "numpy>=2")))
+
+
+def test_bench_tasks_and_harnesses_fit_the_platoon_backend(tmp_path):
+    """harnessforge.bench output runs through PlatoonBackend unchanged: its tasks name their image in task.toml (no
+    Dockerfile replay), a .sif path is used as is, and every gold/start/ablation variant is a valid candidate."""
+    from harnessforge.bench import builder
+    from harnessforge.bench.tasks.generate import generate
+    from harnessforge.evals.__main__ import task_image
+
+    sif = "/images/hf-bench-0.1.sif"
+    manifest = generate(tmp_path / "bench", per_family=1, image=sif)
+    ids = [t["task_id"] for t in manifest]
+    assert len(ids) == 10
+    assert materialize(tmp_path / "bench", ids, tmp_path / "ds") == {}  # docker_image set: nothing to replay
+    for tid in ids:
+        cfg = tomllib.loads((tmp_path / "ds" / tid / "task.toml").read_text())
+        assert cfg["environment"]["docker_image"] == sif and not cfg.get("steps")
+        assert "user" not in cfg.get("agent", {}) and (tmp_path / "ds" / tid / "tests" / "test.sh").is_file()
+        assert task_image(tmp_path / "ds" / tid) == sif  # stage-images skips it; hpc-sandbox runs the .sif
+    harnesses = builder.build_all(tmp_path / "h", names=["gold", "start", "ablate_context_trim"])
+    for path in harnesses.values():
+        check_candidate(path)
+    request = EvalRequest(run_id="b1", candidates=[Candidate(k, v) for k, v in harnesses.items()], tasks=ids,
+                          dataset=str(tmp_path / "bench"), trials=1, endpoint="http://gpu:8000/v1", policy="p",
+                          concurrency=2, out_dir=tmp_path / "out",
+                          options={"model": "p", "harbor_system_deps": False})
+    PlatoonBackend(launch=False).start(request)
+    spec = tomllib.loads(Path(json.loads((tmp_path / "out" / "b1" / "gold" / "eval.yaml").read_text())
+                              ["environments"][0]["harness"]).read_text())
+    assert not spec["install"].get("commands")
 
 
 # ----------------------------------------------------------------------------- PlatoonBackend
