@@ -11,11 +11,13 @@ See docs/stats.md.
 """
 from harnessforge.stats.boundaries import (DEFAULT_C, DEFAULT_FUTILITY, Design, Verdict,
                                            linear_futility)
+from harnessforge.stats.gate import ValGate
 from harnessforge.stats.looks import (DEFAULT_CHECKPOINTS, Look, LookData, LookSchedule,
                                       UnitIndex, collect)
 from harnessforge.stats.paired import Decision, GateConfig, Paired, decide, paired, task_mean
+from harnessforge.stats.race import CandidateState, Race, RaceStatus, ReferenceMode
 
-__all__ = ["DEFAULT_C", "DEFAULT_CHECKPOINTS", "DEFAULT_FUTILITY", "Decision",
-           "Design", "GateConfig", "Look", "LookData", "LookSchedule", "Paired",
-           "UnitIndex", "Verdict", "collect", "decide",
+__all__ = ["DEFAULT_C", "DEFAULT_CHECKPOINTS", "DEFAULT_FUTILITY", "CandidateState", "Decision",
+           "Design", "GateConfig", "Look", "LookData", "LookSchedule", "Paired", "Race",
+           "RaceStatus", "ReferenceMode", "UnitIndex", "ValGate", "Verdict", "collect", "decide",
            "linear_futility", "paired", "task_mean"]
