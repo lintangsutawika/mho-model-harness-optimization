@@ -305,6 +305,11 @@ def run_gateway_job(run_dir: str | Path, *, health_timeout: float = 3600) -> int
         os.write(fd, os.urandom(32).hex().encode())
         os.close(fd)
     if run.gateway.get("weight_sync", "disk-delta") == "disk-delta":
+        # miles wipes the delta dir at warmup (a new stream from the base); keep a previous
+        # launch's stream (e.g. before a resume) aside instead of losing it
+        if P.delta_dir.is_dir() and any(P.delta_dir.iterdir()):
+            aside = P.delta_dir.with_name(f"delta.{time.strftime('%Y%m%d-%H%M%S')}")
+            os.replace(P.delta_dir, aside)
         P.delta_dir.mkdir(parents=True, exist_ok=True)
     P.tinker_root.mkdir(parents=True, exist_ok=True)
     local_ckpt = f"{node_local}/hf-local"

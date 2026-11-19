@@ -159,6 +159,29 @@ def prepare(run: TrainRun, url: str) -> Path:
     return run.paths.platoon_config
 
 
+def resume_batch(run: TrainRun) -> int:
+    """The batch platoon resumes from: its newest checkpoint in log_path (0 for a fresh run)."""
+    last = 0
+    for f in run.paths.platoon_dir.glob("*/*/checkpoints.jsonl"):
+        for line in f.read_text().splitlines():
+            try:
+                last = max(last, int(json.loads(line).get("batch", 0)))
+            except (ValueError, TypeError):
+                pass
+    return last
+
+
+def record_stream_base(run: TrainRun) -> None:
+    """Tell the HF exporter which step this gateway's delta stream starts after (resume)."""
+    from harnessforge.train.export import DeltaExporter
+    d = run.paths.delta_dir
+    if not d.is_dir():
+        return
+    sid = DeltaExporter(base=".", deltas=d, work=".", out=".").stream_id()
+    _write_json(d.parent / "stream_base.json", {"stream": sid, "batch": resume_batch(run),
+                                                "at": time.time()})
+
+
 def run_driver_job(run_dir: str | Path) -> int:
     run = TrainRun.load(Path(run_dir) / "run.json")
     P = run.paths
@@ -191,6 +214,7 @@ def run_driver_job(run_dir: str | Path) -> int:
             run.raw.setdefault("stats", {}).setdefault("wandb", {})["mode"] = "offline"
         cfg = prepare(run, url)
         env = platoon_env(run, url, secrets)
+        record_stream_base(run)
         final = P.dir / "export" / "FINAL"
         if final.exists():                                  # a previous driver's end marker
             final.rename(final.with_name(f"FINAL.{int(time.time())}"))

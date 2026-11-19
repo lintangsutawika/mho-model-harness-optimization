@@ -1,5 +1,5 @@
 {
- "_comment": "naive_ext.json at a 131072-token context (per-call max_tokens 16384). No KL. TP4 + expandable segments: TP2 passed a single-datum probe (129.7/140 GB) but OOMed on the first real batch (26 GiB allocation, 33 GiB fragmented). Driver held until `train probe` passes, then `train driver`. Recovery checkpoints every 10 steps (keep 2).",
+ "_comment": "naive_ext.json at a 131072-token context (per-call max_tokens 16384). No KL. TP4 + expandable segments: TP2 passed a single-datum probe (129.7/140 GB) but OOMed on the first real batch (26 GiB allocation, 33 GiB fragmented). Driver held until `train probe` passes, then `train driver`. Recovery checkpoints every 10 steps, none pruned automatically (~47 GB each).",
  "extends": "naive_ext.json",
  "run_id": "platoon-grpo200-tmax-naive-uniform-noKL-ctx131k-ext--Qwen3.5-4B",
  "labels": {
@@ -36,7 +36,6 @@
  },
  "checkpoint": {
   "every": 50,
-  "recovery_every": 10,
-  "keep_recovery": 2
+  "recovery_every": 10
  }
 }

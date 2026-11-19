@@ -178,3 +178,22 @@ def test_step_naming_launch_push_final_push_new_stream(tmp_path):
                                   read(base, "model.visual.patch"))
     for k, a in states[3].items():
         np.testing.assert_array_equal(read(tmp_path / "hf" / "step_2", k), a.ravel())
+
+
+def test_resumed_stream_steps_continue(tmp_path):
+    """A resumed run's new stream (checkpoint at batch 20): v1 = platoon's launch push of the
+    checkpoint's weights = step 20, then step 21, 22."""
+    base, w, _ = make_base(tmp_path)
+    deltas = tmp_path / "weights" / "delta"
+    states = [w]
+    for v in range(1, 4):
+        nxt = {k: a + 1 for k, a in states[-1].items()}
+        publish(deltas, v, states[-1], nxt)
+        states.append(nxt)
+    ex = DeltaExporter(base=base, deltas=deltas, work=tmp_path / "work", out=tmp_path / "hf", every=1,
+                       log=lambda m: None)
+    (deltas.parent / "stream_base.json").write_text(json.dumps({"stream": ex.stream_id(), "batch": 20}))
+    ex.poll()
+    assert sorted(p.name for p in (tmp_path / "hf").glob("step_*")) == ["step_20", "step_21", "step_22"]
+    (deltas.parent / "stream_base.json").write_text(json.dumps({"stream": "other", "batch": 20}))
+    assert ex.step_of(3) == 2                          # a stale marker for another stream is ignored

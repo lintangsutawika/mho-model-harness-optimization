@@ -233,8 +233,18 @@ class DeltaExporter:
         (self.work / APPLYING_FILE).unlink()
         return {"version": v, "tensors": n, "bytes": changed, "unchecked": unchecked}
 
+    def stream_base(self) -> int:
+        """Steps before this stream (a resumed run: the checkpoint's batch). The driver records it
+        in <deltas>/../stream_base.json for the stream it starts against."""
+        f = self.deltas.parent / "stream_base.json"
+        try:
+            d = json.loads(f.read_text())
+        except (FileNotFoundError, ValueError):
+            return 0
+        return int(d.get("batch", 0)) if d.get("stream") == self.stream_id() else 0
+
     def step_of(self, v: int) -> int:
-        return v - self.version_offset
+        return self.stream_base() + v - self.version_offset
 
     def changed(self, v: int) -> bool:
         index = json.loads((self.deltas / f"weight_v{v:06d}" / "model.safetensors.index.json").read_text())

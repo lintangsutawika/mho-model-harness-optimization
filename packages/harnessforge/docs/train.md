@@ -391,6 +391,68 @@ state and any lent engines stay as they are.
 - **What platoon does on restart.** It resumes from its newest checkpoint in the same `log_path` (the launch
   checkpoint at least). A new `create_model` on the single-tenant gateway resets the trainer to that state.
 
+## Stopping, resuming, and handing over to a new pool
+
+**What a resume reuses.**
+- **platoon** resumes when it is run again with the same `log_path`. It takes the newest entry of
+  `checkpoints.jsonl`, which records the batch, policy version, optimizer steps, sampler/dispatch state files and
+  `wandb_run_id`. It then calls `create_training_client_from_state_with_optimizer`.
+- **miles-tinker** resolves `tinker://<model>/weights/<name>` through the `tinker_meta.json` sidecar in the run's
+  persistent `tinker/` checkpoint root. That works on a new gateway job too, with the same tenant (`tml-local`).
+  Weights and Adam state come back; the parallel layout must match the save (TP4).
+- **A graceful stop** (`train stop`) gives platoon a single SIGTERM. platoon writes a permanent
+  `NNNNNN_interrupted` checkpoint, so stopping right after any step loses nothing but in-flight rollouts.
+- **Disk-delta and HF export.**
+  - A new gateway starts a new stream from the base. The gateway first moves the previous `weights/delta` aside
+    (`delta.<ts>`), because miles would wipe it.
+  - The driver records `weights/stream_base.json` (`{stream, batch}`) so the exporter continues the step numbers:
+    v1 of the new stream is platoon's launch push of the checkpoint's weights = `step_<batch>`.
+
+**Checkpoint cadence and disk** (131k, `naive_ext_131k.json`).
+- Recovery checkpoints every 10 steps plus permanent ones every 50; nothing is pruned automatically
+  (`keep_recovery` unset).
+- Worst case, a crash or forced handover loses 10 steps (~3-5 h at 131k). A graceful stop loses none.
+- 200 steps on /groups:
+
+  | item | size |
+  |---|---|
+  | Tinker states (20 recovery + 4 permanent + launch/final, ~47 GB each) | ~1.2 TB |
+  | disk-delta stream (~0.3 GB/step, maybe more at 131k) | ~60-100 GB |
+  | HF exports (20 × 9 GB) | ~180 GB |
+  | **total** | **~1.4 TB** |
+
+- Pruning older recovery checkpoints is a user decision. platoon can do it (`keep_recovery`, through the Tinker
+  `delete_checkpoint` route).
+
+**Handover from n4hf72 to a new pool.** n4hf72's jobs started 00:55 JST Nov 20 with 72 h walltimes, so they end
+around 00:55 JST Nov 23. Node budget: 8 rt_HF.
+- Today: n4hf72 4 + trainer 1 + hf-serve 1 (ends ~02:40 JST Nov 21).
+- After hf-serve ends: 4 + 1 = 5, leaving room for a 3-node new pool to overlap.
+- qsub into R9920261300 accepted walltimes up to 336 h (held test jobs, deleted at once). The binding limit is the
+  reservation's end time, which `pbs_rstat` does not let us read; ask before relying on more than 72 h.
+
+1. After hf-serve ends (or on the user's go-ahead), start the new pool on 3 nodes. Use the same image, flags and
+   local-snapshot policy as n4hf72 (`~/hf-dev/pool/scripts/pool-n4hf72.json` with `pool_id: n3hfNEW`,
+   `nodes: 3`, `walltime: <longest allowed>`), from the pool tooling checkout whose agents support lending:
+   ```bash
+   cd ~/hf-dev/pool-lend/packages/harnessforge && PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.pool start --spec ~/hf-dev/pool/scripts/pool-n3hfNEW.json --no-wait
+   PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.pool wait --spec ~/hf-dev/pool/scripts/pool-n3hfNEW.json
+   ```
+2. Stop the run at a step boundary, which writes the interrupted checkpoint and returns n4hf72 nodes 1-3:
+   ```bash
+   cd ~/hf-dev/train/harnessforge-ext && PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train stop --run-dir <run> --grace 1800
+   ```
+3. Point the run at the new pool and resume. Same run id and run dir: platoon resumes from its newest checkpoint and
+   W&B run.
+   - Set `rollout.pool_spec` to the new spec and `rollout.lend_nodes: [0, 1, 2]` in `naive_ext_131k.json`. Don't
+     lend node 0 if evaluations should keep a router: lend `[1, 2]` and accept 16 engines, or start a 4-node pool.
+   - Set `driver.hold: false`.
+   ```bash
+   PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train launch --force --config configs/train/naive_ext_131k.json
+   ```
+4. Check that platoon logged `Resuming from ... batch N`, the W&B run id is unchanged, and `hf/step_<N+...>`
+   exports continue. Then stop n4hf72 if nothing else uses it (a user call).
+
 ## W&B logging
 
 platoon logs the run to W&B. `abci-base.json` sets `stats.wandb` to mode `online`, project `mho-harness`, and run
