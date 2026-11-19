@@ -7,7 +7,8 @@
 #   qsub -N hf-serve -q R9920261300 -P gai51740 -v RTYPE=rt_HF -l select=1 \
 #        -l walltime=24:00:00 -j oe -o ~/hf-dev/serve/logs/ scripts/serve/pair.sh
 #
-# Defaults: A = Qwen3.5-9B (name qwen35-9b, port 30011), B = Qwen3.5-4B (qwen35-4b, port 30012).
+# Defaults: A = Qwen/Qwen3.5-9B (name qwen35-9b, port 30011), B = Qwen/Qwen3.5-4B (qwen35-4b, port 30012);
+# served under the HF ids, so litellm clients use litellm_proxy/Qwen/Qwen3.5-9B.
 # Override with NAME_A/MODEL_A/SERVED_A/PORT_A and the _B equivalents (qsub -v ...). MODEL_* may be
 # a local dir or an HF repo id (downloaded into the HF cache first). Everything else passes through
 # to endpoint.sh (CONTEXT_LENGTH, SGLANG_EXTRA_ARGS, RELAY_MAX_INPUTS, SERVE_DIR, ...).
@@ -20,8 +21,8 @@ SERVE_DIR="${SERVE_DIR:-${HOME}/hf-dev/serve}"; export SERVE_DIR
 mkdir -p "${SERVE_DIR}/logs"
 log() { echo "[serve-pair $(date +%H:%M:%S)] $*"; }
 
-NAME_A="${NAME_A:-qwen35-9b}"; MODEL_A="${MODEL_A:-Qwen/Qwen3.5-9B}"; SERVED_A="${SERVED_A:-Qwen3.5-9B}"; PORT_A="${PORT_A:-30011}"
-NAME_B="${NAME_B:-qwen35-4b}"; MODEL_B="${MODEL_B:-Qwen/Qwen3.5-4B}"; SERVED_B="${SERVED_B:-Qwen3.5-4B}"; PORT_B="${PORT_B:-30012}"
+NAME_A="${NAME_A:-qwen35-9b}"; MODEL_A="${MODEL_A:-Qwen/Qwen3.5-9B}"; SERVED_A="${SERVED_A:-Qwen/Qwen3.5-9B}"; PORT_A="${PORT_A:-30011}"
+NAME_B="${NAME_B:-qwen35-4b}"; MODEL_B="${MODEL_B:-Qwen/Qwen3.5-4B}"; SERVED_B="${SERVED_B:-Qwen/Qwen3.5-4B}"; PORT_B="${PORT_B:-30012}"
 
 fetch() {  # repo id (or a local dir, used as is) -> local snapshot path
   if [ -d "$1" ]; then echo "$1"; return; fi

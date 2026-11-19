@@ -88,7 +88,10 @@ image = modal.Image.debian_slim().pip_install("fastapi==0.115.*", "websockets>=1
     # large SWE-bench payloads and missed the bridge's WebSocket keepalive, so the
     # bridge tore the socket down (1011) and every in-flight request was lost.
     # Give the loop real cores so it can pong on time and forward without stalling.
-    cpu=4.0,
+    # The singleton container is rescheduled on every redeploy or recycle, and a big CPU
+    # request can wait a long time for capacity ("waiting to be scheduled on a CPU worker"),
+    # during which every request hangs. RELAY_CPU at deploy time sizes it (scripts/serve uses 1).
+    cpu=float(os.environ.get("RELAY_CPU", "4.0")),
     secrets=[_relay_secret],
 )
 @modal.concurrent(max_inputs=MAX_INPUTS)  # many concurrent agents multiplexed over one WS

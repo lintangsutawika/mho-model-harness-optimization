@@ -24,6 +24,7 @@
 #   RELAY_APP       Modal app name (default hf-serve-$NAME) -> https://<workspace>--$RELAY_APP-web.modal.run
 #   KEY_FILE        relay key (default $SERVE_DIR/$NAME.key; created with mode 600 if missing)
 #   RELAY_MAX_INPUTS / RELAY_REQUEST_TIMEOUT   relay concurrency / per-request timeout (128 / 1800)
+#   RELAY_CPU       relay container CPUs (default 1.0; 4 waited a long time for Modal capacity)
 #   MILES_SIF       SGLang image (default the shared miles_latest.sif)
 set -euo pipefail
 export PATH="${HOME}/.local/bin:/opt/pbs/bin:/usr/sbin:/usr/bin:/bin:${PATH}"
@@ -93,7 +94,7 @@ log "sglang healthy"
 
 # 2. Modal relay (fixed app name = stable URL; the key is baked in from the env at deploy).
 DEPLOY_OUT="$(RELAY_APP_NAME="$RELAY_APP" RELAY_SECRET="$RELAY_SECRET" \
-  RELAY_MAX_INPUTS="${RELAY_MAX_INPUTS:-128}" RELAY_REQUEST_TIMEOUT="${RELAY_REQUEST_TIMEOUT:-1800}" \
+  RELAY_MAX_INPUTS="${RELAY_MAX_INPUTS:-128}" RELAY_CPU="${RELAY_CPU:-1.0}" RELAY_REQUEST_TIMEOUT="${RELAY_REQUEST_TIMEOUT:-1800}" \
   uv run -q --no-project --with modal modal deploy src/harness/relay/modal_relay.py 2>&1)" \
   || { echo "$DEPLOY_OUT"; log "relay deploy failed"; exit 1; }
 RELAY_URL="$(printf '%s' "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9._-]+\.modal\.run' | head -1)"
