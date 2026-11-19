@@ -53,6 +53,10 @@ class Kind(ABC):
     # Accept every candidate that gets a val score, without the val gate (WHALE's weight
     # updates are always kept). Its val eval is a plain uniform one (no adaptive looks).
     always_accept: bool = False
+    # Accept the round's selected sibling on the train gate alone: no val eval at all (an
+    # experiment: with --gate-z 0 every B > A on the train subset is kept). The frontier
+    # then holds that candidate's train-subset score, not a val score.
+    accept_on_train: bool = False
 
     @abstractmethod
     def proposal_ok(self, cand_dir: Path) -> tuple[bool, str]:
