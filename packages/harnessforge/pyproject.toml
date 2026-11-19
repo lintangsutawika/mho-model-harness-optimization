@@ -1,0 +1,24 @@
+[project]
+name = "harnessforge"
+version = "0.0.1"
+description = "Optimize agent harnesses and the models that run them: sequentially tested harness search, a persistent model pool, and RL/RSFT training on top of platoon."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []          # the core (records, contracts, statistics) is stdlib-only
+
+[project.optional-dependencies]
+# Evaluation and training through platoon (harbor environments, hpc-sandbox sandboxes, Tinker API)
+platoon = ["platoon[tinker,hpc]>=0.6,<0.7"]
+# Model pool client/launcher helpers
+pool = ["httpx>=0.27"]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harnessforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
