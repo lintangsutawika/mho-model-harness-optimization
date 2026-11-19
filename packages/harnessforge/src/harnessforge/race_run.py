@@ -199,7 +199,7 @@ class RaceDriver:
                 self.timeline.append(entry)
                 self._logged[c] = j
                 self.log(f"[{self._el(now)}] look {j} {c} vs {self.race.reference}: {entry['tasks']} tasks "
-                         f"({entry['paired_tasks']} paired), D={_fmt(entry['d'])}+-{_fmt(entry['se'])} "
+                         f"({entry['paired_tasks']} paired), D={_fmt(entry['d'])}+-{_fmt(entry['se'], sign=False)} "
                          f"t={_fmt(entry['t'], 2)}; pass if t > {_fmt(entry['efficacy'], 2)}, stop if t <= "
                          f"{_fmt(entry['futility'], 2)} -> {entry['verdict']}"
                          + (" (skipped: infra-suspect)" if entry.get("skipped") else ""))
@@ -235,8 +235,8 @@ class RaceDriver:
         tmp.replace(self.summary_path)
 
 
-def _fmt(x: float | None, nd: int = 4) -> str:
-    return "-" if x is None else (f"{x:+.{nd}f}" if nd == 4 else f"{x:.{nd}f}")
+def _fmt(x: float | None, nd: int = 4, sign: bool = True) -> str:
+    return "-" if x is None else (f"{x:+.{nd}f}" if sign else f"{x:.{nd}f}")
 
 
 def look_entry(idx: UnitIndex, race: Race, c: str, j: int) -> dict[str, Any]:
@@ -262,13 +262,18 @@ def look_entry(idx: UnitIndex, race: Race, c: str, j: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------------------------------- offline replay
 def snapshot_at(records: Sequence[TrialRecord], t: float, end: float) -> list[TrialRecord]:
     """The records as a poll at time `t` would have seen them: launched ones only, unfinished ones in flight.
-    Records with no `finished_at` (e.g. trials cancelled by a stop) count as finished at `end`."""
+    Trials cancelled by a stop (error "stopped"/"cancelled") stay in flight forever: they never completed, so a look
+    that needs them was never ready (counting them as finished env-failures would make the looks after a stop
+    "ready" on truncated data). Other records with no `finished_at` count as finished at `end`."""
     out = []
     for r in records:
         started = r.started_at if r.started_at is not None else -math.inf
         if started > t:
             continue
-        fin = r.finished_at if r.finished_at is not None else (end if r.finished else math.inf)
+        if r.env_failed and r.error in CANCELLED:
+            fin = math.inf
+        else:
+            fin = r.finished_at if r.finished_at is not None else (end if r.finished else math.inf)
         out.append(r if fin <= t else replace(r, finished=False, reward=None, env_failed=False, error=None))
     return out
 
@@ -276,7 +281,8 @@ def snapshot_at(records: Sequence[TrialRecord], t: float, end: float) -> list[Tr
 def replay(records: Sequence[TrialRecord], race: Race) -> dict[str, Any]:
     """Run `race` offline on a finished evaluation's records, with a snapshot at every finish time, as a live
     driver polling continuously would have. Returns the timeline (with each look's finish time relative to the
-    first launch), the decisions and the decision times."""
+    first launch), the decisions and the decision times. Looks that needed trials a stop cancelled are never ready,
+    so a race replayed on a stopped evaluation can end undecided (`truncated_at_look`: the last look it took)."""
     recs = [r for r in records if r.candidate in (race.reference, *race.candidates)]
     if not recs:
         raise ValueError("no records of the race's sides")
@@ -307,7 +313,8 @@ def replay(records: Sequence[TrialRecord], race: Race) -> dict[str, Any]:
             break
     return {"reference": race.reference, "candidates": list(race.candidates),
             "design": race.design.as_dict(), "decisions": st.as_dict(),
-            "decided_at_s": {c: _r(v, 1) for c, v in decided.items()}, "timeline": timeline}
+            "decided_at_s": {c: _r(v, 1) for c, v in decided.items()}, "timeline": timeline,
+            "undecided": [c for c in race.candidates if st.states[c].alive]}
 
 
 # ---------------------------------------------------------------------------------------------------- FileRun
@@ -415,7 +422,7 @@ def cmd_replay(a: argparse.Namespace) -> int:
     if a.out:
         Path(a.out).write_text(text)
     for e in result["timeline"]:
-        print(f"look {e['look']} {e['candidate']}: {e['tasks']} tasks D={_fmt(e['d'])}+-{_fmt(e['se'])} "
+        print(f"look {e['look']} {e['candidate']}: {e['tasks']} tasks D={_fmt(e['d'])}+-{_fmt(e['se'], sign=False)} "
               f"t={_fmt(e['t'], 2)} eff {_fmt(e['efficacy'], 2)} fut {_fmt(e['futility'], 2)} -> {e['verdict']} "
               f"@{e['elapsed_s']} s")
     print(json.dumps({c: s["reason"] for c, s in result["decisions"]["states"].items()}, indent=1))

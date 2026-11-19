@@ -110,7 +110,7 @@ def test_snapshot_at_and_side_counts():
     snap = snapshot_at(recs, 12, end=40)
     assert [(r.index, r.finished) for r in snap] == [(0, True), (1, False)]
     snap = snapshot_at(recs, 40, end=40)
-    assert all(r.finished for r in snap) and len(snap) == 4
+    assert [r.finished for r in snap] == [True, True, False, True]   # a cancelled trial never finishes
     k = side_counts(recs, "A", planned=8)
     assert k == {"planned": 8, "launched": 4, "finished": 4, "scored": 3, "env_failed": 0, "cancelled": 1,
                  "in_flight": 0, "never_launched": 4, "successes": 1}
@@ -168,3 +168,19 @@ def test_cli_drive_over_file_run_jobs(tmp_path, capsys):
     assert s["reverse"]["decisions"]["states"]["A"]["verdict"] == "fail"
     assert s["reverse"]["decisions"]["states"]["A"]["look"] == 1
     assert (tmp_path / "race.records.jsonl").exists()
+
+
+def test_reverse_replay_after_a_stop_does_not_use_cancelled_units():
+    """Forward race decided at look 2 and stopped both sides; the reverse race must not take look 3 on the
+    cancelled trials (it would see them as finished env-failures)."""
+    run, sched = start({"A": A_REWARDS, "B": B_BETTER})
+    driver, s, _ = drive(run, Race("A", ["B"], sched))
+    assert s["sides"]["A"]["cancelled"] + s["sides"]["B"]["cancelled"] > 0
+    rev = replay(driver.records, Race("B", ["A"], sched))
+    assert rev["decisions"]["states"]["A"]["verdict"] == "fail" and rev["decisions"]["states"]["A"]["look"] == 1
+    near_null = {t: 0.5 for t in TASKS}
+    run, sched = start({"A": near_null, "B": B_BETTER})
+    driver, s, _ = drive(run, Race("A", ["B"], sched))
+    rev = replay(driver.records, Race("B", ["A"], sched))
+    looks = [e["look"] for e in rev["timeline"]]
+    assert max(looks) <= s["decisions"]["states"]["B"]["look"]
