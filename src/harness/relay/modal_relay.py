@@ -55,6 +55,9 @@ if os.environ.get("RELAY_SECRET"):
     _relay_secret = modal.Secret.from_dict({
         "RELAY_SECRET": os.environ["RELAY_SECRET"],
         "RELAY_REQUEST_TIMEOUT": os.environ.get("RELAY_REQUEST_TIMEOUT", "600"),
+        # Not secret: /health reports it so a node can tell this deploy's container from a
+        # previous deploy's container that is still draining (scripts/serve/endpoint.sh).
+        "RELAY_DEPLOY_ID": os.environ.get("RELAY_DEPLOY_ID", ""),
     })
 else:
     _relay_secret = modal.Secret.from_name(SECRET_NAME)
@@ -138,7 +141,8 @@ def web():
 
     @api.get("/health")
     async def health():
-        return {"ok": True, "bridge_connected": bridge_ws["ws"] is not None}
+        return {"ok": True, "bridge_connected": bridge_ws["ws"] is not None,
+                "deploy": os.environ.get("RELAY_DEPLOY_ID", "")}
 
     @api.api_route("/v1/{path:path}", methods=["GET", "POST"])
     async def proxy(path: str, request: Request):
