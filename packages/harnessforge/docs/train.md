@@ -236,7 +236,7 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | `--async-max-concurrent-samples` | 256 | `train.max_concurrent_rollouts: 160` | **differs**: limited by the client node's cores |
 | `--rollout-temperature` | 1.0 | `inference_params.temperature: 1.0` (miles-tinker requires 1.0) | same |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16384 per call | `max_completion_tokens: 16384`, `sampling_precedence: config` | same |
-| `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | 65536 | `train.context_window_length: 65536`; SGLang context 65536 | same |
+| context: `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | rollouts **uncapped**: SGLang served 262144, the agent kept going past 64k, and only training truncated each sample to 65536 | `naive_ext_64kcap`: `train.context_window_length: 65536` **at rollout**. platoon's gateway refuses an over-window prompt and the trajectory scores 0 (`on_context_overflow: grade`); training datums ≤ 65536 | **differs** (user decision). In the old run, over-64k trajectories were ~45-60 % of rollout time but only 5-10 % of successes (context study, `~/hf-dev/ctxstudy/out/`) |
 | agent timeout | 1800 s override × 2.0 = 3600 s | `agent_timeout_multiplier: 6` (each task's 600 s × 6) | same |
 | `AGENT_TRIAL_TIMEOUT` | 7200 s, scores 0 | `rollout_config.timeout: 7200` | mapped |
 | harness | micro-swe-agent base scaffold via harbor's MiniSweAgent | the same dir, through the evals backend's spec (runner and toolchain) | same code |

@@ -228,3 +228,24 @@ def test_naive_ext_131k_config():
     # everything else as naive_ext
     strip = lambda t: {k: v for k, v in t.items() if k != "context_window_length"}
     assert strip(r["train"]) == strip(base["train"]) and X.rollout_cfg(r) == X.rollout_cfg(base)
+
+
+
+def test_naive_ext_64kcap_config(tmp_path):
+    from harnessforge.train.gateway import serve_args
+    from harnessforge.train.platoon import train_config
+    r = TrainRun.load(CONFIGS / "naive_ext_64kcap.json")
+    base = TrainRun.load(CONFIGS / "naive_ext.json")
+    assert "64kcap" in r.run_id and "noKL" in r.run_id and r.run_id != base.run_id
+    assert r["train"]["context_window_length"] == 65536
+    assert r["train"]["workflow_config"]["rollout_config"]["inference_params"]["max_completion_tokens"] == 16384
+    a = serve_args(r, port=1, local_ckpt="/x", addrs=["h:1"])
+    val = lambda f: a[a.index(f) + 1]
+    assert val("--tinker-max-tokens-per-datum") == "65536" and val("--tensor-model-parallel-size") == "2"
+    assert r.gateway["env"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert r.driver["stop_timeout"] == 3600 and r["checkpoint"]["recovery_every"] == 10
+    assert "keep_recovery" not in r["checkpoint"] and r["stats"]["wandb"]["mode"] == "online"
+    assert "ctx64k-rolloutcap" in r["stats"]["wandb"]["tags"]
+    assert "{launch}" in X.rollout_cfg(r)["engine_local_dir"]
+    cfg = train_config(r, ["t"], "http://x:1", tmp_path / "s.toml")
+    assert cfg["environments"][0]["on_context_overflow"] == "grade"
