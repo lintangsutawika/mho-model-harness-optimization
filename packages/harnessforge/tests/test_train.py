@@ -209,6 +209,8 @@ def test_dppo_run_config_is_v2_but_the_loss():
     assert "dppo" in dppo["run_id"] and dppo["run_id"] != v2["run_id"]
     assert dppo["stats"]["wandb"]["tags"] == v2["stats"]["wandb"]["tags"] + ["dppo-tv0.1"]
     assert dppo["gateway"]["miles_src"].endswith("/miles-tinker-dppo")
+    assert dppo["gateway"]["custom_losses"] == {"dppo": "harnessforge.train.losses.dppo:dppo_loss"}
+    assert "dppo=harnessforge.train.losses.dppo:dppo_loss" in serve_args(TrainRun(dppo), port=1, local_ckpt="/x", addrs=["a:1"])
     assert dppo["driver"]["platoon"].endswith("/platoon-dppo-venv/bin/platoon")
 
     def strip(d):
@@ -216,6 +218,7 @@ def test_dppo_run_config_is_v2_but_the_loss():
                        .replace("harnessforge-dppo", "harnessforge-v2").replace("miles-tinker-dppo", "miles-tinker-ext-run"))
         for k in ("run_id", "labels", "stats"):
             d.pop(k)
+        d["gateway"].pop("custom_losses", None)
         for k in ("loss_fn", "loss_fn_config"):
             d["train"].pop(k)
         return d

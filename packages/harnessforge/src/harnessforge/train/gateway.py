@@ -124,6 +124,10 @@ def serve_args(run: TrainRun, *, port: int, local_ckpt: str,
                  "--update-weight-delta-encoding", g.get("delta_encoding", "xor")]
     elif mode != "broadcast":
         raise ValueError(f"gateway.weight_sync must be disk-delta or broadcast, not {mode!r}")
+    # custom Tinker losses (miles-tinker --tinker-custom-loss): {"dppo": "harnessforge.train.losses.dppo:dppo_loss"};
+    # the modules import from hf_src, which is on the trainer's PYTHONPATH (container_argv)
+    for name, path in sorted((g.get("custom_losses") or {}).items()):
+        args += ["--tinker-custom-loss", f"{name}={path}"]
     return args + [str(a) for a in g.get("extra_args", [])]
 
 

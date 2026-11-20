@@ -1,8 +1,9 @@
-platoon 0.6.0 + tinker 0.16.1 (client side) for miles-tinker's dppo loss (miles-tinker branch feat/dppo-loss):
+platoon 0.6.0 + tinker 0.16.1, client side of the dppo loss (harnessforge.train.losses.dppo, registered in the
+trainer through miles-tinker's custom-loss hook as loss_fn "dppo"):
 (a) tinker's LossFnType admits "dppo" (the SDK validates loss_fn against a Literal before sending),
 (b) platoon treats dppo with config keys {divergence, threshold, ratio_cap} as zero for zero advantages (the
 zero-advantage datum filter and the group admission check behave as under ppo),
-(c) platoon logs the server's dppo stats per microbatch: optim/dppo_masked_frac, optim/dppo_capped_frac,
+(c) platoon logs the loss's per-request sums (forward_backward metrics dppo_*:sum) per microbatch: optim/dppo_masked_frac, optim/dppo_capped_frac,
 optim/dppo_divergence_mean, optim/dppo_tokens.
 Apply after platoon-tito.patch and platoon-tito2.patch, in the site-packages directory that holds platoon/ and tinker/:
 patch -p1 < platoon-dppo.patch

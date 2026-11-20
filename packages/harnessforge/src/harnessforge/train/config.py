@@ -9,7 +9,8 @@ Sections (see configs/train/*.json and docs/train.md):
     run_id, runs_root, python, harnessforge_src, launcher {kind, queue, account}
     model    {name, hf_checkpoint, ref_load, megatron_model_type}
     gateway  {sif, miles_src, extra_site, rollout_nodes, walltime, port, weight_sync, tp,
-              max_tokens_per_gpu, log_probs_chunk_size, sglang {...}, binds, env, extra_args}
+              max_tokens_per_gpu, log_probs_chunk_size, sglang {...}, binds, env, extra_args,
+              custom_losses {loss_fn name: module:function} (harnessforge.train.losses)}
     driver   {where: hc|gateway, walltime, platoon, site, image_cache, seed_image_cache, env}
     data     {dataset, tasks (list | file | null = every task dir), limit, seed, exclude}
     harness  {dir, agent_config}
