@@ -88,6 +88,12 @@ def _chain() -> None:
 
 
 _install()
+if os.environ.get("HF_TRACE_CANCEL") == "1":   # who cancels the train loop / a rollout (cancel_trace.py)
+    try:
+        import cancel_trace
+        cancel_trace.install()
+    except Exception:
+        pass
 try:
     _chain()
 except Exception:
