@@ -249,3 +249,27 @@ def test_naive_ext_64kcap_config(tmp_path):
     assert "{launch}" in X.rollout_cfg(r)["engine_local_dir"]
     cfg = train_config(r, ["t"], "http://x:1", tmp_path / "s.toml")
     assert cfg["environments"][0]["on_context_overflow"] == "grade"
+
+
+
+def test_naive_ext_64kcap_v2_config(tmp_path):
+    from harnessforge.train.platoon import train_config
+    r = TrainRun.load(CONFIGS / "naive_ext_64kcap_v2.json")
+    prev = TrainRun.load(CONFIGS / "naive_ext_64kcap.json")
+    assert "64kcap-v2" in r.run_id and "noKL" in r.run_id and r.run_id != prev.run_id and r.dir != prev.dir
+    assert r["sandboxes"]["mode"] == "remote" and r["train"]["max_concurrent_rollouts"] == 640
+    assert r["harness"]["agent_config"].endswith("agent-toolcap64.yaml") and r["harness"]["dir"] == prev["harness"]["dir"]
+    assert r.driver["platoon"].endswith("platoon-tito2-venv/bin/platoon")
+    assert r.driver["env"]["PLATOON_MIN_COMPLETION_TOKENS"] == "2048" and r.driver["where"] == "gateway"
+    assert r["env"]["provider_options"]["sysdeps"].endswith("jammy-harbor-deps-2") and not r["env"]["harbor_system_deps"]
+    assert r["train"]["context_window_length"] == 65536 and r.gateway["tp"] == 2
+    assert r["checkpoint"]["recovery_every"] == 10 and "keep_recovery" not in r["checkpoint"]
+    assert {"toolcap64", "tito", "keepthink-tmpl", "ctxlimit-end", "remote-sbx640"} <= set(r["stats"]["wandb"]["tags"])
+    cfg = train_config(r, ["t"], "http://x:1", tmp_path / "s.toml")
+    rk = cfg["train"]["renderer_kwargs"]
+    assert rk["tool_call_parser"] == "qwen3_coder" and rk["chat_template"].endswith("keep-thinking-v1.jinja")
+    import yaml
+    assert yaml.safe_load((CONFIGS / "agent-toolcap64.yaml").read_text()) == {"agent": {"step_limit": 64}}
+    fleet = json.loads((CONFIGS.parent / "sandboxhost" / "grpo-train.json").read_text())
+    assert fleet["hosts"] * fleet["slots_per_host"] + r["sandboxes"]["local_slots"] >= 640
+    assert fleet["provider_options"]["sysdeps"] == r["env"]["provider_options"]["sysdeps"]
