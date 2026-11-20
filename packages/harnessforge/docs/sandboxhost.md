@@ -95,6 +95,32 @@ Train run config: `"sandboxes": {"mode": "remote", "hosts_spec": "<fleet.json or
 (top level; `train.max_concurrent_rollouts` should not exceed `local_slots + hosts x slots_per_host`). Evals:
 `options.sandboxes` with the same keys. `mode: local` (default) keeps the old behaviour.
 
-## Measurements (ABCI, 2026-11-20)
+## Cluster tests (ABCI, 2026-11-20, no GPUs)
 
-See "Cluster tests" below.
+Fleet: 2, then 4 rt_HC host jobs (96 slots, `max_starting` 16, shared image cache, TB2.1 prepared images); clients
+in their own rt_HC jobs; venv = a copy of the evals venv's packages (platoon 0.6.0, hpc-sandbox 0.5.1).
+
+**Provider bench** (`RemotePodProvider` directly; N sandboxes started at once, then 30 `exec(["true"])` each):
+
+| | local, 8 | remote, 8 (cold host) | remote, 64 (2 hosts) | remote, 384 (4 hosts x 96) |
+|---|---|---|---|---|
+| start p50 / max | 64.5 / 64.7 s (cold images) | 45.6 / 47.5 s (incl. 484 MB toolchain mirror) | 9.9 / 18.9 s | 65.7 / 113.5 s (96 per host behind a cap of 16) |
+| exec RTT, one sandbox, p50 | 2.7 ms | 3.9 ms | 3.9 ms | 4.2 ms |
+| exec RTT, all at once, p50 | 7.7 ms | 9.4 ms | 43 ms | 228 ms (384 concurrent singularity execs on 4 x 32 cores) |
+| 1 MB upload / download | 6 / 7 ms | 18 / 23 ms | 16 / 14 ms | 49 / 20 ms |
+
+The relay costs about 1.2 ms per call. A burst of 96 starts on one host takes about 110 s with the start cap of 16,
+as it does locally.
+
+**platoon eval, fake model** (scripted 2-turn model on the client; every sandbox remote):
+- 8 TB2.1 tasks x 2: 16/16 scored, 0 env failures. The agent's model calls went through the relay. The verifier
+  ran. collect / harbor export wrote test-stdout and the agent trajectory.
+- 89 TB2.1 tasks x 4 = 356 at once on 4 hosts (fake model 20 s per call): all 356 finished in 540 s. Start, from
+  request to up and including placement and the cap: p50 46 s, p90 72 s. Per host: 90 / 87 / 91 / 88.
+  8 env failures were the known `qemu-*` apt 404s.
+- Host 3 was hard-killed (`qsig -s KILL`) with 85 active and 2 starting. Its 83 running trials ended 0.3-0.7 s
+  later as `error:unexpected:SandboxLostError`: infra in platoon, so untrainable, and env_failed in the reader. The 2
+  starting ones went to other hosts. No hang; later starts avoided the dead host. `start --hosts 4` replaced it.
+
+**platoon eval, real model** (pool node 0, Qwen3.5-4B policy, 24 TB2.1 tasks x 1 at 24): trials ran normally through
+remote sandboxes. At 25 min, 3/12 finished were solved, with trajectories up to 235k output tokens.
