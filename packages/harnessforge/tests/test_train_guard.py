@@ -372,3 +372,32 @@ def test_cancel_trace_names_the_canceller(tmp_path):
 
 def test_cancel_trace_is_off_by_default(tmp_path):
     assert _run_trace(tmp_path, on=False) == ""
+
+
+TIMEOUT_SCRIPT = r"""
+import asyncio
+async def stale_timeout_owner():
+    async with asyncio.timeout(0.05):     # a timeout context left entered in a suspended generator
+        yield 1
+async def harness_rollout():
+    gen = stale_timeout_owner()
+    await gen.__anext__()
+    try:
+        await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+async def main():
+    await asyncio.create_task(harness_rollout())
+asyncio.run(main())
+print("done")
+"""
+
+
+def test_cancel_trace_names_the_timeout_site(tmp_path):
+    env = {**os.environ, "HF_STACKDUMP_DIR": str(tmp_path), "HF_TRACE_CANCEL": "1",
+           "PYTHONPATH": os.pathsep.join([str(G.SITE_DIR), os.environ.get("PYTHONPATH", "")])}
+    out = subprocess.run([sys.executable, "-c", TIMEOUT_SCRIPT], env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    log = next(tmp_path.glob("cancels.*.txt")).read_text()
+    assert "_on_timeout" in log and "the asyncio.Timeout was created at" in log
+    assert "in stale_timeout_owner" in log and "its state:" in log
