@@ -794,6 +794,45 @@ PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train driver --run-dir <r
 - `PLATOON_MIN_COMPLETION_TOKENS` is a process variable, not a platoon config key. It applies to every gateway in the
   driver's platoon process, its evaluations included.
 
+## Stall guard and automatic driver restarts (`harnessforge.train.guard`)
+
+The trial 64kcap run (2026-11-20) hung at step 34: the gateway ran the step's `optim_step` at 18:21:15
+and the platoon client never made another Tinker call (no save, no "Still waiting" line); the gateway
+reclaimed the model on its 1 h session lease at 18:49 (the SDK's session heartbeats had stopped about
+17:49, silently). platoon's watchdog is fed by every rollout group in flight, so straggler rollouts
+(agent timeout 600 s x 6 = 3600 s) hid the stall until 19:36; the watchdog exited rc=2 at 19:47
+with no stack. The exact frame is unknown, hence the dumps below.
+
+The driver now watches progress itself (`| Step N/M |` lines in `logs/platoon.log`):
+
+| key | default | |
+|---|---|---|
+| `driver.stall_timeout` | 2700 | seconds without a new step before acting (0: off) |
+| `driver.stall_startup_grace` | 3600 | extra seconds before a platoon process's first step |
+| `driver.stall_stop_wait` | 600 | graceful stop wait, then the second signal, then SIGKILL |
+| `driver.max_auto_restarts` | 3 | restarts over the run's life (`auto_restarts.json`) |
+
+On a stall: every Python process of `platoon train` dumps its thread stacks (faulthandler,
+`SIGRTMIN+2`) and its asyncio task stacks (`SIGRTMIN+3`; a hung await only shows there) into
+`logs/stacks/stacks.<pid>.txt`, copied to `logs/stall.<n>.<time>.txt`; platoon is stopped; and, within
+the budget and with `driver.where = gateway`, the driver writes `KEEP_GATEWAY`, so the gateway starts
+a fresh driver: it unloads the old model (`release_previous_models`) and platoon resumes from the
+latest recovery checkpoint (`checkpoint.recovery_every`: 5 in v2). A watchdog exit (rc=2) is handled
+the same way; its stacks are taken at platoon's first "WATCHDOG: No heartbeat" warning. SIGUSR1 is not
+used for dumps: platoon's supervisor sends it to mean "exit at once". The stack-dump code is a
+`sitecustomize.py` (`train/stackdump_site/`, first on platoon's `PYTHONPATH`, chaining to any other).
+
+Each auto-restart is logged in `logs/driver.events.log` (`STALL: ...`, `AUTO-RESTART n/3: ...`),
+recorded in `auto_restarts.json` (reason, last step, silence, rc, stacks file), tagged
+`auto-restart-<n>` on the W&B run (also added to run.json's tags, which the resumed platoon re-sends)
+with a line in the run's notes. Past the budget, or when a person asked for the stop (STOP,
+DRIVER_STOP, SIGTERM), there is no restart: the run stops and waits for a person.
+
+Known, not fixed here: the remote-sandbox relay (`sandboxhost.provider.UpstreamRelay._on_conn`)
+leaves connection handlers pending in `net.splice` after a peer goes away; asyncio garbage-collects
+them ("Task was destroyed but it is pending", ~1800 in 4 h of the trial run). Harmless to rollouts so
+far; fixing it needs a look at how a vanished peer ends a pump (not a one-liner).
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the

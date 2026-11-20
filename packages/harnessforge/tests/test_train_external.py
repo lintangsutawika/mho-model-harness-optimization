@@ -263,7 +263,7 @@ def test_naive_ext_64kcap_v2_config(tmp_path):
     assert r.driver["env"]["PLATOON_MIN_COMPLETION_TOKENS"] == "2048" and r.driver["where"] == "gateway"
     assert r["env"]["provider_options"]["sysdeps"].endswith("jammy-harbor-deps-2") and not r["env"]["harbor_system_deps"]
     assert r["train"]["context_window_length"] == 65536 and r.gateway["tp"] == 2
-    assert r["checkpoint"]["recovery_every"] == 10 and "keep_recovery" not in r["checkpoint"]
+    assert r["checkpoint"]["recovery_every"] == 5 and "keep_recovery" not in r["checkpoint"]
     assert {"toolcap64", "tito", "keepthink-tmpl", "ctxlimit-end", "remote-sbx640"} <= set(r["stats"]["wandb"]["tags"])
     cfg = train_config(r, ["t"], "http://x:1", tmp_path / "s.toml")
     rk = cfg["train"]["renderer_kwargs"]

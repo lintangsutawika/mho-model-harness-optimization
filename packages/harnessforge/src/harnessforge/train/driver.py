@@ -27,6 +27,8 @@ from typing import Any
 
 from harnessforge.train.config import TrainRun
 from harnessforge.train.gateway import _write_json, container_argv
+from harnessforge.train.guard import (STACKS_DIR, WATCHDOG_RC, StallGuard, collect_stacks, dump_stacks,
+                                      note_wandb, record_restart, restarts, stop_platoon, wandb_run_id)
 
 #: marker files in the run dir: KEEP_GATEWAY = the gateway outlives this driver (restarts it when
 #: the driver runs on its head node); DRIVER_STOP = ask the driver (any placement) to stop
@@ -120,10 +122,13 @@ def platoon_env(run: TrainRun, url: str, secrets: dict[str, str] | None = None) 
     node_local = node_local_dir()
     env = dict(os.environ)
     env.update({
-        "PYTHONPATH": os.pathsep.join(p for p in (hf_src, env.get("PYTHONPATH")) if p),
+        # the stack-dump sitecustomize first (it chains to any other), then this package
+        "PYTHONPATH": os.pathsep.join(p for p in (str(Path(hf_src) / "harnessforge" / "train" / "stackdump_site"),
+                                                  hf_src, env.get("PYTHONPATH")) if p),
         "TINKER_BASE_URL": url, "TINKER_API_KEY": TINKER_API_KEY,
         "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
         "PLATOON_NODE_SCRATCH": node_local, "PYTHONUNBUFFERED": "1",
+        "HF_STACKDUMP_DIR": str(run.paths.logs / STACKS_DIR),
         "no_proxy": ",".join(filter(None, [url.split("//")[-1].split(":")[0], "127.0.0.1",
                                            env.get("no_proxy", "")])),
     })
@@ -257,6 +262,86 @@ def record_stream_base(run: TrainRun) -> None:
                                                 "at": time.time()})
 
 
+def supervise(run: TrainRun, proc: subprocess.Popen, guard: StallGuard, term, stop: dict,
+              *, poll: float = 10.0, sleep=time.sleep) -> dict[str, Any] | None:
+    """Wait for platoon to exit; pass on stop requests (STOP / DRIVER_STOP); on the guard's events dump
+    the stacks, and on a stall stop platoon. Returns the incident (None: platoon exited on its own or
+    was asked to stop): {"reason", "step", "silent_s", "stacks"}."""
+    P = run.paths
+    incident: dict[str, Any] | None = None
+    watchdog_stacks: str | None = None
+    while proc.poll() is None:
+        if (P.stop_file.exists() or (P.dir / DRIVER_STOP).exists()) and not stop["flag"]:
+            stop["user"] = True
+            term()
+        event = None if stop["flag"] else guard.poll()
+        if event:
+            n = len(guard_restarts(run)) + 1
+            t = time.time()
+            pids = dump_stacks(P.logs, proc.pid, sleep=sleep)
+            dest = collect_stacks(P.logs, P.logs / f"stall.{n}.{time.strftime('%Y%m%d-%H%M%S')}.txt", pids, t)
+            if event == "watchdog":
+                watchdog_stacks = str(dest)
+                _log(run, f"platoon's watchdog is warning (no heartbeat); stacks of pids {pids} in {dest}")
+            else:
+                _log(run, f"STALL: no training step for {guard.silent_for():.0f}s (last step "
+                          f"{guard.last_step}); stacks of pids {pids} in {dest}; stopping platoon")
+                incident = {"reason": "stall", "step": guard.last_step,
+                            "silent_s": round(guard.silent_for()), "stacks": str(dest)}
+                stop_platoon(proc, term, stop_wait=float(run.driver.get("stall_stop_wait", 600)), sleep=sleep)
+                break
+        sleep(poll)
+    if incident is None and proc.returncode == WATCHDOG_RC and not stop["user"]:
+        incident = {"reason": "watchdog", "step": guard.last_step, "silent_s": round(guard.silent_for()),
+                    "stacks": watchdog_stacks}
+    return incident
+
+
+def guard_restarts(run: TrainRun) -> list[dict[str, Any]]:
+    return restarts(run.dir)
+
+
+def auto_restart(run: TrainRun, incident: dict[str, Any] | None, rc: int, env: dict[str, str]) -> bool:
+    """After a stall or a watchdog exit, ask the gateway for a driver restart (KEEP_GATEWAY) while the
+    budget (driver.max_auto_restarts) lasts; record it (auto_restarts.json, driver.events.log, W&B).
+    Over budget, or with a separate driver job, the run stops and waits for a person. Whether it did."""
+    if incident is None:
+        return False
+    budget = int(run.driver.get("max_auto_restarts", 3))
+    done = len(guard_restarts(run))
+    can = run.driver.get("where", "hc") == "gateway"
+    if done >= budget or not can:
+        why = (f"auto-restart budget used ({done}/{budget})" if can
+               else "auto-restart needs driver.where = gateway")
+        _log(run, f"{incident['reason'].upper()} (rc={rc}) at step {incident['step']}: {why}; "
+                  f"the run stops here and waits for a person")
+        return False
+    n = record_restart(run.dir, {**incident, "rc": rc, "at": time.time(),
+                                 "at_local": time.strftime("%Y-%m-%d %H:%M:%S %Z")})
+    # the resumed platoon re-sends its config's W&B tags: keep the restart's tag in them too
+    try:
+        cfg = json.loads(run.paths.config.read_text())
+        tags = cfg.setdefault("stats", {}).setdefault("wandb", {}).setdefault(
+            "tags", list((run.get("stats", {}).get("wandb") or {}).get("tags") or []))
+        if f"auto-restart-{n}" not in tags:
+            tags.append(f"auto-restart-{n}")
+        _write_json(run.paths.config, cfg)
+    except (OSError, ValueError) as e:
+        _log(run, f"could not add the auto-restart tag to {run.paths.config}: {e}")
+    (run.dir / KEEP_GATEWAY).write_text(f"auto-restart {n}: {incident['reason']}\n")
+    _log(run, f"AUTO-RESTART {n}/{budget}: {incident['reason']} (rc={rc}, last step {incident['step']}, "
+              f"silent {incident['silent_s']}s, stacks {incident['stacks']}); the gateway restarts the "
+              f"driver, which resumes from the latest recovery checkpoint")
+    rid = wandb_run_id(run.paths.platoon_dir)
+    wb = run.get("stats", {}).get("wandb") or {}
+    if rid and wb.get("mode", "online") == "online" and env.get("WANDB_API_KEY"):
+        python = str(Path(str(run.driver.get("platoon", "platoon"))).with_name("python"))
+        note = (f"[{time.strftime('%Y-%m-%d %H:%M %Z')}] auto-restart {n}: {incident['reason']} after step "
+                f"{incident['step']} (silent {incident['silent_s']}s, rc={rc}); stacks: {incident['stacks']}")
+        _log(run, note_wandb(python, str(wb.get("project", "")), rid, f"auto-restart-{n}", note, env))
+    return True
+
+
 def run_driver_job(run_dir: str | Path) -> int:
     run = TrainRun.load(Path(run_dir) / "run.json")
     P = run.paths
@@ -266,7 +351,11 @@ def run_driver_job(run_dir: str | Path) -> int:
     platoon_proc: subprocess.Popen | None = None
     exporter: subprocess.Popen | None = None
     rc = 1
-    stop = {"flag": False}
+    stop = {"flag": False, "user": False}
+
+    def _user_term(*_: Any) -> None:            # a stop someone asked for: never auto-restarted
+        stop["user"] = True
+        _term()
 
     def _term(*_: Any) -> None:
         # once: platoon takes a second SIGTERM as "force exit" (no interrupted checkpoint, no reaping)
@@ -275,8 +364,8 @@ def run_driver_job(run_dir: str | Path) -> int:
         stop["flag"] = True
         if platoon_proc is not None and platoon_proc.poll() is None:
             platoon_proc.send_signal(signal.SIGTERM)       # platoon checkpoints, stops its sandboxes
-    signal.signal(signal.SIGTERM, _term)
-    signal.signal(signal.SIGINT, _term)
+    signal.signal(signal.SIGTERM, _user_term)
+    signal.signal(signal.SIGINT, _user_term)
     try:
         g = wait_gateway(run)
         url = g["url"]
@@ -311,15 +400,16 @@ def run_driver_job(run_dir: str | Path) -> int:
                                     "gateway": url, "started_at": time.time()})
         t0 = time.time()
         with open(P.logs / "platoon.log", "ab") as out:
+            guard = StallGuard(P.logs / "platoon.log", float(run.driver.get("stall_timeout", 2700)),
+                               float(run.driver.get("stall_startup_grace", 3600)))
             platoon_proc = subprocess.Popen([platoon, "train", str(cfg)], env=env, stdout=out,
                                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                             cwd=str(run.dir), start_new_session=True)
-            while platoon_proc.poll() is None:
-                if (P.stop_file.exists() or (P.dir / DRIVER_STOP).exists()) and not stop["flag"]:
-                    _term()
-                time.sleep(10)
+            incident = supervise(run, platoon_proc, guard, _term, stop)
         rc = platoon_proc.returncode
         _log(run, f"platoon train exited rc={rc} after {time.time() - t0:.0f}s")
+        if not stop["user"]:
+            auto_restart(run, incident, rc, env)
     except Exception as e:                                  # report, then clean up below
         _log(run, f"ERROR: {type(e).__name__}: {e}")
         rc = 1
