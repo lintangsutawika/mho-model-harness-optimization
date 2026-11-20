@@ -54,7 +54,10 @@ HOST_LABEL = "hf.sandboxhost"
 FORWARDED_OPTIONS = ("fakeroot", "allow_network_none", "pod_users", "rootfs_layout", "extra_start_args",
                      "bind_resolv_conf", "default_timeout_s", "start_timeout_s", "stop_grace_s", "stop_timeout_s",
                      "output_limit_bytes", "image_cache", "gpu", "cgroup_limits", "rootfs_templates",
-                     "service_stop_grace_s", "slirp4netns", "binary", "stage_images")
+                     "service_stop_grace_s", "slirp4netns", "binary", "stage_images",
+                     # the tools bundle replacing harbor's per-trial apt (evals.pods.SYSDEPS_EXTRACT): a remote
+                     # sandbox must get it as a local one does, or the agent loses curl/git/gcc/make
+                     "sysdeps")
 #: ops that a client's disconnect cancels
 CANCELLABLE = frozenset({"exec", "upload", "download", "ensure_routes", "kill_processes", "mirror_put"})
 
