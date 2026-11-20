@@ -682,6 +682,108 @@ trajectory at the wall instead of letting it continue.
 - The patch targets platoon 0.6.0 exactly. The build script refuses other versions. A platoon upgrade needs the
   patch rebased (or upstreamed; draft in `docs/platoon-tito-upstream.md`).
 
+## Keep-thinking template and the context limit (`patches/platoon-tito2.patch`)
+
+Two mid-run changes on top of TITO, in a second training venv, `~/hf-dev/train/platoon-tito2-venv`. It was built with
+`build_platoon_tito_venv.sh ~/hf-dev/evals/venv ~/hf-dev/train/platoon-tito2-venv platoon-tito.patch
+platoon-tito2.patch`. `platoon-tito-venv` and the evals venv are left as they are.
+
+**(a) Always keep thinking (TMax-style: "We edit chat templates such that thinking is preserved on intermediate
+turns").**
+- *Stock behaviour.* Qwen3.5's stock template renders an assistant turn's `reasoning_content` only after the last real
+  user query. A user message (micro-swe-agent's format error) therefore drops the thinking of every earlier turn: about
+  10k tokens near the 64k wall.
+- *The template.* `src/harnessforge/train/templates/qwen3.5-keep-thinking-v1.jinja` is the snapshot's template with
+  that one condition changed to always render the thinking. A test checks that it equals the stock template but for
+  that line.
+  - Conversations without a user query after an assistant turn render token for token as before (so does every
+    rollout's normal tool loop).
+  - The build script copies it to `<venv>/templates/`.
+- *The hook.* platoon 0.6.0 has no template override: `renderer_kwargs` are set as renderer attributes, and the
+  `preserve_thinking` kwarg is ignored by Qwen3.5's template. So the patch adds a `chat_template` attribute to the
+  `chat_template` renderer (a `.jinja` path or the text). It is passed to `apply_chat_template` and enters the
+  tool-call parser's cache key. Set it with
+  `train.renderer_kwargs.chat_template = "<venv>/templates/qwen3.5-keep-thinking-v1.jinja"`. harnessforge deep-merges
+  this with the default `tool_call_parser: qwen3_coder`.
+- *Serving.* The engines (miles-tinker, SGLang) sample on the tokens platoon renders and never render a chat
+  template, so nothing changes there.
+- *Evals.* Evaluations differ: the hosted gateway forwards `/v1/chat/completions` to the pool's SGLang, which renders
+  with the model's stock template. Evaluated policies would see dropped thinking after a format error, where training
+  keeps it. To align them, start the pool engines with `engine_args: {"chat-template": "<path>/qwen3.5-keep-thinking-v1.jinja"}`
+  (SGLang `--chat-template`). That is a pool restart, which this PR does not do. The case is rare (micro-swe-agent
+  format errors), but a policy trained with (a) relies on its old thinking still being there.
+- *Effect.* (a) alone saves no tokens. micro-swe-agent still drops the failed reply, so the call after a format error
+  still starts a new datum. Prompts no longer shrink there, so more trajectories reach the 64k window and end by
+  overflow (graded as before). Use it with (b).
+
+**(b) End a trajectory near the window (the context limit).**
+- *What changes.* platoon used to clamp `max_tokens` to the remaining room: "Clamping max_tokens 16384 -> 149". The
+  model then got cut after a few hundred tokens, micro-swe-agent dropped the reply, and the stock template dropped the
+  past thinking. The trajectory went on with a new ~55k-token datum, often several times.
+- *The limit.* Now, in `ModelGateway.fit_max_tokens`, a prompt that leaves less than
+  `min(min_completion_tokens, max_tokens)` under the window raises `ContextLimitError`. That is a subclass of
+  `ContextWindowExceededError`, so harnesses get the usual context-length error. micro-swe-agent aborts on it.
+  - `min_completion_tokens` comes from `PLATOON_MIN_COMPLETION_TOKENS` (in `driver.env`); the default in this venv is
+    2048, and `0` restores the clamp.
+- *Grading.* The agent counts the limit (`AgentSession.context_limits`) and records
+  `misc.context_limit = {prompt_tokens, context_window, min_completion_tokens, calls}`. `platoon.harness.rollout` (and
+  `inline.failure_outcome` for function harnesses) then grades the session with the verifier, with reason
+  `context_limit`. The outcome is `scored`, not env_failed. With `on_context_overflow: exclude` it is excluded from
+  training instead, like an overflow.
+- *Visibility.*
+  - Events: the trajectory's `misc.outcome.reason = "context_limit"` (the grader's own reason under
+    `grade_reason`), plus `misc.context_limit`.
+  - W&B: a new per-trajectory stat `context_limit` (0/1) next to `num_steps`, logged as `rollout*/context_limit/avg`,
+    i.e. the share ended this way. `outcome/scored` is unchanged: these are scored.
+
+**Replay (256 trained trajectories per step, through the patched gateway at the real 65536 window).**
+
+| | measured (no TITO) | TITO | TITO + (a) | TITO + (b) | TITO + (a) + (b) |
+|---|---|---|---|---|---|
+| step 1 datums/trajectory | 2.96 | 1.188 | 1.180 | **1.031** | 1.031 |
+| step 1 training tokens | 21.25M | 9.50M | 9.43M | **6.87M** (3.1× fewer) | 6.89M |
+| step 1 ended at the window | – | 3 overflow | 19 overflow | 31 at the limit (12.1%) | 32 at the limit (12.5%) |
+| step 2 datums/trajectory | 3.87 | 1.324 | 1.371 | **1.102** | 1.102 |
+| step 2 training tokens | 29.28M | 11.29M | 12.18M | **7.51M** (3.9× fewer) | 7.58M |
+| step 2 ended at the window | – | 5 overflow | 30 overflow | 41 at the limit (16.0%) | 43 at the limit (16.8%) |
+
+How to read the table:
+- *Earlier TITO numbers.* At the real window the TITO column is slightly below the earlier replay (9.90M / 12.08M,
+  run at a 2× window). The rebuilt prompts are within about 12 tokens of the recorded ones, so 3–5 trajectories at the
+  wall end by overflow in the replay where the run clamped.
+- *Calls after (b).* The remaining datum breaks under (b) are micro-swe-agent format errors away from the wall: 8 in
+  step 1, 26 in step 2.
+- *Reward of the ended trajectories.* Their final reward in the real run, after continuing past the wall:
+  - step 1 (TITO + a + b): mean 0.28, and 9 of 32 passed;
+  - step 2: 0.07, and 3 of 43 passed.
+  The verifier grades the state at the limit, so some of these may still pass. At most about 9/256 (step 1) and 3/256
+  (step 2) rollouts could lose a pass. That is the cost of (b).
+
+**Switching the run (driver-only restart; coordinate with the run's owner).** Both changes are mid-run changes. They
+apply to rollouts started after the restart, and trajectories already in history keep what they saw. From the run's
+harnessforge checkout:
+```bash
+PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train driver --run-dir <run> --grace 5400 \
+    --set 'driver.platoon="/home/aci18914wh/hf-dev/train/platoon-tito2-venv/bin/platoon"' \
+    --set 'train.renderer_kwargs.chat_template="/home/aci18914wh/hf-dev/train/platoon-tito2-venv/templates/qwen3.5-keep-thinking-v1.jinja"' \
+    --set 'driver.env.PLATOON_MIN_COMPLETION_TOKENS="2048"'
+```
+- (b) alone: drop the `chat_template` line.
+- (a) alone: set `PLATOON_MIN_COMPLETION_TOKENS="0"`.
+- To check after the restart:
+  - `<run>/platoon-train.json` has `train.renderer_kwargs.chat_template`;
+  - events show `misc.outcome.reason == "context_limit"` on some trajectories and no `Clamping max_tokens ... -> <2048`
+    lines in `logs/platoon.log`;
+  - W&B shows `context_limit/avg` around 0.1–0.17, and `optim/num_tokens` around 7–8M per step.
+
+**Risks.**
+- The reward of rollouts that used to get past the wall after a shrink, above.
+- A policy shift towards shorter trajectories, since the wall now ends a rollout.
+- (a) makes training and evaluation prompts differ after a format error unless the pool is given the same template.
+- The template is pinned to the Qwen3.5-4B snapshot `851bf6e8`. Another snapshot needs its own versioned file.
+- `PLATOON_MIN_COMPLETION_TOKENS` is a process variable, not a platoon config key. It applies to every gateway in the
+  driver's platoon process, its evaluations included.
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the
