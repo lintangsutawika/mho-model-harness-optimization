@@ -553,6 +553,134 @@ name = run id; tags come from the config. miles' own W&B stays disabled.
 under the run dir (and the extra paths) against the key's value. It prints counts and file paths, never the value,
 and exits 1 on a hit.
 
+## Token-in/token-out prompts (`patches/platoon-tito.patch`)
+
+**Problem.** platoon's gateway renders every model call's messages from scratch with the chat template, so the
+model's previous turn comes back as the template's rendering of the message parsed from its sampled tokens. That
+differs from the sampled tokens whenever the model wrote whitespace the template normalizes (`\n\n</think>`, one `\n`
+before a `<tool_call>`; `\n` and `\n\n` are each one Qwen token, so the token count often does not change), a tool
+call did not parse, the reply had several tool calls, or the generation was cut. The next prompt then does not
+extend the previous prompt + completion, and `trajectory_to_data` starts a new datum that repeats the shared prefix.
+In the 64k-cap run, step 1 trained 759 datums / 21.25M tokens for 256 trajectories and step 2 991 / 29.28M.
+
+**The patch** (platoon 0.6.0; `platoon/gateway/tito.py` new; `core.py`, `server.py`, `hosted.py`):
+- Per agent, the gateway keeps the exact stream of its last call: prompt tokens + sampled tokens, as sampled, with the
+  request messages.
+- A request whose messages are the previous request's + the assistant message the gateway returned (role, trimmed
+  content and reasoning, tool-call names and arguments) + new messages is sampled on
+  `stream [+ <|im_end|> if the completion was cut] + suffix`. The suffix is the template's rendering of the new
+  messages and the generation prompt: the text after the last assistant turn's `<|im_end|>` in a render of the whole
+  conversation. Earlier tokens are never re-rendered.
+- Anything else is rendered from scratch exactly as before and starts a new stream (a new datum): history dropped or
+  rewritten, tools or chat-template kwargs changed, or the template renders earlier turns differently once the new
+  messages follow.
+- Datums: unchanged code. `trajectory_to_data` merges every call whose prompt extends the accumulated sequence, which
+  is now every stitched call. Loss mask = the sampled tokens only. Inserted tokens (new messages, template glue, a
+  repaired `<|im_end|>`) are prompt tokens: mask 0, logprob 0. Sampler logprobs stay aligned with their tokens.
+- What the model sees: its earlier turns are its own sampled tokens rather than a re-rendering. Everything else is the
+  template's rendering. With canonical samples the stitched prompt equals the from-scratch prompt token for token.
+- Switches: `PLATOON_TITO=0` (in `driver.env`) turns it off in the patched venv; `PLATOON_TITO_VERIFY=1` also
+  checks every stitched prompt against the from-scratch render as text.
+- Each trajectory's misc gets `tito: {stitched, fresh, reasons: {...}}`. The rollout process logs `TITO: N of M calls
+  extended ...` every 2000 calls.
+
+**micro-swe-agent and Qwen3.5.** When a reply has no valid bash tool call (none, unparsed, cut at max_tokens),
+micro-swe-agent raises `FormatError`. It **drops the reply** and appends a user message with the error. The Qwen3.5
+template then also stops rendering the thinking of every earlier turn, because a new user query moved
+`last_query_index`. That is a real change of what the model sees, so the call is rendered from scratch and starts a
+new datum. These are the only breaks left with this harness: 54 of 13816 calls in step 1's trained trajectories and 95 of
+14538 in step 2's.
+The case "cut / unparsed reply kept by the harness" (the stream keeps the raw sampled tokens, plus a masked
+`<|im_end|>` for a cut) is covered by tests, but micro-swe-agent never takes that path.
+
+**The training venv.** The evals venv is never modified:
+```bash
+# in an rt_HC job: copies ~/hf-dev/evals/venv, rewrites its entry points' paths, applies the patch, checks it
+bash src/harnessforge/train/patches/build_platoon_tito_venv.sh ~/hf-dev/evals/venv ~/hf-dev/train/platoon-tito-venv
+```
+The script:
+- refuses an existing destination;
+- checks that platoon is 0.6.0;
+- checks that `bin/platoon` runs the copy's own interpreter and imports the patched platoon;
+- writes `PLATOON_TITO.json` (source, patch sha256, time).
+platoon workers re-exec `sys.executable`, which is the copy's interpreter, so every process runs the patched code.
+
+**Validation** (`tests/test_platoon_tito.py`, `harnessforge.train.tito_replay`):
+- Unit tests with the real Qwen3.5 tokenizer and template and a scripted sampler: whitespace variants, the
+  canonical token-for-token equality, the mask/logprob check, multiple / unparsable / cut replies, dropped replies,
+  truncated history, changed tools, the `PLATOON_TITO` switch, the HTTP server path.
+- End to end: the real micro-swe-agent (litellm 1.110.0, as in the `hf-micro-swe-1` toolchain) against the patched
+  `GatewayServer` with a scripted sampler. litellm sends replies back with their reasoning and tool calls intact, so
+  every kept reply stitches, and only the two format errors start datums:
+  - TITO: 3 datums, 4388 tokens;
+  - without TITO: 5 datums, 6410 tokens;
+  - mask = the 595 sampled tokens in both.
+- Replay of the live run's recorded steps (the 256 trained trajectories of each step). The recordings hold each
+  call's returned message, usage and generation record, not the observations or the raw sampled text, so:
+  - the replay rebuilds the conversation as micro-swe-agent would: filler tool results sized from the recorded
+    prompt growth, steered to the recorded prompt sizes;
+  - it drives the patched gateway with TITO off and on;
+  - `--perturb p` samples a fraction p of the calls with whitespace the template does not render, since rebuilt
+    samples are otherwise canonical and never break the TITO-off path.
+
+| trained trajectories (256 per step) | measured in the run (no TITO) | replay, TITO off (perturb 0 / 0.01 / 0.02) | replay, TITO on | TITO from recorded usage |
+|---|---|---|---|---|
+| step 1 datums/trajectory | 2.96 (759) | 1.22 / 1.82 / 2.31 | **1.211** (310) | 1.211 |
+| step 1 training tokens | 21.25M | 9.97M / 13.28M / 16.00M | **9.90M** (2.15× fewer than measured) | 9.89M |
+| step 2 datums/trajectory | 3.87 (991) | 1.38 / 1.88 / 2.36 | **1.371** (351) | 1.371 |
+| step 2 training tokens | 29.28M | 12.18M / 15.22M / 18.02M | **12.08M** (2.42× fewer) | 12.07M |
+
+Notes on the replay:
+- Rebuilt prompts are within 12 tokens per call of the recorded ones (mean |diff|).
+- With TITO on, every call whose history micro-swe-agent kept was stitched: 13506 and 14187 calls. The only fresh
+  renders were the format errors (54 and 95) and each trajectory's first call.
+- With canonical samples (perturb 0), all 27693 stitched prompts decode to exactly the from-scratch render.
+- TITO-on numbers do not change with perturbation, while TITO-off grows towards the measured 3–4 datums per trajectory.
+
+**What is left: the 64k wall.** Of the remaining breaks, 46 (step 1) and 69 (step 2) are calls cut at the context
+wall: prompt ≈ 65.3k, so `max_tokens` is clamped to a few hundred. micro-swe-agent drops the reply and adds a user
+message, Qwen3.5 then drops all past thinking (~10k tokens), and the trajectory continues on a new ~55k-token datum.
+These cost 2.70M (step 1) and 4.23M (step 2) of the TITO-on tokens; without them a step would be about 7.2–7.8M. TITO
+leaves this alone because what the model sees really changes. Removing it is a harness/run decision, e.g. ending a
+trajectory at the wall instead of letting it continue.
+
+**Switching the running GRPO run (driver-only restart).** Coordinate with the run's owner first:
+1. Build the venv (above); check `~/hf-dev/train/platoon-tito-venv/PLATOON_TITO.json`.
+2. From the run's harnessforge checkout (the one its gateway job runs), at a step boundary, run
+   `train driver` with `--set driver.platoon=...` as shown below.
+   - `run.json`'s `driver.platoon` is the binary the driver starts.
+   - With `driver.where: gateway`, this writes `KEEP_GATEWAY` + `DRIVER_STOP`. platoon gets one SIGTERM, writes its
+     interrupted checkpoint and reaps its sandboxes. The gateway then starts a fresh driver with the edited
+     `run.json`, and platoon resumes from that checkpoint against the same trainer and engines.
+   - In-flight rollouts are lost, as with any driver restart.
+   ```bash
+   PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train driver --run-dir <run> --grace 5400 \
+       --set 'driver.platoon="/home/aci18914wh/hf-dev/train/platoon-tito-venv/bin/platoon"'
+   ```
+3. Check:
+   - `logs/platoon.log` resumes from the checkpoint;
+   - new rollouts' `trajectory_finished` events carry `misc.tito`, mostly `stitched`;
+   - the next steps log `optim/num_datums` near the number of trained trajectories (256 + format-error breaks) and
+     `optim/num_tokens` at the replay's TITO-on level.
+4. To undo, use the same command with `driver.platoon` set back to `/home/aci18914wh/hf-dev/evals/venv/bin/platoon`,
+   or keep the venv and add `--set 'driver.env.PLATOON_TITO="0"'`.
+
+**Risks.**
+- Prefix-cache and datum shape. One datum per trajectory is up to 65536 tokens (prompt + completion of the last
+  call, by the gateway's window), within the trainer's per-datum limit (65536) and TP2 tokens per GPU. There are fewer
+  datums of the same maximum length, so the batch packs differently. The loss is a per-token mean, so its scale does
+  not change.
+- Sampled-token contexts. A trajectory's later calls now see the model's own raw earlier turns (as the old miles TITO
+  run did) instead of a normalized re-rendering. This only matters for whitespace-level differences. A run switched
+  mid-way mixes both in its history.
+- Harness echo. The comparison trusts the harness to send replies back unchanged (role, trimmed content and
+  reasoning, tool calls). A harness that edits them falls back to rendering from scratch, which is safe but gives no
+  saving; the `tito.reasons` counts show it.
+- Two template renders per call (history and conversation) instead of one plus a full encode. This was not measured
+  at 160 concurrent rollouts, but encoding the full 60k-token prompt was the larger cost.
+- The patch targets platoon 0.6.0 exactly. The build script refuses other versions. A platoon upgrade needs the
+  patch rebased (or upstreamed; draft in `docs/platoon-tito-upstream.md`).
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the
