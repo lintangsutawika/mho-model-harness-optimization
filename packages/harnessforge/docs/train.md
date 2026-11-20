@@ -928,6 +928,17 @@ Guard settings since: `driver.stall_timeout` 1200 s (healthy steps 4-6 min, slow
 The v2 run (`...64kcap-v2-ext...`) took this as a mid-run infrastructure change (driver-only restart with the
 patched venv); it changes no training semantics.
 
+### Who cancels? (`HF_TRACE_CANCEL=1`, `train/stackdump_site/cancel_trace.py`)
+
+Rollout groups are also "cancelled from within" (14 times in the trial and in v2, none in about 9.5 h with local
+sandboxes only, before restart 1 changed remote sandboxes, TITO, the 64-call cap and the concurrency at once). The
+cancel lands wherever the rollout task waits (our sandbox RPCs, a local pod start, platoon's gateway start, a
+harbor session release): the rollout task itself is cancelled from outside. With `driver.env.HF_TRACE_CANCEL = "1"`
+every event loop of the platoon process gets a task factory and `create_future` whose `cancel()` logs the caller's
+stack to `logs/stacks/cancels.<pid>.txt` (at most 400 entries) when the target is the `train_loop` task or a
+rollout / group-member task, or a future such a task waits on, and the caller is not that task. Off: nothing is
+installed. v2 runs with it from a driver-only restart (a diagnostic, no-semantics change; LABEL.txt).
+
 ## Known limits and risks
 
 - **Qwen3.5 has never run through the Tinker gateway** (only Qwen3-4B was tested upstream). The smoke run is the

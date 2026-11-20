@@ -314,3 +314,61 @@ def test_platoon_patch_keeps_a_real_cancellation():
         with pytest.raises(asyncio.CancelledError):
             await t
     asyncio.run(main())
+
+
+TRACE_SCRIPT = r"""
+import asyncio
+async def train_loop_body(fut):
+    await fut
+async def harness_rollout():
+    await asyncio.sleep(3600)
+def third_party_cancels(fut):          # e.g. an SDK callback cancelling a future it does not own
+    fut.cancel()
+async def rogue_canceller(task):
+    await asyncio.sleep(0.05)
+    task.cancel()
+async def main():
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    t = asyncio.create_task(train_loop_body(fut), name="train_loop")
+    loop.call_later(0.05, third_party_cancels, fut)
+    await asyncio.gather(t, return_exceptions=True)
+    r = asyncio.create_task(harness_rollout())
+    await rogue_canceller(r)
+    await asyncio.gather(r, return_exceptions=True)
+    own = asyncio.create_task(harness_rollout())       # a cancel by the target's own parent... still logged
+    await asyncio.sleep(0.01)
+    other = asyncio.create_task(asyncio.sleep(3600))   # not a target: not logged
+    other.cancel()
+    await asyncio.gather(other, return_exceptions=True)
+    own.cancel()
+    await asyncio.gather(own, return_exceptions=True)
+asyncio.run(main())
+print("done")
+"""
+
+
+def _run_trace(tmp_path, on: bool) -> str:
+    env = {**os.environ, "HF_STACKDUMP_DIR": str(tmp_path),
+           "PYTHONPATH": os.pathsep.join([str(G.SITE_DIR), os.environ.get("PYTHONPATH", "")])}
+    env.pop("HF_TRACE_CANCEL", None)
+    if on:
+        env["HF_TRACE_CANCEL"] = "1"
+    out = subprocess.run([sys.executable, "-c", TRACE_SCRIPT], env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0 and "done" in out.stdout, out.stderr
+    files = list(tmp_path.glob("cancels.*.txt"))
+    return files[0].read_text() if files else ""
+
+
+def test_cancel_trace_names_the_canceller(tmp_path):
+    log = _run_trace(tmp_path, on=True)
+    entries = [e for e in log.split("\n=== ") if e.strip()]
+    first = entries[0]
+    assert "future cancel of train_loop" in first and "third_party_cancels" in first   # the future's canceller
+    rogue = [e for e in entries if "task cancel of" in e and "harness_rollout" in e and "rogue_canceller" in e]
+    assert rogue                                                                         # a task's canceller
+    assert not any("<sleep>" in e.split("\n")[0].split(" by ")[0] for e in entries)      # non-targets skipped
+
+
+def test_cancel_trace_is_off_by_default(tmp_path):
+    assert _run_trace(tmp_path, on=False) == ""
