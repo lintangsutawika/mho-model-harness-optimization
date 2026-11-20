@@ -15,8 +15,9 @@ from typing import Any, Sequence
 
 from harnessforge.contracts import Candidate
 from harnessforge.evals import dataset as datasets
-from harnessforge.evals.backend import DEFAULT_PROVIDER, HARBOR_SYSTEM_DEPS
+from harnessforge.evals.backend import DEFAULT_PROVIDER, HARBOR_SYSTEM_DEPS, POD_PROVIDERS
 from harnessforge.evals.harness import CANDIDATE_MOUNT, TOOLCHAIN, check_candidate, render_spec
+from harnessforge.sandboxhost import provider_settings
 from harnessforge.train.config import TrainRun
 
 #: platoon `train:` defaults for Qwen3.5 on miles-tinker full fine-tuning (a run's `train`
@@ -83,7 +84,14 @@ def environment_entry(run: TrainRun, tasks: Sequence[str], spec: Path) -> dict[s
     env = run.get("env", {})
     provider = env.get("provider", DEFAULT_PROVIDER)
     provider_options = {"fakeroot": True, "allow_network_none": True, **env.get("provider_options", {})}
-    if provider == DEFAULT_PROVIDER:
+    # sandboxes: {mode: remote, hosts_spec, local_slots}: pods on sandbox host jobs too (harnessforge.sandboxhost)
+    remote, remote_options = provider_settings(run.get("sandboxes"))
+    if remote is not None:
+        if provider != DEFAULT_PROVIDER:
+            raise ValueError(f"sandboxes.mode remote replaces the pod provider, not env.provider {provider!r}")
+        provider = remote
+        provider_options.update(remote_options)
+    if provider in POD_PROVIDERS:
         provider_options.setdefault("keep_agent_processes", bool(env.get("harbor_keep_processes", True)))
     return {
         "name": "harnessforge",

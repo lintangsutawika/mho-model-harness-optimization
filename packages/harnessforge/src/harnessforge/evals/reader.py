@@ -37,8 +37,11 @@ PRE_AGENT_KINDS = frozenset({
     "harness_setup", "harness_config",
 })
 # Failures of the evaluation itself, not of the candidate's agent: the model backend failed one of the agent's calls,
-# platoon's queue for the sandbox timed out, the session was closed under the trial.
-INFRA_KINDS = frozenset({"harness_crash_gateway", "env_busy", "session_closed"})
+# platoon's queue for the sandbox timed out, the session was closed under the trial, the sandbox was lost.
+INFRA_KINDS = frozenset({"harness_crash_gateway", "env_busy", "session_closed",
+                         # the sandbox died under the trial: its container, or the sandbox host it ran on
+                         # (harnessforge.sandboxhost raises hpc_sandbox.SandboxLostError for a host that went away)
+                         "unexpected:SandboxLostError"})
 # Every other failure kind (harness_crash, context_overflow, verifier_timeout, verifier_no_reward, verifier_output,
 # verifier_setup, artifact_collect, main_exited, ...) happens after the agent ran, and counts as reward 0, as harbor's
 # missing reward did.

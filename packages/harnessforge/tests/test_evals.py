@@ -70,7 +70,8 @@ def test_classify_outcomes():
     assert classify(scored, graded_timeout) == (0.0, False, "scored:agent_timeout")
     # sandbox never started: the rollout raised, no outcome
     assert classify({"outcome_status": None, "error": "EnvSetupError: sandbox_start ..."}, None).env_failed
-    for kind in ("sandbox_start", "env_setup", "harness_setup", "harness_crash_gateway", "env_busy"):
+    for kind in ("sandbox_start", "env_setup", "harness_setup", "harness_crash_gateway", "env_busy",
+                 "unexpected:SandboxLostError"):
         v = classify({"outcome_status": "error"}, {"misc": {"outcome": {"status": "error", "failure_kind": kind}}})
         assert v.env_failed and v.reward is None and kind in v.error
     # after the agent ran: counts, as 0
@@ -371,3 +372,14 @@ def test_eval_node_job():
     script = spec.command[-1]
     assert "PLATOON_NODE_SCRATCH" in script and "stage-images req.json --from /groups/x/images" in script
     assert script.splitlines()[-1] == "exec python -m harnessforge.evals run req.json"
+
+
+def test_platoon_backend_remote_sandboxes(tmp_path):
+    request = platoon_request(tmp_path, n_candidates=1)
+    request.options["sandboxes"] = {"mode": "remote", "hosts_spec": "/fleet", "local_slots": 4}
+    PlatoonBackend(launch=False).start(request)
+    kw = json.loads((tmp_path / "out" / "r1" / "c0" / "eval.yaml").read_text())["environments"][0]["service_kwargs"]
+    assert kw["provider"] == "harnessforge.sandboxhost.provider:RemotePodProvider"
+    po = kw["provider_options"]
+    assert po["hosts_spec"] == "/fleet" and po["local_slots"] == 4 and po["keep_agent_processes"] is True
+    assert po["collect_dir"].endswith("/collected")

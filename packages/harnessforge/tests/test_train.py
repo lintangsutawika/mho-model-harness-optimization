@@ -179,3 +179,17 @@ def test_mapping_table(capsys):
     assert cli.main(["mapping"]) == 0
     out = capsys.readouterr().out
     assert "--kl-loss-coef" in out and "differs" in out
+
+
+def test_remote_sandboxes_select_the_remote_provider(run, tmp_path):
+    run.raw["sandboxes"] = {"mode": "remote", "hosts_spec": "/fleet.json", "local_slots": 160}
+    entry = environment_entry(run, ["task_000"], tmp_path / "spec.toml")
+    kw = entry["service_kwargs"]
+    assert kw["provider"] == "harnessforge.sandboxhost.provider:RemotePodProvider"
+    assert kw["provider_options"]["hosts_spec"] == "/fleet.json"
+    assert kw["provider_options"]["local_slots"] == 160
+    assert kw["provider_options"]["keep_agent_processes"] is True and kw["provider_options"]["fakeroot"] is True
+    run.raw["sandboxes"] = {"mode": "local"}
+    kw = environment_entry(run, ["task_000"], tmp_path / "spec.toml")["service_kwargs"]
+    assert kw["provider"] == "harnessforge.evals.pods:PodSingularityProvider" and "hosts_spec" not in kw[
+        "provider_options"]

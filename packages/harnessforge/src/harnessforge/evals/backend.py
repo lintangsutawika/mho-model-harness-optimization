@@ -30,6 +30,8 @@ Options (`EvalRequest.options`):
     agent_config      sampling YAML layered after `-c mini` (configs/sampling/<model>.yaml)
     api_key_env       variable holding the endpoint's key (none for a local vLLM/SGLang)
     provider          sandbox provider (default "harnessforge.evals.pods:PodSingularityProvider")
+    sandboxes         {mode: remote, hosts_spec: FLEET, local_slots: N}: start the pods on sandbox host jobs as well
+                      (harnessforge.sandboxhost; RemotePodProvider, which takes the pod provider's options too)
     provider_options  its options (image_cache, scratch_root, fakeroot, allow_network_none, pod_users, ...)
     agent_timeout_multiplier, verifier_timeout_multiplier   as harbor's --agent-timeout-multiplier (default 1.0)
     harbor_system_deps  apt/dnf/apk-install curl, bash, gcc/make, git, python3, pip3 when missing, before the agent
@@ -69,8 +71,11 @@ from harnessforge.evals import dataset as datasets
 from harnessforge.evals.harness import CANDIDATE_MOUNT, TOOLCHAIN, check_candidate, render_spec
 from harnessforge.evals.reader import RolloutReader
 from harnessforge.records import TrialRecord, write_jsonl
+from harnessforge.sandboxhost import provider_settings
 
 DEFAULT_PROVIDER = "harnessforge.evals.pods:PodSingularityProvider"
+#: providers that take the pod provider's options (the remote one is a pod provider with sandbox hosts)
+POD_PROVIDERS = frozenset({DEFAULT_PROVIDER, "harnessforge.sandboxhost.provider:RemotePodProvider"})
 #: harbor's MiniSweAgent.install: ensure_system_dependencies(curl, bash, build_tools, git, python3, python_pip).
 HARBOR_SYSTEM_DEPS = r"""
 need=""
@@ -254,7 +259,14 @@ class PlatoonBackend:
     def _config(self, request: EvalRequest, candidate: Candidate, model: str, spec: Path, dataset_dir: Path,
                 out: Path, opts: Mapping[str, Any]) -> dict[str, Any]:
         provider_options = {"fakeroot": True, "allow_network_none": True, **opts.get("provider_options", {})}
-        if opts.get("provider", DEFAULT_PROVIDER) == DEFAULT_PROVIDER:
+        provider = opts.get("provider", DEFAULT_PROVIDER)
+        remote, remote_options = provider_settings(opts.get("sandboxes"))
+        if remote is not None:
+            if provider != DEFAULT_PROVIDER:
+                raise ValueError(f"sandboxes.mode remote replaces the pod provider, not provider {provider!r}")
+            provider = remote
+            provider_options.update(remote_options)
+        if provider in POD_PROVIDERS:
             # harbor grades with the agent's processes alive (servers a task asked for); platoon kills them first
             provider_options.setdefault("keep_agent_processes", bool(opts.get("harbor_keep_processes", True)))
             if image_map := opts.get("image_map", os.environ.get("HPCSB_IMAGE_MAP")):
@@ -267,7 +279,7 @@ class PlatoonBackend:
         service_kwargs = {
             "dataset_dir": str(dataset_dir),
             "splits": {"eval": list(request.tasks)},
-            "provider": opts.get("provider", DEFAULT_PROVIDER),
+            "provider": provider,
             "provider_options": provider_options,
             "mounts": [{"source": str(Path(candidate.harness_dir).resolve()), "target": CANDIDATE_MOUNT,
                         "read_only": True}],

@@ -233,7 +233,7 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | `--entropy-coef` | 0 | none | same |
 | zero-std group filter + resampling | drop uniform-reward groups, resample until 8 informative | `group_admission: informative`, `refill.max_groups_per_step: 8` | mapped (capped at 64 groups per step) |
 | `--fully-async --max-weight-staleness 4` | async, staleness ≤ 4 | `train.max_staleness: 4` | mapped |
-| `--async-max-concurrent-samples` | 256 | `train.max_concurrent_rollouts: 160` | **differs**: limited by the client node's cores |
+| `--async-max-concurrent-samples` | 256 | `train.max_concurrent_rollouts: 160` | **differs**: limited by the client node's cores (remote sandbox hosts lift it: `sandboxes`, docs/sandboxhost.md) |
 | `--rollout-temperature` | 1.0 | `inference_params.temperature: 1.0` (miles-tinker requires 1.0) | same |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16384 per call | `max_completion_tokens: 16384`, `sampling_precedence: config` | same |
 | `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | 65536 | `train.context_window_length: 65536`; SGLang context 65536 | same |
@@ -253,7 +253,7 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | **KL to the reference** (0.01, low_var_kl) | Small at lr 1e-6 over 200 steps, but a confound | Server-side in miles-tinker full mode (details below). ~1-2 days + 1 smoke; +20-30% trainer time per step (old run: ref log-probs 36 s of a 190 s train step, against 5-10 min rollout phases, so ~5% wall time) | Run without it now, labelled `no-KL`; add it before any run whose purpose is to reproduce exactly |
 | Dr.GRPO divisor vs per-token mean | Changes the effective learning rate, not the gradient direction | Reshape platoon's datum scaling (a platoon objective option) or a miles-tinker `loss_fn_config` divisor; ~0.5 day | Accept; record it |
 | TIS | At staleness ≤ 4 the PPO ratio against the sampler's logprobs already corrects off-policy samples; TIS also corrects train/infer mismatch | Add a truncated-IS factor to miles-tinker's `ppo` loss (`loss_fn_config.tis_cap`); ~0.5 day | Accept for now |
-| Concurrency 160 vs 256 | Rollout phase up to ~1.6× longer at the start (shorter later as groups refill) | Sandboxes on more nodes. platoon runs Harbor sandboxes on the client's node only: its gateway reaches a sandbox over a node-local unix socket, so remote sandbox jobs would need a new provider plus a relay | Accept; measure step time |
+| Concurrency 160 vs 256 | Rollout phase up to ~1.6× longer at the start (shorter later as groups refill) | Sandboxes on more nodes: `sandboxes: {mode: remote, ...}` runs pods on sandbox host jobs too, relaying the gateway's unix socket over TCP (docs/sandboxhost.md) | Accept; measure step time |
 
 **KL in miles-tinker full mode, scoped.** The pieces exist:
 
@@ -279,11 +279,23 @@ Server-side and fixed at startup is the right shape:
 
 ## Placement and concurrency
 
-platoon runs Harbor sandboxes on the client's node. So the "driver" is the sandbox host too:
+platoon runs Harbor sandboxes on the client's node, unless the run has a `sandboxes` section with `mode: remote`
+(below). So by default the "driver" is the sandbox host too:
 
 - `driver.where: hc`: an `rt_HC` job (32 cores, ~28 concurrent rollouts). Used for the smoke run.
 - `driver.where: gateway`: on the gateway's head node (192 cores; the Megatron trainer uses little CPU). The
   gateway job starts it once the server is healthy. Used for `naive.json`, at 160 concurrent rollouts.
+
+Remote sandboxes (`harnessforge.sandboxhost`, docs/sandboxhost.md): start a fleet of rt_HC sandbox host jobs
+(`python -m harnessforge.sandboxhost start --spec configs/sandboxhost/grpo.json`) and add to the run
+
+```json
+"sandboxes": {"mode": "remote", "hosts_spec": "/abs/path/configs/sandboxhost/grpo.json", "local_slots": 160}
+```
+
+The driver then keeps up to `local_slots` pods on its own node and places the rest on the hosts (96 each), so
+`train.max_concurrent_rollouts` can be `local_slots + hosts x 96` (160 + 5 x 96 = 640). A host that dies fails its
+rollouts as infrastructure errors (untrainable), within a second, and is avoided; `start` again replaces it.
 
 Images:
 
