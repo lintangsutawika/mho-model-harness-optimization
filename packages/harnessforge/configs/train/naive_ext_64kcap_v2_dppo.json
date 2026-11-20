@@ -1,0 +1,50 @@
+{
+ "_comment": "naive_ext_64kcap_v2.json with TMax 4B's loss: DPPO (binary-TV trust region against the sampler, threshold 0.1, ratio cap 10; allenai/tmax-4b) instead of PPO clipping. Everything else is v2's (no KL, centered advantages without std normalization, 64k end-at-limit, TITO, toolcap 64, remote sandboxes 640, recovery every 5, stall guard). Server side: miles-tinker loss_fn dppo (branch dppo-loss, deployed to ~/hf-dev/train/miles-tinker-dppo); client side: platoon-dppo-venv (platoon-tito2 venv + patches/platoon-dppo.patch: tinker LossFnType admits dppo, zero-advantage filter as under ppo, optim/dppo_* metrics). New run dir; nothing of the v2 run is reused.",
+ "extends": "naive_ext_64kcap_v2.json",
+ "run_id": "platoon-grpo200-tmax-naive-uniform-noKL-64kcap-v2-dppo-ext--Qwen3.5-4B",
+ "harnessforge_src": "/home/aci18914wh/hf-dev/train/harnessforge-dppo/src",
+ "labels": {
+  "loss": "DPPO (TMax 4B): binary TV divergence, threshold 0.1, ratio cap 10, trust region anchored at the sampler's logprobs; no PPO clipping",
+  "compares_to": "platoon-grpo200-tmax-naive-uniform-noKL-64kcap-v2-ext--Qwen3.5-4B (same setup, loss_fn ppo 0.8/1.28)"
+ },
+ "gateway": {
+  "miles_src": "/home/aci18914wh/hf-dev/train/miles-tinker-dppo"
+ },
+ "harness": {
+  "agent_config": "/home/aci18914wh/hf-dev/train/harnessforge-dppo/configs/train/agent-toolcap64.yaml"
+ },
+ "sandboxes": {
+  "hosts_spec": "/home/aci18914wh/hf-dev/train/harnessforge-dppo/configs/sandboxhost/grpo-train.json"
+ },
+ "driver": {
+  "platoon": "/home/aci18914wh/hf-dev/train/platoon-dppo-venv/bin/platoon"
+ },
+ "train": {
+  "loss_fn": "dppo",
+  "loss_fn_config": {
+   "$replace": true,
+   "threshold": 0.1,
+   "ratio_cap": 10.0
+  },
+  "renderer_kwargs": {
+   "chat_template": "/home/aci18914wh/hf-dev/train/platoon-dppo-venv/templates/qwen3.5-keep-thinking-v1.jinja"
+  }
+ },
+ "stats": {
+  "wandb": {
+   "tags": [
+    "no-KL",
+    "external-engines",
+    "platoon",
+    "ctx64k-rolloutcap",
+    "remote-sbx640",
+    "toolcap64",
+    "tito",
+    "keepthink-tmpl",
+    "ctxlimit-end",
+    "v2",
+    "dppo-tv0.1"
+   ]
+  }
+ }
+}

@@ -7,6 +7,8 @@
 #     DEST_VENV  default ~/hf-dev/train/platoon-tito-venv
 #     PATCH      patch files in this directory, applied in order; default platoon-tito.patch. The second venv:
 #                ... ~/hf-dev/train/platoon-tito2-venv platoon-tito.patch platoon-tito2.patch
+#                The DPPO venv (the tito2 venv + miles-tinker's dppo loss on the client side):
+#                ~/hf-dev/train/platoon-tito2-venv ~/hf-dev/train/platoon-dppo-venv platoon-dppo.patch
 #
 # Run it in a CPU job (it copies ~6 GB), e.g.
 #   qsub -q R9920261300 -P gai51740 -v RTYPE=rt_HC -l select=1 -l walltime=1:00:00 -j oe -o <log> -- \
@@ -67,6 +69,17 @@ if "platoon-tito2.patch" in patches:
     for name in os.listdir(os.path.join(dest, "templates")):
         print("template", os.path.join(dest, "templates", name))
     print("context limit default 2048, chat_template override available")
+if "platoon-dppo.patch" in patches:
+    import typing
+    import tinker
+    from platoon.train.objectives.api import objective_is_zero_for_zero_advantages
+    from platoon.train.objectives.policy_gradient import dppo_metrics
+    assert os.path.realpath(tinker.__file__).startswith(os.path.realpath(dest)), tinker.__file__
+    assert "dppo" in typing.get_args(tinker.types.LossFnType)
+    tinker.types.ForwardBackwardInput(data=[], loss_fn="dppo", loss_fn_config={"threshold": 0.1, "ratio_cap": 10.0})
+    assert objective_is_zero_for_zero_advantages("dppo", {"threshold": 0.1, "ratio_cap": 10.0})
+    assert dppo_metrics({"dppo_tokens:sum": 4.0, "dppo_masked_tokens:sum": 1.0})["optim/dppo_masked_frac"] == 0.25
+    print("dppo: loss_fn admitted, zero for zero advantages, optim/dppo_* metrics")
 EOF
 "$DEST/bin/platoon" --help > /dev/null
 

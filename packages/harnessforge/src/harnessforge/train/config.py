@@ -43,11 +43,18 @@ def _expand(v: Any) -> Any:
     return v
 
 
+REPLACE_KEY = "$replace"
+
+
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
-    """Recursive dict merge (over wins; lists and scalars are replaced)."""
+    """Recursive dict merge (over wins; lists and scalars are replaced). A dict in `over` with
+    `"$replace": true` replaces the base's dict instead of merging into it (a loss_fn_config whose
+    keys must not inherit the parent's, e.g. dppo over ppo's clip thresholds)."""
     out = dict(base)
     for k, v in over.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
+        if isinstance(v, dict) and v.get(REPLACE_KEY):
+            out[k] = {kk: vv for kk, vv in v.items() if kk != REPLACE_KEY}
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge(out[k], v)
         else:
             out[k] = v

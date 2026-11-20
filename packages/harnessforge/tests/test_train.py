@@ -193,3 +193,31 @@ def test_remote_sandboxes_select_the_remote_provider(run, tmp_path):
     kw = environment_entry(run, ["task_000"], tmp_path / "spec.toml")["service_kwargs"]
     assert kw["provider"] == "harnessforge.evals.pods:PodSingularityProvider" and "hosts_spec" not in kw[
         "provider_options"]
+
+
+def test_merge_replace():
+    base = {"train": {"loss_fn": "ppo", "loss_fn_config": {"clip_low_threshold": 0.8, "clip_high_threshold": 1.28}}}
+    over = {"train": {"loss_fn": "dppo", "loss_fn_config": {"$replace": True, "threshold": 0.1, "ratio_cap": 10.0}}}
+    assert merge(base, over) == {"train": {"loss_fn": "dppo", "loss_fn_config": {"threshold": 0.1, "ratio_cap": 10.0}}}
+
+
+def test_dppo_run_config_is_v2_but_the_loss():
+    """naive_ext_64kcap_v2_dppo differs from v2 only in the loss, run id, label/tags and its own deployments."""
+    cfgs = Path(__file__).resolve().parents[1] / "configs" / "train"
+    v2, dppo = (TrainRun.load(cfgs / f"naive_ext_64kcap_v2{s}.json").raw for s in ("", "_dppo"))
+    assert dppo["train"]["loss_fn"] == "dppo" and dppo["train"]["loss_fn_config"] == {"threshold": 0.1, "ratio_cap": 10.0}
+    assert "dppo" in dppo["run_id"] and dppo["run_id"] != v2["run_id"]
+    assert dppo["stats"]["wandb"]["tags"] == v2["stats"]["wandb"]["tags"] + ["dppo-tv0.1"]
+    assert dppo["gateway"]["miles_src"].endswith("/miles-tinker-dppo")
+    assert dppo["driver"]["platoon"].endswith("/platoon-dppo-venv/bin/platoon")
+
+    def strip(d):
+        d = json.loads(json.dumps(d).replace("platoon-dppo-venv", "platoon-tito2-venv")
+                       .replace("harnessforge-dppo", "harnessforge-v2").replace("miles-tinker-dppo", "miles-tinker-ext-run"))
+        for k in ("run_id", "labels", "stats"):
+            d.pop(k)
+        for k in ("loss_fn", "loss_fn_config"):
+            d["train"].pop(k)
+        return d
+
+    assert strip(dppo) == strip(v2)
