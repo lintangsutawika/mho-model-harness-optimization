@@ -156,7 +156,7 @@ class UpstreamRelay:
         self.connections = 0
 
     async def start(self, host: str = "0.0.0.0") -> tuple[str, int]:
-        self.server = await asyncio.start_server(self._on_conn, host, 0, limit=2 ** 20, backlog=1024)
+        self.server = await asyncio.start_server(net.keep_task(self._on_conn), host, 0, limit=2 ** 20, backlog=1024)
         port = self.server.sockets[0].getsockname()[1]
         self.addr = (net.advertise_ip(self.advertise) if host in ("0.0.0.0", "") else host, port)
         return self.addr
@@ -172,6 +172,7 @@ class UpstreamRelay:
     async def _on_conn(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         net.set_keepalive(writer)
         up_w = None
+        torn_down = False
         try:
             auth = await wire.server_handshake(reader, writer, self.token)
             path = self.keys.get(str(auth.get("key")))
@@ -182,9 +183,14 @@ class UpstreamRelay:
             await net.splice(reader, writer, up_r, up_w)
         except (wire.WireError, ConnectionError, OSError, asyncio.TimeoutError):
             pass
+        except GeneratorExit:                      # closed in place: close without awaiting anything
+            torn_down = True
+            net.close_now(writer, up_w)
+            raise
         finally:
-            await net.close_writer(writer)
-            await net.close_writer(up_w)
+            if not torn_down:
+                await net.close_writer(writer)
+                await net.close_writer(up_w)
 
 
 # ---------------------------------------------------------------------------------------------------------- client

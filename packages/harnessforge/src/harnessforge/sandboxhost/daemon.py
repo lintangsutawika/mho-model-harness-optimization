@@ -116,7 +116,8 @@ class SandboxHost:
 
     # ------------------------------------------------------------------ lifecycle
     async def start_server(self, host: str = "0.0.0.0", port: int = 0) -> tuple[str, int]:
-        self._server = await asyncio.start_server(self._handle, host, port, limit=2 ** 20, backlog=1024)
+        self._server = await asyncio.start_server(net.keep_task(self._handle), host, port, limit=2 ** 20,
+                                                  backlog=1024)
         sock_port = self._server.sockets[0].getsockname()[1]
         self.address = (net.advertise_ip(self.advertise) if host in ("0.0.0.0", "") else host, sock_port)
         return self.address
@@ -207,6 +208,7 @@ class SandboxHost:
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         net.set_keepalive(writer)
         spooled: list[Path] = []
+        torn_down = False
         try:
             try:
                 await wire.server_handshake(reader, writer, self.token)
@@ -229,10 +231,15 @@ class SandboxHost:
             pass
         except Exception:  # noqa: BLE001 - one bad connection never ends the daemon
             logger.exception("connection failed")
+        except GeneratorExit:                      # closed in place: close without awaiting anything
+            torn_down = True
+            net.close_now(writer)
+            raise
         finally:
             for p in spooled:
                 p.unlink(missing_ok=True)
-            await net.close_writer(writer)
+            if not torn_down:
+                await net.close_writer(writer)
 
     async def _run(self, op: str, handler: Any, header: dict, payload: Any, reader: asyncio.StreamReader,
                    writer: asyncio.StreamWriter, spooled: list[Path]) -> None:
@@ -366,7 +373,7 @@ class SandboxHost:
                 await net.close_writer(writer)
                 await net.close_writer(up_w)
 
-        return await asyncio.start_unix_server(on_conn, path=str(sock_path))
+        return await asyncio.start_unix_server(net.keep_task(on_conn), path=str(sock_path))
 
     # ------------------------------------------------------------------ ops
     async def op_ping(self, header: dict, payload: Any) -> dict:
