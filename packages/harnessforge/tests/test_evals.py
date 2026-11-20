@@ -70,7 +70,8 @@ def test_classify_outcomes():
     assert classify(scored, graded_timeout) == (0.0, False, "scored:agent_timeout")
     # sandbox never started: the rollout raised, no outcome
     assert classify({"outcome_status": None, "error": "EnvSetupError: sandbox_start ..."}, None).env_failed
-    for kind in ("sandbox_start", "env_setup", "harness_setup", "harness_crash_gateway", "env_busy"):
+    for kind in ("sandbox_start", "env_setup", "harness_setup", "harness_crash_gateway", "env_busy",
+                 "unexpected:SandboxLostError"):
         v = classify({"outcome_status": "error"}, {"misc": {"outcome": {"status": "error", "failure_kind": kind}}})
         assert v.env_failed and v.reward is None and kind in v.error
     # after the agent ran: counts, as 0
