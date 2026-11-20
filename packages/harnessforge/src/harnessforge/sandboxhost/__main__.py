@@ -3,6 +3,8 @@
     python -m harnessforge.sandboxhost start  --spec fleet.json [--hosts N] [--no-wait] [--timeout S]
     python -m harnessforge.sandboxhost status --spec fleet.json [--json] [--no-ping]
     python -m harnessforge.sandboxhost stop   --spec fleet.json [--host I] [--grace S]
+    python -m harnessforge.sandboxhost drain  --spec fleet.json --host I [--replace] [--timeout S]
+        (no new sandboxes on host I; it exits once its own have stopped; --replace then starts a fresh one)
     python -m harnessforge.sandboxhost serve  --state DIR --index I          (inside a host job)
 
 --spec also takes the fleet's state dir.
@@ -33,10 +35,11 @@ def _summary(st: dict) -> str:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="python -m harnessforge.sandboxhost", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["start", "status", "stop", "serve"])
+    ap.add_argument("cmd", choices=["start", "status", "stop", "drain", "serve"])
     ap.add_argument("--spec", help="fleet spec JSON (or its state dir)")
     ap.add_argument("--hosts", type=int)
-    ap.add_argument("--host", type=int, help="stop: only this host index")
+    ap.add_argument("--host", type=int, help="stop: only this host index; drain: the host to drain")
+    ap.add_argument("--replace", action="store_true", help="drain: start a fresh host for it once drained")
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--timeout", type=float, default=1800.0)
     ap.add_argument("--grace", type=float, default=330.0)
@@ -63,6 +66,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(st, indent=1) if a.json else _summary(st))
     elif a.cmd == "stop":
         fleet.stop(fd, index=a.host, grace_s=a.grace)
+    elif a.cmd == "drain":
+        if a.host is None:
+            sys.exit("drain needs --host")
+        spec = fleet.load_spec(a.spec) if a.spec.endswith(".json") else None
+        timeout = a.timeout if a.timeout != 1800.0 else 4 * 3600.0
+        return 0 if fleet.drain(fd, a.host, timeout=timeout, replace=a.replace, spec=spec) else 1
     return 0
 
 

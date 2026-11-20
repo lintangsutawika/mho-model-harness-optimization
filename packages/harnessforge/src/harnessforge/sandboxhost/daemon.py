@@ -21,6 +21,9 @@ kill_processes, ensure_routes, stop, renew, reap, mirror_begin / mirror_put.
   on it and by the client's keepalive (`renew`); one that expires with nothing in flight is stopped (its client
   died without stopping or reaping it).
 - **Shutdown.** SIGTERM, or STOP / STOP.<i> in the fleet dir: stop every sandbox, write status "stopped", exit.
+- **Drain.** DRAIN / DRAIN.<i> in the fleet dir: place nothing new (free 0, starts refused as full), keep serving the
+  sandboxes it has until they stop, then exit with status "drained" (`sandboxhost drain --replace` then starts a
+  fresh host for that index): a host swapped without losing a rollout.
 """
 from __future__ import annotations
 
@@ -85,7 +88,8 @@ class SandboxHost:
                  provider_options: dict[str, Any] | None = None, lease_s: float = 900.0,
                  provider_factory: Callable[[dict[str, Any]], Any] | None = None,
                  status_file: str | os.PathLike | None = None, stop_files: tuple[Path, ...] = (),
-                 advertise: str | None = None, info: dict[str, Any] | None = None) -> None:
+                 advertise: str | None = None, info: dict[str, Any] | None = None,
+                 drain_files: tuple[Path, ...] = ()) -> None:
         self.token = token
         self.slots = int(slots)
         self.name = name
@@ -95,6 +99,8 @@ class SandboxHost:
         self.provider_factory = provider_factory or default_provider_factory
         self.status_file = Path(status_file) if status_file else None
         self.stop_files = tuple(stop_files)
+        self.drain_files = tuple(drain_files)
+        self.drained = False
         self.advertise = advertise
         self.info = dict(info or {})
         self.entries: dict[str, _Entry] = {}
@@ -140,7 +146,16 @@ class SandboxHost:
     def request_stop(self) -> None:
         self._stopping.set()
 
+    @property
+    def draining(self) -> bool:
+        return any(p.exists() for p in self.drain_files)
+
     async def shutdown(self) -> None:
+        if self.drained:                           # nothing left to stop: say so, and keep the "drained" status
+            if self._server is not None:
+                self._server.close()
+            self._write_status("drained")
+            return
         self._write_status("stopping")
         if self._server is not None:
             self._server.close()
@@ -167,7 +182,8 @@ class SandboxHost:
         except OSError:
             load = (0.0, 0.0, 0.0)
         return {"name": self.name, "slots": self.slots, "active": len(self.entries), "starting": self.starting,
-                "free": max(0, self.slots - len(self.entries) - self.starting), "load": list(load),
+                "free": 0 if self.draining else max(0, self.slots - len(self.entries) - self.starting),
+                "draining": self.draining, "load": list(load),
                 "cpus": os.cpu_count(), "stats": dict(self.stats), "pid": os.getpid(),
                 "host": socket.gethostname(), "time": time.time(), **self.info}
 
@@ -181,11 +197,20 @@ class SandboxHost:
 
     async def _status_loop(self) -> None:
         while True:
-            self._write_status("ready")
             if any(p.exists() for p in self.stop_files):
                 logger.info("STOP file present: shutting down")
                 self._stopping.set()
                 return
+            if self.draining:
+                if not self.entries and not self.starting:
+                    logger.info("DRAIN file present and no sandbox left: exiting (drained)")
+                    self.drained = True
+                    self._write_status("drained")
+                    self._stopping.set()
+                    return
+                self._write_status("draining")     # not "ready": clients place nothing here
+            else:
+                self._write_status("ready")
             await asyncio.sleep(STATUS_EVERY_S)
 
     async def _lease_loop(self) -> None:
@@ -386,6 +411,8 @@ class SandboxHost:
         from platoon.sandbox.base import Mount, SandboxSpec
         if self._stopping.is_set():
             raise wire.HostFull(f"sandbox host {self.name} is shutting down")
+        if self.draining:
+            raise wire.HostFull(f"sandbox host {self.name} is draining")
         if len(self.entries) + self.starting >= self.slots:
             self.stats["full"] += 1
             raise wire.HostFull(f"sandbox host {self.name} is full ({self.slots} slots)")
@@ -559,6 +586,7 @@ def serve(state: str | os.PathLike, index: int, *, port: int | None = None) -> i
         name=f"{cfg['fleet_id']}/{index}", provider_options=spec.get("provider_options") or {},
         lease_s=float(spec.get("lease_s", 900)), status_file=fd.host_file(index),
         stop_files=(fd.stop_file, fd.dir / f"STOP.{index}"), advertise=spec.get("advertise"),
+        drain_files=(fd.dir / "DRAIN", fd.dir / f"DRAIN.{index}"),
         info={"index": index, "job_id": os.environ.get("PBS_JOBID", "local")})
 
     async def main() -> None:

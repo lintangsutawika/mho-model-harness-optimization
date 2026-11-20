@@ -511,3 +511,69 @@ def test_fleet_spec_and_host_job(tmp_path):
 def test_sysdeps_is_forwarded_to_hosts():
     from harnessforge.sandboxhost.daemon import FORWARDED_OPTIONS
     assert "sysdeps" in FORWARDED_OPTIONS
+
+
+def test_drained_host_places_nothing_new_and_exits_when_empty(tmp_path, monkeypatch):
+    from harnessforge.sandboxhost import daemon
+    monkeypatch.setattr(daemon, "STATUS_EVERY_S", 0.05)
+    fd = make_fleet(tmp_path)
+
+    async def go():
+        h0 = await start_host(fd, tmp_path, 0, slots=4, drain_files=(fd.dir / "DRAIN.0",))
+        h1 = await start_host(fd, tmp_path, 1, slots=4)
+        p = provider(fd, tmp_path)
+        loop0 = asyncio.ensure_future(h0._status_loop())
+        on0 = None
+        for _ in range(8):                       # get one sandbox onto host 0
+            b = await p.start(spec())
+            if b._host.index == 0:
+                on0 = b
+                break
+            await b.stop()
+        assert on0 is not None
+        (fd.dir / "DRAIN.0").write_text("1")
+        assert h0.status()["free"] == 0 and h0.status()["draining"]
+        await asyncio.sleep(0.2)
+        assert fd.hosts()[0]["status"] == "draining"
+        new = [await p.start(spec()) for _ in range(3)]
+        assert all(b._host.index == 1 for b in new)          # nothing new on the draining host
+        assert (await on0.exec("true")).exit_code == 0        # its own sandbox still works
+        assert not loop0.done()                               # still serving it
+        await on0.stop()
+        await asyncio.wait_for(loop0, 5)                      # empty: it exits on its own
+        assert h0.drained and fd.hosts()[0]["status"] == "drained"
+        await h0.shutdown()
+        assert fd.hosts()[0]["status"] == "drained"
+        for b in new:
+            await b.stop()
+    run(go())
+
+
+def test_fleet_drain_waits_then_replaces(tmp_path):
+    spec_file = tmp_path / "fleet.json"
+    spec_file.write_text(json.dumps({"fleet_id": "f2", "state_root": str(tmp_path / "state"), "hosts": 2,
+                                     "python": "/venv/bin/python", "harnessforge_src": "/src",
+                                     "launcher": {"kind": "pbs"}}))
+    spec = fleet.load_spec(spec_file)
+    from harnessforge.contracts import JobState, JobStatus
+
+    class FakeLauncher:
+        submitted: list = []
+        done: set = set()
+
+        def submit(self, s):
+            self.submitted.append(s)
+            return f"{len(self.submitted)}.pbs"
+
+        def status(self, j):
+            return JobStatus(JobState.DONE if j in self.done else JobState.RUNNING)
+
+    launcher = FakeLauncher()
+    fleet.start(spec, launcher=launcher, wait=False, log=lambda *_: None)
+    fd = fleet.FleetDir(tmp_path / "state" / "f2")
+    assert not fleet.drain(fd, 1, launcher=launcher, timeout=0.05, poll=0.01, log=lambda *_: None)
+    assert (fd.dir / "DRAIN.1").exists() and len(launcher.submitted) == 2   # still draining: nothing replaced
+    launcher.done.add("2.pbs")                                               # host 1's job ended (drained)
+    assert fleet.drain(fd, 1, launcher=launcher, timeout=5, poll=0.01, replace=True, log=lambda *_: None)
+    assert fd.fleet()["jobs"] == {"0": "1.pbs", "1": "3.pbs"}               # a fresh host 1, host 0 untouched
+    assert not (fd.dir / "DRAIN.1").exists()                                 # the new one does not drain

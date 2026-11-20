@@ -192,9 +192,10 @@ def start(spec: dict[str, Any], *, hosts: int | None = None, launcher=None, wait
         old = cfg["jobs"].get(str(i))
         if old and launcher.status(old).state != JobState.DONE:
             continue
-        stop_i = fd.dir / f"STOP.{i}"
-        if stop_i.exists():
-            stop_i.rename(fd.dir / f"STOP.{i}.{int(time.time())}")
+        for marker in (f"STOP.{i}", f"DRAIN.{i}"):  # a fresh host starts neither stopping nor draining
+            m = fd.dir / marker
+            if m.exists():
+                m.rename(fd.dir / f"{marker}.{int(time.time())}")
         job = launcher.submit(host_job(spec, fd, i))
         cfg["jobs"][str(i)] = job
         cfg["history"].append({"at": time.time(), "event": "submit", "index": i, "job": job})
@@ -257,3 +258,32 @@ def stop(fd: FleetDir, *, index: int | None = None, launcher=None, grace_s: floa
     cfg.setdefault("history", []).append({"at": time.time(), "event": "stop", "index": index})
     write_json(fd.fleet_file, cfg)
     log("stopped")
+
+
+def drain(fd: FleetDir, index: int, *, launcher=None, timeout: float = 4 * 3600.0, poll: float = 15.0,
+          replace: bool = False, spec: dict[str, Any] | None = None, log=print) -> bool:
+    """Drain host `index` (DRAIN.<index>): it places nothing new and exits once its sandboxes have stopped. Waits up
+    to `timeout` for its job to end; with `replace`, then starts a fresh host for that index (with `spec`, else the
+    fleet's own). Returns whether the host drained in time (it keeps draining otherwise)."""
+    cfg = fd.fleet()
+    launcher = launcher or _launcher(cfg["spec"])
+    job = cfg.get("jobs", {}).get(str(index))
+    if job is None:
+        raise KeyError(f"fleet {cfg['fleet_id']} has no host {index}")
+    (fd.dir / f"DRAIN.{index}").write_text(f"{time.time()}\n")
+    cfg.setdefault("history", []).append({"at": time.time(), "event": "drain", "index": index})
+    write_json(fd.fleet_file, cfg)
+    log(f"host {index}: draining (job {job})")
+    deadline = time.time() + timeout
+    while launcher.status(job).state != JobState.DONE:
+        if time.time() > deadline:
+            h = fd.hosts().get(index, {})
+            log(f"host {index}: still {h.get('active')} sandbox(es) after {timeout:.0f}s; it keeps draining")
+            return False
+        time.sleep(poll)
+    log(f"host {index}: drained")
+    if replace:
+        new_spec = dict(spec or cfg["spec"])
+        n = max(int(new_spec.get("hosts", 1)), index + 1, len(cfg.get("jobs", {})))
+        start(new_spec, hosts=n, launcher=launcher, wait=False, log=log)
+    return True
