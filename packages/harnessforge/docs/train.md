@@ -840,7 +840,31 @@ cd ~/hf-dev/train/harnessforge-dppo && PYTHONPATH=$PWD/src ~/.local/bin/python3.
     --config configs/train/naive_ext_64kcap_v2_dppo.json
 ```
 
-SMOKE_PLACEHOLDER
+**GPU smoke (2026-11-21, 1 rt_HF node, `/groups/.../mho/runs/dppo-smoke-hook2-20261121-0150`).** This used the
+`miles-tinker-dppo` tree with `--tinker-custom-loss dppo=harnessforge.train.losses.dppo:dppo_loss`: full FT, TP2 × DP2,
+2 SGLang engines of its own attached with disk-delta (not the pool). The client was `platoon-dppo-venv`. The serve
+log shows the hook registering at startup.
+
+Each of 3 steps: 4 prompts × 4 samples (128 tokens), sampled from the current weights, with random group-centered
+rewards. `forward_backward(dppo)` ran on those (real mu) and on a copy whose mu was perturbed by ±1.5 in log space,
+then `optim_step` (lr 1e-5) and a publish.
+
+| step | real: masked / divergence mean / IW mean | perturbed: masked / divergence mean | engine versions | probe Δlogprob vs base |
+|---|---|---|---|---|
+| 1 | 0.000 / 0.0025 / 1.000 | 0.216 / 0.246 | 2, 2 | 0.023 |
+| 2 | 0.000 / 0.0023 / 1.000 | 0.325 / 0.239 | 3, 3 | 0.059 |
+| 3 | 0.000 / 0.0027 / 0.999 | 0.240 / 0.231 | 4, 4 | 0.066 |
+
+Every check passed:
+
+- `optim/dppo_*` and the `dppo_*:sum` server metrics were present, with no NaN.
+- The server's masked count equals the client's recomputation from the returned trainer logprobs (443, 665 and 491
+  perturbed tokens of 2048).
+- The weights advanced, and both engines agree (spread 0).
+- No capping at these ratios.
+- Grad norms are about 6e3 because the smoke's advantages are not divided by token counts. platoon's normalization
+  does that in the run.
+
 
 ## Stall guard and automatic driver restarts (`harnessforge.train.guard`)
 
