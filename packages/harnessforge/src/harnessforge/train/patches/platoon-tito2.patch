@@ -1,0 +1,375 @@
+platoon 0.6.0 + platoon-tito.patch: (a) a chat-template override for the chat_template renderer
+(renderer_kwargs.chat_template: a .jinja path or the text), (b) the context limit (PLATOON_MIN_COMPLETION_TOKENS,
+default 2048: a prompt leaving less ends the rollout, graded with reason context_limit; trajectory stat context_limit).
+Apply after platoon-tito.patch, in the site-packages directory that holds platoon/:  patch -p1 < platoon-tito2.patch
+
+diff --git a/platoon/gateway/__pycache__/core.cpython-312.pyc b/platoon/gateway/__pycache__/core.cpython-312.pyc
+index 2238c14..6e143f8 100644
+Binary files a/platoon/gateway/__pycache__/core.cpython-312.pyc and b/platoon/gateway/__pycache__/core.cpython-312.pyc differ
+diff --git a/platoon/gateway/__pycache__/server.cpython-312.pyc b/platoon/gateway/__pycache__/server.cpython-312.pyc
+index 75a271f..ce1e0a3 100644
+Binary files a/platoon/gateway/__pycache__/server.cpython-312.pyc and b/platoon/gateway/__pycache__/server.cpython-312.pyc differ
+diff --git a/platoon/gateway/core.py b/platoon/gateway/core.py
+index 925a0b6..92b2ab4 100644
+--- a/platoon/gateway/core.py
++++ b/platoon/gateway/core.py
+@@ -73,6 +73,26 @@ MessageRole = Literal["assistant", "user", "system", "tool", "function"]
+ # reported as a context-window error (hard condensation) instead of being sampled.
+ MIN_CONTEXT_HEADROOM_TOKENS = 1
+ 
++# The context limit (ModelGateway.min_completion_tokens): a prompt that leaves fewer completion tokens than this under
++# the context window ends the rollout (ContextLimitError, graded with reason ``context_limit``) instead of being sampled
++# with a clamped ``max_tokens``.  PLATOON_MIN_COMPLETION_TOKENS sets it for a process (0: off, clamp as before).
++MIN_COMPLETION_TOKENS_ENV = "PLATOON_MIN_COMPLETION_TOKENS"
++DEFAULT_MIN_COMPLETION_TOKENS = 2048
++# The outcome reason of a rollout the context limit ended, and the agent misc key that records the refused prompt.
++CONTEXT_LIMIT_REASON = "context_limit"
++CONTEXT_LIMIT_MISC_KEY = "context_limit"
++
++
++def min_completion_tokens_from_env(default: int = DEFAULT_MIN_COMPLETION_TOKENS) -> int:
++    """``PLATOON_MIN_COMPLETION_TOKENS`` as a non-negative int, else ``default``."""
++    value = os.environ.get(MIN_COMPLETION_TOKENS_ENV, "").strip()
++    if not value:
++        return default
++    tokens = int(value)
++    if tokens < 0:
++        raise ValueError(f"{MIN_COMPLETION_TOKENS_ENV} must be >= 0, got {tokens}")
++    return tokens
++
+ # Render kwargs a request may forward from its ``chat_template_kwargs`` (top level, or inside
+ # ``extra_body``) into ``renderer.build_generation_prompt``.
+ CHAT_TEMPLATE_RENDER_KWARGS = ("enable_thinking", "preserve_thinking")
+@@ -192,6 +212,37 @@ class ContextWindowExceededError(GatewayError):
+         )
+ 
+ 
++class ContextLimitError(ContextWindowExceededError):
++    """The prompt fits the context window but leaves less than the gateway's ``min_completion_tokens`` for the
++    completion: the rollout ends here and is graded (reason ``context_limit``).  Transports report it as the
++    context-window error it subclasses, so a harness stops (or condenses) instead of retrying."""
++
++    def __init__(self, *, prompt_tokens: int, context_window: int, min_completion_tokens: int) -> None:
++        GatewayError.__init__(
++            self,
++            f"Context length exceeded: {prompt_tokens} prompt tokens leave {context_window - prompt_tokens} of the "
++            f"{context_window}-token context window, less than the {min_completion_tokens} completion tokens a "
++            "call needs (input exceeds the context window); the rollout ends here and is graded.",
++        )
++        self.prompt_tokens = prompt_tokens
++        self.context_window = context_window
++        self.min_completion_tokens = min_completion_tokens
++
++
++def note_context_refusal(agent: AgentSession, error: ContextWindowExceededError) -> None:
++    """Count a prompt refused for the context window on ``agent``; a context limit (:class:`ContextLimitError`) is
++    also counted in ``context_limits`` and recorded in its misc (-> trajectory misc ``context_limit``)."""
++    agent.context_overflows += 1
++    if isinstance(error, ContextLimitError):
++        agent.context_limits += 1
++        agent.misc[CONTEXT_LIMIT_MISC_KEY] = {
++            "prompt_tokens": error.prompt_tokens,
++            "context_window": error.context_window,
++            "min_completion_tokens": error.min_completion_tokens,
++            "calls": len(agent.calls),
++        }
++
++
+ class JudgesOffError(GatewayError):
+     """A judge refused because the run's judges are off (``inference.judges: false``): a ``judge`` call, or a
+     ``judge``-role agent.  The refusal is counted in the refusing agent's misc (:data:`JUDGES_REFUSED_MISC_KEY`),
+@@ -923,7 +974,8 @@ class AgentSession:
+     calls: list[ChatResponse] = field(default_factory=list, repr=False)
+     timeline: CallTimeline | None = field(default=None, repr=False)
+     closed: bool = False
+-    context_overflows: int = 0  # prompts refused for exceeding the context window
++    context_overflows: int = 0  # prompts refused for exceeding the context window (context limits included)
++    context_limits: int = 0  # of those, prompts that fit but left less than the gateway's min_completion_tokens
+     # Calls the gateway failed for its own reasons: sampling failed or timed out, the sample could not be parsed,
+     # or rendering failed for a reason other than the request (on_harness_exit's grade_if_gateway_clean).
+     gateway_errors: int = 0
+@@ -1144,6 +1196,7 @@ class ModelGateway:
+         max_minted_agents: int | None = None,
+         version: int | None = None,
+         tito: bool | None = None,
++        min_completion_tokens: int | None = None,
+     ) -> None:
+         self.sampler = sampler
+         self.version = version
+@@ -1178,6 +1231,10 @@ class ModelGateway:
+         # The tools each role's agents may see and call, as name patterns (limit_tools); a role left out: every tool.
+         self.role_tools: dict[str, tuple[str, ...]] = {}
+         self.tito = tito_from_env() if tito is None else bool(tito)
++        # The context limit: see MIN_COMPLETION_TOKENS_ENV.  None: the variable, else DEFAULT_MIN_COMPLETION_TOKENS.
++        self.min_completion_tokens = (
++            min_completion_tokens_from_env() if min_completion_tokens is None else int(min_completion_tokens)
++        )
+         self._tito_stitcher: TitoStitcher | None | bool = None  # built on first use; False: renderer unsupported
+         self.tito_totals = TitoTotals()
+ 
+@@ -1267,6 +1324,13 @@ class ModelGateway:
+         headroom = self.context_window_length - prompt_length
+         if headroom < MIN_CONTEXT_HEADROOM_TOKENS:
+             raise ContextWindowExceededError(prompt_tokens=prompt_length, context_window=self.context_window_length)
++        if headroom < min(self.min_completion_tokens, max_tokens):
++            # The context limit: rather than a reply clamped to a few tokens, end the rollout here (graded).
++            raise ContextLimitError(
++                prompt_tokens=prompt_length,
++                context_window=self.context_window_length,
++                min_completion_tokens=self.min_completion_tokens,
++            )
+         if max_tokens > headroom:
+             logger.info(
+                 f"Clamping max_tokens {max_tokens} -> {headroom}: {prompt_length} prompt tokens "
+@@ -1507,8 +1571,8 @@ class ModelGateway:
+                 call = runtime.prepare(
+                     request, defaults=agent.sampling_defaults, kind=agent.sampling_kind(kind), agent=agent
+                 )
+-            except ContextWindowExceededError:
+-                agent.context_overflows += 1
++            except ContextWindowExceededError as exc:
++                note_context_refusal(agent, exc)
+                 raise
+             except (GatewayError, ValueError):
+                 raise  # the request's own fault
+diff --git a/platoon/gateway/server.py b/platoon/gateway/server.py
+index 6c5218f..3dbaea0 100644
+--- a/platoon/gateway/server.py
++++ b/platoon/gateway/server.py
+@@ -60,6 +60,7 @@ from platoon.gateway.core import (
+     CallKindRefusedError,
+     ContextWindowExceededError,
+     GatewayError,
++    note_context_refusal,
+     ModelGateway,
+     PreparedCall,
+     UnknownAgentError,
+@@ -329,7 +330,7 @@ class GatewayServer:
+                 dialect.chat_request(body), defaults=agent.sampling_defaults, kind=agent.sampling_kind(kind), agent=agent
+             )
+         except ContextWindowExceededError as exc:
+-            agent.context_overflows += 1
++            note_context_refusal(agent, exc)
+             return _error_response(dialect, exc)
+         except Exception as exc:
+             if error_kind(exc) == "server":
+diff --git a/platoon/harness/agents.py b/platoon/harness/agents.py
+index ae012f8..c3e0580 100644
+--- a/platoon/harness/agents.py
++++ b/platoon/harness/agents.py
+@@ -475,6 +475,7 @@ async def _grade_child(
+         on_harness_exit=runtime.on_harness_exit,
+         gateway_errors=child.agent.gateway_errors,
+         budget_exhausted=child.agent.budget_exhausted,
++        context_limits=getattr(child.agent, "context_limits", 0),
+     )
+     if failed is not None:
+         return failed
+diff --git a/platoon/harness/inline.py b/platoon/harness/inline.py
+index 07c0e8b..c862974 100644
+--- a/platoon/harness/inline.py
++++ b/platoon/harness/inline.py
+@@ -287,6 +287,7 @@ def failure_outcome(
+     on_harness_exit: HarnessExitPolicy | None = None,
+     gateway_errors: int = 0,
+     budget_exhausted: bool = False,
++    context_limits: int = 0,
+ ) -> tuple[Outcome | None, str | None]:
+     """The failure taxonomy of a finished run: ``(outcome instead of grading, reason to add to a grade)``.
+ 
+@@ -298,6 +299,9 @@ def failure_outcome(
+     the default), graded (``reason="harness_crash"``), or graded unless the gateway failed one of the agent's
+     calls (``gateway_errors``; then ``harness_crash_gateway``).  ``completed`` and ``limit`` runs are graded, a
+     ``limit`` run that the gateway stopped at its step budget (``budget_exhausted``) with ``reason="budget"``.
++    A run the gateway's context limit ended (``context_limits``: a prompt left less than its ``min_completion_tokens``)
++    is graded with ``reason="context_limit"``, whether the harness then failed or finished, unless the environment
++    sets ``on_context_overflow: exclude``.
+     """
+ 
+     from platoon.envs.service import Outcome
+@@ -310,6 +314,10 @@ def failure_outcome(
+         return Outcome(status="timeout", reason="agent_timeout"), None
+     if result.status == "cancelled":
+         return Outcome(status="cancelled", reason="agent_cancelled"), None
++    if context_limits and result.status in ("error", "completed", "limit"):
++        if on_context_overflow == "exclude":
++            return Outcome.infra("context_limit", reason=f"{harness_ref} reached the context limit"), None
++        return None, "context_limit"
+     if result.status == "error":
+         reason = f"{harness_ref} failed: {result.error}"
+         if context_overflows:
+diff --git a/platoon/harness/rollout.py b/platoon/harness/rollout.py
+index a333638..ae6b269 100644
+--- a/platoon/harness/rollout.py
++++ b/platoon/harness/rollout.py
+@@ -475,6 +475,12 @@ async def _run_and_grade(
+         if route.on_harness_exit.timeout == "grade":
+             return await _grade(session, reason="agent_timeout"), result, placement
+         return Outcome(status="timeout", reason="agent_timeout"), result, placement
++    if getattr(root, "context_limits", 0) and spec.exit_status(result.exit_code) in ("completed", "error", "limit"):
++        # The gateway's context limit ended the run (a prompt left less than min_completion_tokens): a graded policy
++        # outcome, whether the harness then failed on the context error or finished.
++        if route.on_context_overflow == "exclude":
++            return Outcome.infra("context_limit", reason="the context limit ended the run"), result, placement
++        return await _grade(session, reason="context_limit"), result, placement
+     if spec.exit_status(result.exit_code) == "completed" and getattr(root, "budget_exhausted", False):
+         # The gateway ended the run at the step budget: a graded policy outcome, like a harness's own step limit.
+         return await _grade(session, reason="budget"), result, placement
+diff --git a/platoon/programs.py b/platoon/programs.py
+index 698bd18..c4de55e 100644
+--- a/platoon/programs.py
++++ b/platoon/programs.py
+@@ -433,6 +433,7 @@ class Episode:
+                 on_harness_exit=self.route.on_harness_exit,
+                 gateway_errors=self.root.gateway_errors,
+                 budget_exhausted=self.root.budget_exhausted,
++                context_limits=getattr(self.root, "context_limits", 0),
+             )
+             if failed is not None:
+                 return failed
+diff --git a/platoon/train/tinker/renderers/__pycache__/chat_template.cpython-312.pyc b/platoon/train/tinker/renderers/__pycache__/chat_template.cpython-312.pyc
+index 8af6475..da553ee 100644
+Binary files a/platoon/train/tinker/renderers/__pycache__/chat_template.cpython-312.pyc and b/platoon/train/tinker/renderers/__pycache__/chat_template.cpython-312.pyc differ
+diff --git a/platoon/train/tinker/renderers/chat_template.py b/platoon/train/tinker/renderers/chat_template.py
+index a4c6b59..48a7025 100644
+--- a/platoon/train/tinker/renderers/chat_template.py
++++ b/platoon/train/tinker/renderers/chat_template.py
+@@ -43,6 +43,7 @@ import hashlib
+ import itertools
+ import json
+ import logging
++import os
+ import threading
+ from collections.abc import Iterable, Mapping, Sequence
+ from typing import Any
+@@ -114,6 +115,7 @@ class ChatTemplateRenderer(Renderer):
+         chat_template_kwargs: Mapping[str, Any] | None = None,
+         tool_call_parser: str = AUTO,
+         reasoning_tags: Any = AUTO,
++        chat_template: str | None = None,
+     ):
+         super().__init__(tokenizer)
+         self.image_processor = image_processor  # accepted for get_renderer() parity; text-only
+@@ -123,10 +125,28 @@ class ChatTemplateRenderer(Renderer):
+         self.chat_template_kwargs = dict(chat_template_kwargs or {})
+         self.tool_call_parser = tool_call_parser
+         self.reasoning_tags = reasoning_tags
++        # A chat template to render with instead of the tokenizer's own: a path to a .jinja file, or the template
++        # text (``train.renderer_kwargs.chat_template``).  None: the tokenizer's.
++        self.chat_template = chat_template
+         self._stop_tokens = generation_stop_tokens(tokenizer)
+         self._generation_prompts: dict[str, str] = {}  # template kwargs -> a generation prompt rendered with them
+ 
+     # ------------------------------------------------------------------ render
++    def template_text(self) -> str | None:
++        """The override template's text (``chat_template``: a file's contents, or the text itself), or None."""
++        override = self.chat_template
++        if not override:
++            return None
++        cached = self.__dict__.get("_template_cache")
++        if cached is not None and cached[0] == override:
++            return cached[1]
++        text = override
++        if "{" not in override and "\n" not in override:  # a path, not a template
++            with open(os.path.expanduser(override), encoding="utf-8") as f:
++                text = f.read()
++        self._template_cache = (override, text)
++        return text
++
+     def template_kwargs(self, *, enable_thinking: bool | None = None, preserve_thinking: bool | None = None) -> dict:
+         """The kwargs the template sees: the renderer's settings, then the request's overrides."""
+         kwargs = dict(self.chat_template_kwargs)
+@@ -151,11 +171,13 @@ class ChatTemplateRenderer(Renderer):
+         if not messages:
+             raise RendererError("No messages provided.")
+         try:
++            override = self.template_text()
+             return self.tokenizer.apply_chat_template(
+                 clean_messages(messages),
+                 tools=list(tools) if tools and not isinstance(tools, Mapping) else None,
+                 add_generation_prompt=add_generation_prompt,
+                 tokenize=False,
++                **({"chat_template": override} if override else {}),
+                 **self.template_kwargs(enable_thinking=enable_thinking, preserve_thinking=preserve_thinking),
+             )
+         except jinja2.TemplateError as e:  # the template's raise_exception: a bad request, like RendererError
+@@ -230,13 +252,14 @@ class ChatTemplateRenderer(Renderer):
+         """
+         settings = (
+             self.tool_call_parser,
++            self.chat_template,
+             json.dumps(self.reasoning_tags, default=str),
+             json.dumps(self.template_kwargs(), sort_keys=True, default=str),
+         )
+         resolved = self.__dict__.get("_resolved_parser")
+         if resolved is not None and resolved[0] == settings:
+             return resolved[1]
+-        template = json.dumps(self.tokenizer.chat_template, sort_keys=True, default=str)
++        template = json.dumps(self.template_text() or self.tokenizer.chat_template, sort_keys=True, default=str)
+         key = (
+             getattr(self.tokenizer, "name_or_path", None),
+             hashlib.sha256(template.encode()).hexdigest(),
+diff --git a/platoon/train/workflow/output.py b/platoon/train/workflow/output.py
+index 6973683..191a304 100644
+--- a/platoon/train/workflow/output.py
++++ b/platoon/train/workflow/output.py
+@@ -174,7 +174,7 @@ def _summarize_outcomes(outcomes: list[MemberOutcome]) -> RolloutStats:
+         "task_reward_valid": [result.task_reward_valid for result in results],
+         **{
+             key: [getattr(stats, key) for stats in trajectories]
+-            for key in ("num_steps", "num_input_tokens", "num_output_tokens", *TOOL_CALL_STATS)
++            for key in ("num_steps", "num_input_tokens", "num_output_tokens", *TOOL_CALL_STATS, "context_limit")
+         },
+     }
+     root_keys = {key for result in results for key in result.root_rewards_dict}
+diff --git a/platoon/utils/__pycache__/tinker_data_processing.cpython-312.pyc b/platoon/utils/__pycache__/tinker_data_processing.cpython-312.pyc
+index 1a64f21..5be34ed 100644
+Binary files a/platoon/utils/__pycache__/tinker_data_processing.cpython-312.pyc and b/platoon/utils/__pycache__/tinker_data_processing.cpython-312.pyc differ
+diff --git a/platoon/utils/rollout_stats.py b/platoon/utils/rollout_stats.py
+index ce67354..0eda99d 100644
+--- a/platoon/utils/rollout_stats.py
++++ b/platoon/utils/rollout_stats.py
+@@ -129,7 +129,7 @@ def summarize_rollout_group(data: Mapping[str, Any], *, presence_mask_prefix: st
+     for name in ("task_reward", "task_reward_valid", "num_steps", "num_input_tokens", "num_output_tokens"):
+         if name in data:
+             stats.add(name, present(name))
+-    for name in TOOL_CALL_STATS:
++    for name in (*TOOL_CALL_STATS, "context_limit"):  # context_limit: the share ended by the gateway's context limit
+         if name in data:
+             stats.add(name, present(name))
+ 
+diff --git a/platoon/utils/tinker_data_processing.py b/platoon/utils/tinker_data_processing.py
+index c922ad2..5d1620e 100644
+--- a/platoon/utils/tinker_data_processing.py
++++ b/platoon/utils/tinker_data_processing.py
+@@ -128,6 +128,8 @@ class TrajectoryStats:
+     num_tool_calls: int = 0
+     num_recovered_tool_calls: int = 0
+     num_unparsed_tool_calls: int = 0
++    # 1 when the gateway's context limit ended the trajectory (outcome reason ``context_limit``), else 0.
++    context_limit: int = 0
+ 
+ 
+ _SAMPLING_COUNT_FIELDS = (
+@@ -821,6 +823,7 @@ def get_train_data_for_trajectory_collection(
+                 rewards_dict=rewards_dict,
+                 is_root=is_root,
+                 **tool_call_counts(trajectory),
++                context_limit=_ended_by_context_limit(trajectory),
+             )
+         )
+ 
+@@ -842,6 +845,13 @@ def get_train_data_for_trajectory_collection(
+     )
+ 
+ 
++def _ended_by_context_limit(trajectory: dict) -> int:
++    """1 when the trajectory's outcome reason is ``context_limit`` (the gateway's context limit ended it)."""
++    misc = trajectory.get("misc") if isinstance(trajectory, dict) else None
++    outcome = misc.get("outcome") if isinstance(misc, dict) else None
++    return int(isinstance(outcome, dict) and outcome.get("reason") == "context_limit")
++
++
+ def _agent_tag(trajectory_id: str, trajectory: dict, depth: int, reward: float, policy: str | None = None) -> AgentTag:
+     """The :class:`AgentTag` of one converted trajectory: its agent as the gateway recorded it in its misc, its parent
+     (``parent_info``), its depth, its processed ``reward``, None when it was interrupted or its verifier gave no

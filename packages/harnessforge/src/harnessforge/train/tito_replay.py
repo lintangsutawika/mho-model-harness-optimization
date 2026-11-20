@@ -67,11 +67,32 @@ def load_tokenizer(path: str) -> Any:
     return AutoTokenizer.from_pretrained(path)
 
 
-def make_gateway(tokenizer: Any, sampler: Any, *, tito: bool, context_window: int = 65536, max_tokens: int = 16384):
+KEEP_THINKING_TEMPLATE = os.path.join(os.path.dirname(__file__), "templates", "qwen3.5-keep-thinking-v1.jinja")
+
+
+def make_gateway(
+    tokenizer: Any,
+    sampler: Any,
+    *,
+    tito: bool,
+    context_window: int = 65536,
+    max_tokens: int = 16384,
+    chat_template: str | None = None,
+    min_completion_tokens: int = 0,
+):
+    """The gateway under test. ``chat_template``: the renderer's template override (the platoon-tito2 patch);
+    ``min_completion_tokens``: the context limit (0: clamp as platoon 0.6.0 does)."""
     from platoon.gateway.core import ModelGateway
     from platoon.train.tinker.renderers import ChatTemplateRenderer
 
     renderer = ChatTemplateRenderer(tokenizer, tool_call_parser="qwen3_coder")
+    extra: dict[str, Any] = {}
+    if chat_template:
+        renderer.chat_template = chat_template
+    if min_completion_tokens:
+        extra["min_completion_tokens"] = min_completion_tokens
+    elif "min_completion_tokens" in ModelGateway.__init__.__code__.co_varnames:
+        extra["min_completion_tokens"] = 0
     return ModelGateway(
         sampler=sampler,
         renderer=renderer,
@@ -80,6 +101,7 @@ def make_gateway(tokenizer: Any, sampler: Any, *, tito: bool, context_window: in
         max_tokens=max_tokens,
         context_window_length=context_window,
         tito=tito,
+        **extra,
     )
 
 
@@ -226,14 +248,24 @@ def e2e_script(tokenizer: Any) -> list[Any]:
 
 
 async def run_micro_swe(
-    tokenizer: Any, *, tito: bool, harness_python: str, micro_swe_src: str, workdir: str, timeout: float = 300
+    tokenizer: Any,
+    *,
+    tito: bool,
+    harness_python: str,
+    micro_swe_src: str,
+    workdir: str,
+    timeout: float = 300,
+    script: list[Any] | None = None,
+    check: bool = True,
+    **gateway_kwargs: Any,
 ) -> tuple[Any, dict[str, Any]]:
     """Serve the gateway (scripted sampler) over HTTP and run micro-swe-agent against it (litellm_proxy, as the
-    harness spec launches it). Returns (the agent session, micro-swe-agent's trajectory)."""
+    harness spec launches it). Returns (the agent session, micro-swe-agent's trajectory, with its exit code under
+    ``_exit_code``). ``check``: raise when the harness exits non-zero."""
     from platoon.gateway.server import GatewayServer
 
-    sampler = ScriptedSampler(tokenizer, e2e_script(tokenizer))
-    gateway = make_gateway(tokenizer, sampler, tito=tito)
+    sampler = ScriptedSampler(tokenizer, script if script is not None else e2e_script(tokenizer))
+    gateway = make_gateway(tokenizer, sampler, tito=tito, **gateway_kwargs)
     agent = open_agent(gateway, f"e2e-{int(tito)}")
     server = GatewayServer(gateway)
     base = await server.start("127.0.0.1")
@@ -259,12 +291,13 @@ async def run_micro_swe(
         proc = await asyncio.create_subprocess_exec(*argv, cwd=workdir, env=env, stdout=asyncio.subprocess.PIPE,
                                                     stderr=asyncio.subprocess.STDOUT)
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-        if proc.returncode != 0:
+        if check and proc.returncode != 0:
             raise RuntimeError(f"micro-swe-agent exited {proc.returncode}: {out.decode()[-3000:]}")
     finally:
         await server.stop()
     with open(output) as f:
         trajectory = json.load(f)
+    trajectory["_exit_code"] = proc.returncode
     return agent, trajectory
 
 
@@ -286,6 +319,7 @@ def _load_events(path: str) -> list[dict[str, Any]]:
                 action = misc.get("action_misc") or {}
                 tr["steps"].append((action.get("completion_id"), action.get("usage") or {}, misc.get("message") or {}))
             elif kind == "trajectory_finished":
+                tr["reward"] = event.get("reward")
                 misc = event.get("misc") or {}
                 tr["gens"] = misc.get("model_generations") or {}
                 tr["role"] = (misc.get("agent") or {}).get("role")
@@ -320,10 +354,33 @@ def _filler(tokenizer: Any, n: int) -> str:
     return " ".join(["ok"] * max(0, n))
 
 
-async def replay_trajectory(tokenizer: Any, tr: dict[str, Any], *, tito: bool, perturb: float = 0.0) -> dict[str, Any]:
+# What the replay compares: the gateway before (off), with TITO (merged), and with TITO plus (a) the keep-thinking
+# template and/or (b) the context limit (min_completion_tokens 2048), all at the run's 65536-token window.
+VARIANTS: dict[str, dict[str, Any]] = {
+    "off": {"tito": False},
+    "tito": {"tito": True},
+    "tito+a": {"tito": True, "keep_thinking": True},
+    "tito+b": {"tito": True, "min_completion_tokens": 2048},
+    "tito+a+b": {"tito": True, "keep_thinking": True, "min_completion_tokens": 2048},
+}
+
+
+async def replay_trajectory(
+    tokenizer: Any,
+    tr: dict[str, Any],
+    *,
+    tito: bool,
+    perturb: float = 0.0,
+    keep_thinking: bool = False,
+    min_completion_tokens: int = 0,
+    context_window: int = 65536,
+    template: str = KEEP_THINKING_TEMPLATE,
+) -> dict[str, Any]:
+    from platoon.gateway.core import ContextLimitError, ContextWindowExceededError
+
     steps = tr["steps"]
     script: list[Any] = []
-    rng = random.Random(tr["id"])  # the same samples with TITO off and on
+    rng = random.Random(tr["id"])  # the same samples in every variant
     for cid, usage, message in steps:
         record = tr["gens"].get(cid, {})
         text = sample_text(message, variant=rng.random() < perturb)
@@ -333,38 +390,61 @@ async def replay_trajectory(tokenizer: Any, tr: dict[str, Any], *, tito: bool, p
         else:
             script.append((text, True))
     sampler = ScriptedSampler(tokenizer, script)
-    # the rebuilt tool results overshoot the recorded prompt sizes by a little; the window does not affect stitching
-    gateway = make_gateway(tokenizer, sampler, tito=tito, context_window=2 * 65536)
+    gateway = make_gateway(
+        tokenizer,
+        sampler,
+        tito=tito,
+        context_window=context_window,
+        chat_template=template if keep_thinking else None,
+        min_completion_tokens=min_completion_tokens,
+    )
     agent = open_agent(gateway, tr["id"])
     history = MicroSweHistory(tr["goal"])
     prompt_diffs = []
     kept = dropped = 0
+    ended = None
+    base = previous = 0  # drift the variant causes by design (thinking kept after a dropped reply), not steered away
+    after_drop = False
     for i, (cid, usage, message) in enumerate(steps):
-        response = await gateway.chat(agent, chat_request(history.messages))
+        try:
+            response = await gateway.chat(agent, chat_request(history.messages))
+        except ContextLimitError:
+            ended = "context_limit"
+            break
+        except ContextWindowExceededError:
+            ended = "context_overflow"
+            break
         drift = response.prompt_tokens - int(usage.get("prompt_tokens") or 0)
-        prompt_diffs.append(drift)
+        if after_drop:
+            base += drift - previous
+        previous = drift
+        prompt_diffs.append(drift - base)
         cut = response.stop_reason == "length"
         reply = response.message()
         calls = None if cut else valid_bash_calls(reply)
         observations: list[str] = []
         if calls and i + 1 < len(steps):
             grow = int(steps[i + 1][1].get("prompt_tokens") or 0) - int(usage.get("prompt_tokens") or 0)
-            grow -= int(usage.get("completion_tokens") or 0) + drift  # steer the rebuilt prompt back to the recorded
+            grow -= int(usage.get("completion_tokens") or 0) + (drift - base)  # steer back to the recorded sizes
             per_call = max(0, grow - 12 * len(calls)) // len(calls)
             observations = [
                 '{\n  "returncode": 0,\n  "output": "' + _filler(tokenizer, per_call - 10) + '"\n}' for _ in calls
             ]
-        if history.add_reply(reply, observations, cut=cut):
-            kept += 1
-        else:
+        after_drop = not history.add_reply(reply, observations, cut=cut)
+        if after_drop:
             dropped += 1
+        else:
+            kept += 1
     data = datums(agent)
     return {
         "datums": len(data),
         "tokens": sum(datum_tokens(d) for d in data),
-        "calls": len(steps),
+        "calls": len(agent.calls),
+        "recorded_calls": len(steps),
         "kept": kept,
         "dropped": dropped,
+        "ended": ended,
+        "reward": tr.get("reward"),
         "prompt_diff_mean_abs": sum(abs(d) for d in prompt_diffs) / max(1, len(prompt_diffs)),
         "tito": dict(agent.misc.get("tito") or {}),
     }
@@ -387,17 +467,19 @@ def usage_estimate(tr: dict[str, Any]) -> tuple[int, int]:
 _WORKER: dict[str, Any] = {}
 
 
-def _worker_init(tokenizer_path: str, perturb: float) -> None:
+def _worker_init(tokenizer_path: str, perturb: float, variants: list[str]) -> None:
     os.environ.setdefault("PLATOON_TITO_VERIFY", "1")
     _WORKER["tokenizer"] = load_tokenizer(tokenizer_path)
     _WORKER["perturb"] = perturb
+    _WORKER["variants"] = variants
 
 
 def _replay_row(tr: dict[str, Any]) -> dict[str, Any]:
     tokenizer, perturb = _WORKER["tokenizer"], _WORKER["perturb"]
-    row: dict[str, Any] = {"id": tr["id"], "calls": len(tr["steps"]), "usage_estimate": usage_estimate(tr)}
-    for tito in (False, True):
-        row["on" if tito else "off"] = run(replay_trajectory(tokenizer, tr, tito=tito, perturb=perturb))
+    row: dict[str, Any] = {"id": tr["id"], "calls": len(tr["steps"]), "usage_estimate": usage_estimate(tr),
+                           "reward": tr.get("reward")}
+    for name in _WORKER["variants"]:
+        row[name] = run(replay_trajectory(tokenizer, tr, perturb=perturb, **VARIANTS[name]))
     return row
 
 
@@ -407,11 +489,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="at most this many trajectories (0: all)")
     ap.add_argument("--workers", type=int, default=1, help="processes (each replays whole trajectories)")
     ap.add_argument("--out", default=None, help="write per-trajectory rows here (JSONL)")
+    ap.add_argument("--variants", default="off,tito", help=f"comma-separated, of {', '.join(VARIANTS)}")
     ap.add_argument("--perturb", type=float, default=0.0,
                     help="fraction of calls sampled with whitespace the template does not render (the recordings "
                          "hold parsed replies, so rebuilt samples are otherwise canonical and never break TITO-off)")
     ap.add_argument("dirs", nargs="+", help="rollouts/train/<k> directories (holding events/*.jsonl)")
     args = ap.parse_args(argv)
+    variants = [v.strip() for v in args.variants.split(",") if v.strip()]
+    unknown = [v for v in variants if v not in VARIANTS]
+    if unknown:
+        ap.error(f"unknown variants {unknown}")
     trajectories = []
     for d in args.dirs:
         for path in sorted(glob.glob(os.path.join(d, "events", "*.jsonl"))):
@@ -421,16 +508,17 @@ def main(argv: list[str] | None = None) -> int:
     # longest first, so the pool does not end on one long trajectory
     order = sorted(range(len(trajectories)), key=lambda k: -len(trajectories[k]["steps"]))
     rows: list[dict[str, Any]] = []
+    init = (args.tokenizer, args.perturb, variants)
     if args.workers > 1:
         import multiprocessing as mp
 
-        with mp.get_context("spawn").Pool(args.workers, _worker_init, (args.tokenizer, args.perturb)) as pool:
+        with mp.get_context("spawn").Pool(args.workers, _worker_init, init) as pool:
             for k, row in enumerate(pool.imap_unordered(_replay_row, [trajectories[j] for j in order])):
                 rows.append(row)
                 if (k + 1) % 20 == 0:
                     print(f"... {k + 1}/{len(trajectories)}", file=sys.stderr, flush=True)
     else:
-        _worker_init(args.tokenizer, args.perturb)
+        _worker_init(*init)
         for k, j in enumerate(order):
             rows.append(_replay_row(trajectories[j]))
             if (k + 1) % 20 == 0:
@@ -439,31 +527,38 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.out, "w") as f:
             for row in rows:
                 f.write(json.dumps(row) + "\n")
-    print(summarize(rows, perturb=args.perturb))
+    print(summarize(rows, variants, perturb=args.perturb))
     return 0
 
 
-def summarize(rows: list[dict[str, Any]], *, perturb: float = 0.0) -> str:
+def summarize(rows: list[dict[str, Any]], variants: list[str], *, perturb: float = 0.0) -> str:
     n = max(1, len(rows))
-    out = [f"trajectories {len(rows)}, calls {sum(r['calls'] for r in rows)}, perturb {perturb}"]
-    for key in ("off", "on"):
-        d = sum(r[key]["datums"] for r in rows)
-        t = sum(r[key]["tokens"] for r in rows)
-        out.append(f"TITO {key:3s}: datums {d} ({d / n:.3f}/trajectory), training tokens {t:,} ({t / n:,.0f}/trajectory)")
+    out = [f"trajectories {len(rows)}, recorded calls {sum(r['calls'] for r in rows)}, perturb {perturb}"]
     d = sum(r["usage_estimate"][0] for r in rows)
     t = sum(r["usage_estimate"][1] for r in rows)
     out.append(f"TITO from recorded usage: datums {d} ({d / n:.3f}/trajectory), training tokens {t:,}")
-    off = sum(r["off"]["tokens"] for r in rows)
-    on = sum(r["on"]["tokens"] for r in rows)
-    out.append(f"tokens on/off: {on / max(1, off):.3f}")
-    reasons: Counter = Counter()
-    for r in rows:
-        reasons.update(r["on"]["tito"].get("reasons") or {})
-        for name in ("text_equal", "text_differs"):
-            reasons[name] += int(r["on"]["tito"].get(name) or 0)
-    out.append(f"TITO prompt outcomes: {dict(reasons)}")
-    diffs = [r["on"]["prompt_diff_mean_abs"] for r in rows]
-    out.append(f"rebuilt vs recorded prompt tokens, mean |diff| per call: {sum(diffs) / max(1, len(diffs)):.1f}")
+    for key in variants:
+        d = sum(r[key]["datums"] for r in rows)
+        t = sum(r[key]["tokens"] for r in rows)
+        calls = sum(r[key]["calls"] for r in rows)
+        line = (f"{key:9s}: datums {d} ({d / n:.3f}/trajectory), training tokens {t:,} ({t / n:,.0f}/trajectory), "
+                f"calls {calls}")
+        for reason in ("context_limit", "context_overflow"):
+            ended = [r for r in rows if r[key]["ended"] == reason]
+            if ended:
+                rewards = [float(r["reward"] or 0.0) for r in ended]
+                line += (f"; ended by {reason}: {len(ended)} ({len(ended) / n:.1%}), their recorded final reward "
+                         f"mean {sum(rewards) / len(rewards):.3f}, passed {sum(1 for x in rewards if x > 0)}")
+        out.append(line)
+        reasons: Counter = Counter()
+        for r in rows:
+            reasons.update(r[key]["tito"].get("reasons") or {})
+            for name in ("text_equal", "text_differs"):
+                reasons[name] += int(r[key]["tito"].get(name) or 0)
+        if key != "off":
+            out.append(f"  prompt outcomes: {dict(reasons)}")
+        diffs = [r[key]["prompt_diff_mean_abs"] for r in rows]
+        out.append(f"  rebuilt vs recorded prompt tokens, mean |diff| per call: {sum(diffs) / n:.1f}")
     return "\n".join(out)
 
 
