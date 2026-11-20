@@ -38,7 +38,8 @@ $PY -m harnessforge.train mapping                                       # the ol
 
 `launch` only writes files and calls `qsub`, so it may run on the login node. Configs (`configs/train/`, JSON with
 `extends`): `abci-base.json` (our paths and the old run's hyperparameters), `smoke.json`, `naive.json` (the full
-comparison run), `pass_rate.json` (the Thompson-sampling variant; not to be run yet).
+comparison run), `pass_rate.json` (the Thompson-sampling variant; not to be run yet), `naive_ext_64kcap_v2_dppo.json` (v2 with TMax's DPPO loss; see
+[TMax DPPO](#tmax-dppo-naive_ext_64kcap_v2_dppo-patchesplatoon-dppopatch)).
 
 ## One-time setup on ABCI
 
@@ -229,6 +230,7 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | `--advantage-estimator grpo --disable-grpo-std-normalization` | r − group mean | platoon group advantage (r − mean, no std) | same |
 | Dr.GRPO loss reducer | constant divisor | sum loss × 1/(action tokens per microbatch) | **differs**: per-token mean, a scale difference |
 | `--eps-clip/--eps-clip-high` | 0.2 / 0.28 | `loss_fn: ppo`, `clip_low_threshold: 0.8`, `clip_high_threshold: 1.28` | mapped |
+| TMax 4B loss (allenai/tmax-4b: "Loss fn: DPPO", binary TV, threshold 0.1; open-instruct `--dppo_ratio_cap 10`) | not in the old run (PPO clip) | `naive_ext_64kcap_v2_dppo`: `loss_fn: dppo`, `loss_fn_config {threshold: 0.1, ratio_cap: 10}` with `gateway.custom_losses {dppo: harnessforge.train.losses.dppo:dppo_loss}` (miles-tinker custom-loss hook; TV is the default divergence) | mapped (TMax DPPO), see below |
 | `--use-tis` (fully async) | truncated IS vs rollout logprobs | PPO ratio taken against the sampler's logprobs | **differs**: no separate TIS weight |
 | `--use-kl-loss --kl-loss-coef 0.01 --kl-loss-type low_var_kl` | KL to the frozen base | none | **differs**, see below |
 | `--entropy-coef` | 0 | none | same |
@@ -793,6 +795,76 @@ PYTHONPATH=src ~/.local/bin/python3.12 -m harnessforge.train driver --run-dir <r
 - The template is pinned to the Qwen3.5-4B snapshot `851bf6e8`. Another snapshot needs its own versioned file.
 - `PLATOON_MIN_COMPLETION_TOKENS` is a process variable, not a platoon config key. It applies to every gateway in the
   driver's platoon process, its evaluations included.
+
+## TMax DPPO (`naive_ext_64kcap_v2_dppo`, `patches/platoon-dppo.patch`)
+
+The v2 run with TMax 4B's loss instead of PPO clipping. Everything else is v2's (the config test
+`test_dppo_run_config_is_v2_but_the_loss` checks this). Per token, with mu = the sampler's logprob of the sampled token
+(the `logprobs` platoon already sends for the PPO ratio) and pi = the trainer's:
+
+- ratio = pi / mu; D = |mu − pi| (binary TV; `divergence: 1` or `"kl"` for binary KL);
+- masked if D > `threshold` (0.1) **and** the update pushes further away: A > 0 with ratio > 1, or A < 0 with
+  ratio < 1;
+- loss = −A · mask · min(ratio, `ratio_cap` = 10).detach() · log pi, summed over tokens like the other Tinker losses.
+
+This is open-instruct's `compute_dppo_policy_loss` (hamishivi/tmax `grpo_utils.py`). The math lives here, in
+`harnessforge.train.losses.dppo`, ported from the Miles-path port `src/mho/train/dppo.py`; `tests/test_train_dppo.py`
+checks the mask/cap/gradient cases and parity with that port on random tensors.
+
+**Pieces.**
+
+| piece | where | what |
+|---|---|---|
+| loss | `src/harnessforge/train/losses/dppo.py` (`dppo_loss`; imports only torch) | per datum: per-token −A · mask · min(ratio, cap).detach() · log pi and the metrics below; config keys `threshold`, `ratio_cap` (≤ 0: none), `divergence` (0 = tv, 1 = kl; the SDK sends floats only); unknown keys are refused |
+| hook | miles-tinker `--tinker-custom-loss NAME=module:function` (branch `feat/tinker-custom-loss-hook`, deployed to `~/hf-dev/train/miles-tinker-dppo` = the live run's tree + the hook) | `gateway.custom_losses {"dppo": "harnessforge.train.losses.dppo:dppo_loss"}` adds the flag. The trainer imports the module once per process from `hf_src`, which is bound into the container and on its `PYTHONPATH` (also in the Ray job's runtime env). A bad path fails at server startup. The per-token loss is summed like the built-in losses; DP padding rows are dropped |
+| client | `~/hf-dev/train/platoon-dppo-venv` = `build_platoon_tito_venv.sh ~/hf-dev/train/platoon-tito2-venv ~/hf-dev/train/platoon-dppo-venv platoon-dppo.patch` | tinker 0.16.1's `LossFnType` is a Literal, so `"dppo"` was refused before sending; platoon's zero-advantage datum filter and admission check treat dppo like ppo |
+| metrics | the loss's per-datum `dppo_tokens`, `dppo_masked_tokens`, `dppo_capped_tokens`, `dppo_divergence` (over tokens with A ≠ 0) come back summed as `<name>:sum` in the `forward_backward` metrics; platoon (patched) logs W&B `optim/dppo_masked_frac`, `optim/dppo_capped_frac`, `optim/dppo_divergence_mean`, `optim/dppo_tokens` (mean over microbatches) | `optim/importance_weight_*` (pi/mu) as before; `optim/clip_frac_*` are not logged (no PPO clip) |
+| config | `configs/train/naive_ext_64kcap_v2_dppo.json` | `"$replace": true` on `loss_fn_config` so ppo's clip thresholds from `abci-base.json` are not inherited (`config.merge`) |
+
+**Differences from TMax.** KL 0 and centered advantages without std normalization are the same as v2. What differs:
+
+- *Loss normalization.* platoon divides each microbatch's summed loss by its action tokens (as v2); open-instruct's
+  aggregation may differ. A scale difference, not a direction one.
+- *Anchor policy.* mu is the SGLang sampler at the version that produced the trajectory (staleness ≤ 4, as v2); TMax's
+  mu is its vLLM rollout policy. Same role; our sampler/trainer numerical mismatch enters D the same way.
+- *One optimizer step per batch* (`num_minibatches: 1`), so pi at the forward is the policy before this step's update.
+- No separate TIS weight (the capped ratio is the only importance weight), as in TMax's DPPO.
+
+**Launch** after v2 has finished: its trainer node is gone and the n4hf72 nodes 1-3 are back in the pool
+(`train status` / `unlend` on the v2 run dir). The sandbox host fleet is the same (`fleet_id: sbh-grpo`, same
+`state_root`); if its jobs have ended, `python -m harnessforge.sandboxhost start --spec
+configs/sandboxhost/grpo-train.json` first. Then:
+
+```bash
+cd ~/hf-dev/train/harnessforge-dppo && PYTHONPATH=$PWD/src ~/.local/bin/python3.12 -m harnessforge.train launch \
+    --config configs/train/naive_ext_64kcap_v2_dppo.json
+```
+
+**GPU smoke (2026-11-21, 1 rt_HF node, `/groups/.../mho/runs/dppo-smoke-hook2-20261121-0150`).** This used the
+`miles-tinker-dppo` tree with `--tinker-custom-loss dppo=harnessforge.train.losses.dppo:dppo_loss`: full FT, TP2 × DP2,
+2 SGLang engines of its own attached with disk-delta (not the pool). The client was `platoon-dppo-venv`. The serve
+log shows the hook registering at startup.
+
+Each of 3 steps: 4 prompts × 4 samples (128 tokens), sampled from the current weights, with random group-centered
+rewards. `forward_backward(dppo)` ran on those (real mu) and on a copy whose mu was perturbed by ±1.5 in log space,
+then `optim_step` (lr 1e-5) and a publish.
+
+| step | real: masked / divergence mean / IW mean | perturbed: masked / divergence mean | engine versions | probe Δlogprob vs base |
+|---|---|---|---|---|
+| 1 | 0.000 / 0.0025 / 1.000 | 0.216 / 0.246 | 2, 2 | 0.023 |
+| 2 | 0.000 / 0.0023 / 1.000 | 0.325 / 0.239 | 3, 3 | 0.059 |
+| 3 | 0.000 / 0.0027 / 0.999 | 0.240 / 0.231 | 4, 4 | 0.066 |
+
+Every check passed:
+
+- `optim/dppo_*` and the `dppo_*:sum` server metrics were present, with no NaN.
+- The server's masked count equals the client's recomputation from the returned trainer logprobs (443, 665 and 491
+  perturbed tokens of 2048).
+- The weights advanced, and both engines agree (spread 0).
+- No capping at these ratios.
+- Grad norms are about 6e3 because the smoke's advantages are not divided by token counts. platoon's normalization
+  does that in the run.
+
 
 ## Stall guard and automatic driver restarts (`harnessforge.train.guard`)
 
