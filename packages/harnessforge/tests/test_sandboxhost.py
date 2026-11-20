@@ -505,3 +505,9 @@ def test_fleet_spec_and_host_job(tmp_path):
     assert oct((tmp_path / "state" / "f1" / "token").stat().st_mode & 0o777) == "0o600"
     fleet.start(spec, launcher=launcher, wait=False, log=lambda *_: None)  # running jobs are not resubmitted
     assert len(launcher.submitted) == 2
+
+
+
+def test_sysdeps_is_forwarded_to_hosts():
+    from harnessforge.sandboxhost.daemon import FORWARDED_OPTIONS
+    assert "sysdeps" in FORWARDED_OPTIONS
