@@ -16,6 +16,24 @@ import os
 import sys
 
 
+def _await_chain(coro, f, limit: int = 60) -> None:
+    """The frames of a suspended coroutine and of everything it awaits (cr_await / gi_yieldfrom / ag_await),
+    outermost first (Task.print_stack shows the top frame alone), then the Future/Task the chain ends on."""
+    for _ in range(limit):
+        frame = getattr(coro, "cr_frame", None) or getattr(coro, "gi_frame", None) or getattr(coro, "ag_frame", None)
+        if frame is not None:
+            co = frame.f_code
+            f.write(f'  File "{co.co_filename}", line {frame.f_lineno}, in {co.co_name}\n')
+        nxt = (getattr(coro, "cr_await", None) or getattr(coro, "gi_yieldfrom", None)
+               or getattr(coro, "ag_await", None))
+        if nxt is None:
+            return
+        if not any(hasattr(nxt, a) for a in ("cr_frame", "gi_frame", "ag_frame")):
+            f.write(f"  awaiting {nxt!r}"[:600] + "\n")
+            return
+        coro = nxt
+
+
 def _install() -> None:
     out_dir = os.environ.get("HF_STACKDUMP_DIR")
     if not out_dir or not hasattr(__import__("signal"), "SIGRTMIN"):
@@ -40,8 +58,8 @@ def _install() -> None:
             for t in tasks:
                 if t.done():
                     continue
-                f.write(f"--- {t!r}\n"[:2000] + "\n")
-                t.print_stack(limit=40, file=f)
+                f.write(f"--- {t!r}"[:2000] + "\n")
+                _await_chain(t.get_coro(), f)
             f.flush()
         except Exception as e:                       # never take the process down
             try:

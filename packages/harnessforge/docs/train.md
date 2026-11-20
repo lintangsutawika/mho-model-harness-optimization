@@ -807,10 +807,10 @@ The driver now watches progress itself (`| Step N/M |` lines in `logs/platoon.lo
 
 | key | default | |
 |---|---|---|
-| `driver.stall_timeout` | 2700 | seconds without a new step before acting (0: off) |
+| `driver.stall_timeout` | 1200 | seconds without a new step before acting (0: off) |
 | `driver.stall_startup_grace` | 3600 | extra seconds before a platoon process's first step |
 | `driver.stall_stop_wait` | 600 | graceful stop wait, then the second signal, then SIGKILL |
-| `driver.max_auto_restarts` | 3 | restarts over the run's life (`auto_restarts.json`) |
+| `driver.max_auto_restarts` | 8 | restarts over the run's life (`auto_restarts.json`) |
 
 On a stall: every Python process of `platoon train` dumps its thread stacks (faulthandler,
 `SIGRTMIN+2`) and its asyncio task stacks (`SIGRTMIN+3`; a hung await only shows there) into
@@ -832,6 +832,29 @@ Known, not fixed here: the remote-sandbox relay (`sandboxhost.provider.UpstreamR
 leaves connection handlers pending in `net.splice` after a peer goes away; asyncio garbage-collects
 them ("Task was destroyed but it is pending", ~1800 in 4 h of the trial run). Harmless to rollouts so
 far; fixing it needs a look at how a vanished peer ends a pump (not a one-liner).
+
+### Root cause of the hangs: a train loop cancelled from within (`patches/platoon-trainloop-cancel.patch`)
+
+The v2 run hung the same way after step 4 (2026-11-21 01:01). Its stall dump (`logs/stall.1.*.txt`) showed no
+`train_loop` task at all, `arun_tinker_training` parked in `TaskGroup.__aexit__` (a bare Future), and the
+dispatcher still alive. A `TaskGroup` ignores a child that ends *cancelled*: it neither aborts nor logs. So when an
+awaited future on the step-end path is cancelled by someone else (the step task itself was not), the
+`CancelledError` passes platoon's `except Exception` handlers, the train loop ends "cancelled", and the run waits
+forever on the dispatcher and the rollout groups. The patch wraps the train and eval loops: such a cancellation
+is logged with its traceback ("The train loop was cancelled from within") and raised as `RuntimeError`, so the task
+group aborts and platoon exits at once. The driver then auto-restarts it (any non-zero exit nobody asked for counts,
+with the end of `platoon.log` saved as `logs/stall.<n>.*.txt`). Which await is cancelled is still open: the first
+patched incident's traceback names it.
+
+Apply to a training venv (after its other patches):
+`cd <venv>/lib/python3.12/site-packages && patch -p1 < .../patches/platoon-trainloop-cancel.patch`
+(`build_platoon_tito_venv.sh <dest> platoon-tito.patch platoon-tito2.patch platoon-trainloop-cancel.patch`).
+
+Guard settings since: `driver.stall_timeout` 1200 s (healthy steps 4-6 min, slowest 645 s), first-step grace
+3600 s, `driver.max_auto_restarts` 8. Stack dumps now walk each task's whole await chain.
+
+The v2 run (`...64kcap-v2-ext...`) took this as a mid-run infrastructure change (driver-only restart with the
+patched venv); it changes no training semantics.
 
 ## Known limits and risks
 

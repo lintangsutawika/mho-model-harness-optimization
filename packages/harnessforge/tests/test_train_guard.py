@@ -44,7 +44,7 @@ def _run(tmp_path, **driver) -> TrainRun:
 
 def test_v2_config_has_guard_and_recovery_every_5():
     run = TrainRun.load(CONFIGS / "naive_ext_64kcap_v2.json")
-    assert run.driver["stall_timeout"] == 2700 and run.driver["max_auto_restarts"] == 3
+    assert run.driver["stall_timeout"] == 1200 and run.driver["max_auto_restarts"] == 8
     assert run.get("checkpoint")["recovery_every"] == 5
 
 
@@ -200,8 +200,10 @@ def test_real_stack_dump_of_a_hung_await(tmp_path):
     """A process with the sitecustomize, stuck in an await: both dumps land in its stacks file."""
     script = r"""
 import asyncio
-async def wedged_optim_step():
+async def inner_result_wait():
     await asyncio.Event().wait()
+async def wedged_optim_step():
+    await inner_result_wait()
 async def main():
     t = asyncio.create_task(wedged_optim_step())
     print("ready", flush=True)
@@ -221,6 +223,94 @@ asyncio.run(main())
         out = G.collect_stacks(logs, tmp_path / "stall.txt", pids, time.time() - 30).read_text()
         assert "most recent call first" in out          # faulthandler's thread stacks
         assert "wedged_optim_step" in out                 # the asyncio task stack
+        assert "inner_result_wait" in out                 # ... down the await chain
         assert p.poll() is None                           # the dump does not kill it
     finally:
         p.kill()
+
+
+CRASH_PLATOON = r"""
+import sys
+print("x | INFO | platoon.train.step.step | Step 4/200 | Epoch 0", flush=True)
+print("Traceback (most recent call last):", flush=True)
+print("RuntimeError: the train loop was cancelled from within", flush=True)
+sys.exit(1)
+"""
+
+
+def test_crash_exit_is_an_incident_with_the_log_tail(tmp_path):
+    run = _run(tmp_path, where="gateway")
+    (run.paths.logs / "platoon.log").write_text("an earlier process's lines\n")
+    guard = G.StallGuard(run.paths.logs / "platoon.log", timeout=1200)
+    proc = _fake(run, CRASH_PLATOON)
+    incident = D.supervise(run, proc, guard, lambda: None, {"flag": False, "user": False}, poll=0.1)
+    assert incident["reason"] == "exit rc=1" and incident["step"] == 4
+    tail = Path(incident["stacks"]).read_text()
+    assert "cancelled from within" in tail and "earlier process" not in tail
+    assert D.auto_restart(run, incident, 1, {})
+    assert G.restarts(run.dir)[0]["reason"] == "exit rc=1"
+
+
+def test_clean_exit_is_no_incident(tmp_path):
+    run = _run(tmp_path, where="gateway")
+    (run.paths.logs / "platoon.log").write_text("")
+    guard = G.StallGuard(run.paths.logs / "platoon.log", timeout=1200)
+    proc = _fake(run, "print('x | Step 200/200 |', flush=True)")
+    assert D.supervise(run, proc, guard, lambda: None, {"flag": False, "user": False}, poll=0.1) is None
+
+
+PATCH = Path(G.__file__).parent / "patches" / "platoon-trainloop-cancel.patch"
+
+
+def _patched_helper():
+    """The helper the platoon patch adds to platoon/train/trainer/rl.py, run as written."""
+    import asyncio
+    import logging
+    text = PATCH.read_text()
+    body = text[text.index("+async def _fail_if_cancelled_from_within"):]
+    src = "\n".join(line[1:] for line in body.splitlines() if line.startswith("+"))
+    ns = {"asyncio": asyncio, "logger": logging.getLogger("platoon.train.trainer.rl")}
+    exec(src, ns)
+    return ns["_fail_if_cancelled_from_within"]
+
+
+def test_platoon_patch_turns_a_silent_hang_into_an_error(caplog):
+    """The 64kcap hang: a train loop that awaits a future someone else cancels ends 'cancelled', and a task group
+    ignores that, waiting forever on the dispatcher. With the patch the group aborts with an error and a traceback."""
+    import asyncio
+    wrap = _patched_helper()
+
+    async def run(wrapped: bool):
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+
+        async def train_loop():
+            loop.call_later(0.05, fut.cancel)
+            await fut
+
+        async def dispatcher():
+            await asyncio.sleep(3600)
+        async with asyncio.timeout(2):
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(wrap(train_loop(), "train loop") if wrapped else train_loop(), name="train_loop")
+                tg.create_task(dispatcher(), name="dispatcher")
+
+    with pytest.raises(TimeoutError):                      # unpatched: hangs
+        asyncio.run(run(False))
+    with pytest.raises(ExceptionGroup) as e:               # patched: fails at once, naming the cause
+        asyncio.run(run(True))
+    assert any("cancelled from within" in str(x) for x in e.value.exceptions)
+    assert "The train loop was cancelled from within" in caplog.text
+
+
+def test_platoon_patch_keeps_a_real_cancellation():
+    import asyncio
+    wrap = _patched_helper()
+
+    async def main():
+        t = asyncio.create_task(wrap(asyncio.sleep(3600), "train loop"))
+        await asyncio.sleep(0.01)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+    asyncio.run(main())

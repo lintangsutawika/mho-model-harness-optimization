@@ -7,16 +7,17 @@ invisible for as long as straggler rollouts run (up to the agent timeout, 3600 s
 the watchdog then exited rc=2 with no stack. The guard watches progress itself: platoon's
 "| Step N/M |" log lines.
 
-    driver.stall_timeout        seconds without a new step before the guard acts (default 2700; 0 = off)
+    driver.stall_timeout        seconds without a new step before the guard acts (default 1200; 0 = off)
     driver.stall_startup_grace  extra seconds allowed before the first step of a platoon process (default 3600)
-    driver.max_auto_restarts    restarts the guard may ask for over the run's life (default 3)
+    driver.max_auto_restarts    restarts the guard may ask for over the run's life (default 8)
 
 On a stall: dump every platoon Python process's thread stacks and asyncio task stacks
 (stackdump_site), copy them to logs/stall.<n>.<time>.txt, stop platoon (SIGTERM; after
 driver.stall_stop_wait seconds the second signal; then SIGKILL), and, within the budget, write
 KEEP_GATEWAY so the gateway starts a fresh driver (release_previous_models + platoon resume). A
 watchdog exit (rc=2) is handled the same way; its stacks are taken when platoon first warns
-"WATCHDOG: No heartbeat". Each auto-restart is recorded in auto_restarts.json, driver.events.log and
+"WATCHDOG: No heartbeat". Any other non-zero exit nobody asked for (a crash) is too, with the end of
+platoon's log (its traceback) as the record. Each auto-restart is recorded in auto_restarts.json, driver.events.log and
 the run's W&B run (a tag auto-restart-<n> and a line in its notes).
 """
 from __future__ import annotations
@@ -50,6 +51,7 @@ class StallGuard:
                  clock: Callable[[], float] = time.time) -> None:
         self.log, self.timeout, self.grace, self.clock = Path(log), float(timeout), float(startup_grace), clock
         self.offset = self.log.stat().st_size if self.log.exists() else 0   # this process's lines only
+        self.start_offset = self.offset
         self.started = self.last_progress = clock()
         self.last_step: int | None = None
         self.watchdog_warned = False
@@ -82,6 +84,18 @@ class StallGuard:
 
     def silent_for(self) -> float:
         return self.clock() - self.last_progress
+
+
+def log_tail(log: Path, start: int = 0, max_lines: int = 400, max_bytes: int = 4 << 20) -> str:
+    """The last lines this platoon process wrote to its log (from byte ``start``): a crash's traceback."""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(start, f.tell() - max_bytes))
+            data = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return f"could not read {log}: {e}\n"
+    return "\n".join(data.splitlines()[-max_lines:]) + "\n"
 
 
 def platoon_pids(pgid: int, proc_root: str = "/proc") -> list[int]:
