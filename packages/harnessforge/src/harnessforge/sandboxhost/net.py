@@ -3,13 +3,54 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import socket
 import subprocess
+from typing import Any, Awaitable, Callable
 
 #: TCP keepalive: a peer whose node vanished is noticed in about IDLE + INTERVAL * COUNT seconds.
 KEEPALIVE_IDLE_S = 15
 KEEPALIVE_INTERVAL_S = 5
 KEEPALIVE_COUNT = 4
+#: once one direction of a splice ended, how long the other may go on before the splice cuts it
+SPLICE_GRACE_S = 120.0
+
+#: every connection handler task still running (keep_task): asyncio keeps only weak references to tasks, and a
+#: handler's other references (its protocol and transport) go when the connection does. A pending handler that
+#: the garbage collector finds is closed in place: its cleanup then runs inside whatever task triggered the
+#: collection, and a timeout it enters there (close_writer's) cancels that unrelated task 5 s later. That was
+#: the "cancelled from within" rollouts and the 64kcap train-loop hangs.
+_HANDLERS: set[asyncio.Task] = set()
+
+
+def keep_task(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    """Wrap a connection handler (``asyncio.start_server`` callback) so that its task is strongly referenced until
+    it ends (``_HANDLERS``), and so never garbage-collected while pending."""
+
+    @functools.wraps(handler)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        task = asyncio.current_task()
+        if task is not None:
+            _HANDLERS.add(task)
+        try:
+            return await handler(*args, **kwargs)
+        finally:
+            if task is not None:
+                _HANDLERS.discard(task)
+    return wrapper
+
+
+def live_handlers() -> int:
+    return len(_HANDLERS)
+
+
+def close_now(*writers: asyncio.StreamWriter | None) -> None:
+    """Close ``writers`` without awaiting anything: for a teardown (GeneratorExit) or a place with no task."""
+    for writer in writers:
+        if writer is None:
+            continue
+        with contextlib.suppress(Exception):
+            writer.close()
 
 
 def advertise_ip(mode: str | None = None) -> str:
@@ -61,6 +102,12 @@ async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0
     with contextlib.suppress(Exception):
         writer.close()
     try:
+        task = asyncio.current_task()
+    except RuntimeError:                           # no running loop
+        task = None
+    if task is None:                               # no task of its own to wait in: a timeout would land elsewhere
+        return
+    try:
         await asyncio.wait_for(asyncio.shield(writer.wait_closed()), timeout)
     except asyncio.CancelledError:
         raise                                      # this task's own cancellation goes on
@@ -72,9 +119,13 @@ async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0
 
 
 async def splice(r1: asyncio.StreamReader, w1: asyncio.StreamWriter,
-                 r2: asyncio.StreamReader, w2: asyncio.StreamWriter) -> None:
+                 r2: asyncio.StreamReader, w2: asyncio.StreamWriter, *, grace: float | None = None) -> None:
     """Copy bytes both ways until both directions ended (a half-close is passed on), then close both. A broken
-    direction closes both, so the other one ends too."""
+    direction closes both, so the other one ends too; once one direction ended, the other gets ``grace`` seconds
+    (SPLICE_GRACE_S) before it is cut, so a splice always ends (a peer that vanished without a FIN would otherwise
+    hold it, and its handler, forever)."""
+    grace = SPLICE_GRACE_S if grace is None else grace
+
     async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while chunk := await reader.read(65536):
@@ -83,12 +134,26 @@ async def splice(r1: asyncio.StreamReader, w1: asyncio.StreamWriter,
             if writer.can_write_eof():
                 writer.write_eof()
         except (ConnectionError, OSError, RuntimeError):
-            for w in (w1, w2):
-                with contextlib.suppress(Exception):
-                    w.close()
+            close_now(w1, w2)
 
+    pumps = {asyncio.ensure_future(pump(r1, w2)), asyncio.ensure_future(pump(r2, w1))}
     try:
-        await asyncio.gather(pump(r1, w2), pump(r2, w1))
-    finally:
-        await close_writer(w1)
-        await close_writer(w2)
+        _, pending = await asyncio.wait(pumps, return_when=asyncio.FIRST_COMPLETED)
+        if pending:
+            _, pending = await asyncio.wait(pending, timeout=grace)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pumps, return_exceptions=True)
+    except GeneratorExit:                          # closed in place: nothing may be awaited
+        for task in pumps:
+            task.cancel()
+        close_now(w1, w2)
+        raise
+    except BaseException:
+        for task in pumps:
+            task.cancel()
+        close_now(w1, w2)
+        await asyncio.gather(*pumps, return_exceptions=True)
+        raise
+    await close_writer(w1)
+    await close_writer(w2)
