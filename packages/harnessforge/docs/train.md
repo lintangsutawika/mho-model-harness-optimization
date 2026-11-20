@@ -238,6 +238,9 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | `--rollout-temperature` | 1.0 | `inference_params.temperature: 1.0` (miles-tinker requires 1.0) | same |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16384 per call | `max_completion_tokens: 16384`, `sampling_precedence: config` | same |
 | context: `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | rollouts **uncapped**: SGLang served 262144, the agent kept going past 64k, and only training truncated each sample to 65536 | `naive_ext_64kcap`: `train.context_window_length: 65536` **at rollout**. platoon's gateway refuses an over-window prompt and the trajectory scores 0 (`on_context_overflow: grade`); training datums ≤ 65536 | **differs** (user decision). In the old run, over-64k trajectories were ~45-60 % of rollout time but only 5-10 % of successes (context study, `~/hf-dev/ctxstudy/out/`) |
+| agent steps / tool calls | uncapped (micro-swe-agent `step_limit: 0`; harbor's agent timeout only) | **from step 6 of `naive_ext_64kcap`:** `harness.agent_config` = `agent.step_limit: 64`. micro-swe-agent counts model calls, ≈ tool calls (several calls in one response: 0.11 per trajectory). At the limit the agent ends with `LimitsExceeded`, a normal harness exit, and the verifier grades the sandbox | **differs** (user decision, mid-run): matches TMax 4B's "64 maximum tool calls" (allenai/tmax-4b, arXiv 2606.23321 §4.1) |
+| prompt rendering | miles TITO session server: the next prompt is the exact previous token stream plus new tokens | **from step 6:** platoon with TITO stitching (`platoon-tito-venv`, PR #65); steps 1-5 re-rendered the history (3-4 datums per trajectory) | mid-run change; replay of steps 1-2: 1.2-1.4 datums per trajectory, about 2.4× fewer training tokens |
+| sandbox placement | executors on the 4 GPU nodes, 256 concurrent | **from step 6:** remote sandbox hosts (#63): 6 rt_HC × 96 + 112 local slots on the trainer head node, `max_concurrent_rollouts` 640 | mid-run change (steps 1-5: local only, 160) |
 | agent timeout | 1800 s override × 2.0 = 3600 s | `agent_timeout_multiplier: 6` (each task's 600 s × 6) | same |
 | `AGENT_TRIAL_TIMEOUT` | 7200 s, scores 0 | `rollout_config.timeout: 7200` | mapped |
 | harness | micro-swe-agent base scaffold via harbor's MiniSweAgent | the same dir, through the evals backend's spec (runner and toolchain) | same code |
@@ -246,6 +249,13 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | rollout engines | 24 GPUs, miles SGLang | `gateway.rollout_nodes: 3` (miles-managed) | same |
 | trainer | 1 node, TP2, 65536 tokens/GPU, log-prob chunk 1024, CPU-offloaded precision-aware Adam | same TP, tokens and chunk; Adam on GPU (full mode forbids the precision-aware optimizer) | mapped |
 | `--save-interval 10 --save-hf` | HF every 10 steps | `export.every: 10` (from the disk-delta stream) | same |
+
+**Mid-run changes in `platoon-grpo200-tmax-naive-uniform-noKL-64kcap-ext--Qwen3.5-4B`.** One driver-only restart after
+step 5 switched on TITO stitching, the 64 tool-call cap and remote sandboxes (W&B tags `tito`, `toolcap64`,
+`remote-sbx640`; `labels.toolcap` and `LABEL.txt` in the run dir). platoon keeps groups that had settled before a
+restart, so step 6 may still train a few pre-switch rollouts; from step 7 every rollout was sampled under the new
+settings. A second driver-only restart (`platoon-tito2-venv`: Qwen3.5 template and end-at-limit changes) is
+planned.
 
 ### What is not matched, and what it would take
 
