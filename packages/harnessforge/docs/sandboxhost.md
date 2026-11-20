@@ -123,4 +123,7 @@ as it does locally.
   starting ones went to other hosts. No hang; later starts avoided the dead host. `start --hosts 4` replaced it.
 
 **platoon eval, real model** (pool node 0, Qwen3.5-4B policy, 24 TB2.1 tasks x 1 at 24): trials ran normally through
-remote sandboxes. At 25 min, 3/12 finished were solved, with trajectories up to 235k output tokens.
+remote sandboxes, with trajectories up to 235k output tokens; 21 of 24 finished before the eval's 50 min cap and
+3 were solved. Mid-run, one host was `qdel`ed (graceful): it stopped its pods and wrote `status: stopped`, and its 2
+running trials ended the same second. They came back as `SandboxError` (counted reward 0 by the reader); the host now
+reports any op whose sandbox it stopped (shutdown, reap, lease) as `SandboxLostError`, so they are infra failures.

@@ -28,6 +28,7 @@ class FakeSandbox:
         self.killed = 0
         self.kept: frozenset = frozenset()
         self.stopped = False
+        self.procs: set = set()
         self.routes = {name: f"http://127.0.0.1:{18080 + i}" for i, name in enumerate(sorted(spec.upstreams))}
 
     def path(self, p: str) -> Path:
@@ -40,6 +41,7 @@ class FakeSandbox:
         proc = await asyncio.create_subprocess_exec(
             *argv, cwd=str(self.root), env={**os.environ, "SBX": str(self.root), **(env or {})},
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        self.procs.add(proc)
         try:
             out, err = await asyncio.wait_for(proc.communicate(stdin), timeout_s)
         except asyncio.TimeoutError:
@@ -49,6 +51,10 @@ class FakeSandbox:
         except asyncio.CancelledError:
             proc.kill()
             raise
+        finally:
+            self.procs.discard(proc)
+        if self.stopped:  # stopped under the command, as hpc-sandbox's stop kills it
+            raise RuntimeError(f"sandbox {self.id} stopped during the command")
         return ExecResult(exit_code=proc.returncode, stdout=out.decode(), stderr=err.decode())
 
     async def upload(self, src, dst) -> None:
@@ -82,6 +88,9 @@ class FakeSandbox:
     async def stop(self) -> None:
         if not self.stopped:
             self.stopped = True
+            for proc in list(self.procs):
+                if proc.returncode is None:
+                    proc.kill()
             STOPPED.append(self.id)
             shutil.rmtree(self.root, ignore_errors=True)
 

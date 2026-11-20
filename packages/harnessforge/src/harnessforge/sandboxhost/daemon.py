@@ -259,6 +259,10 @@ class SandboxHost:
             except BaseException as exc:  # noqa: BLE001 - reported to the client
                 if not isinstance(exc, (wire.HostFull, FileNotFoundError)):
                     logger.info("op %s on %s failed: %r", op, sid, exc)
+                if entry is not None and (self._stopping.is_set() or entry.stopping is not None):
+                    # the host stopped the sandbox under the op (shutdown, reap, lease): the client lost it
+                    exc = wire.lost_error(f"sandbox {sid} was stopped by sandbox host {self.name} during {op}: "
+                                          f"{type(exc).__name__}: {exc}")
                 await wire.write_frame(writer, wire.error_header(exc))
                 return
             reply, out_payload = result if isinstance(result, tuple) else (result, None)

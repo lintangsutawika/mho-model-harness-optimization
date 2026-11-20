@@ -430,6 +430,23 @@ def test_reap_stops_labelled_remote_sandboxes(tmp_path):
     run(go())
 
 
+def test_shutdown_under_a_running_exec_reports_a_lost_sandbox(tmp_path):
+    from hpc_sandbox import SandboxLostError
+    fd = make_fleet(tmp_path)
+
+    async def go():
+        host = await start_host(fd, tmp_path, 0)
+        p = provider(fd, tmp_path)
+        sb = await p.start(spec())
+        running = asyncio.ensure_future(sb.exec("sleep 30"))
+        await asyncio.sleep(0.5)
+        await host.shutdown()
+        with pytest.raises(SandboxLostError):
+            await asyncio.wait_for(running, 20)
+        await sb.stop()
+    run(go())
+
+
 def test_shutdown_stops_everything(tmp_path):
     fd = make_fleet(tmp_path)
 
