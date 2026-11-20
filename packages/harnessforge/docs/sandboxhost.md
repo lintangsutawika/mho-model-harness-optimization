@@ -116,7 +116,7 @@ as it does locally.
 - 8 TB2.1 tasks x 2: 16/16 scored, 0 env failures. The agent's model calls went through the relay. The verifier
   ran. collect / harbor export wrote test-stdout and the agent trajectory.
 - 89 TB2.1 tasks x 4 = 356 at once on 4 hosts (fake model 20 s per call): all 356 finished in 540 s. Start, from
-  request to up and including placement and the cap: p50 46 s, p90 72 s. Per host: 90 / 87 / 91 / 88.
+  request to up and including placement and the cap: p50 46 s, p90 72 s. Collected per host: 90 / 87 / 91 / 5 (lost sandboxes collect nothing).
   8 env failures were the known `qemu-*` apt 404s.
 - Host 3 was hard-killed (`qsig -s KILL`) with 85 active and 2 starting. Its 83 running trials ended 0.3-0.7 s
   later as `error:unexpected:SandboxLostError`: infra in platoon, so untrainable, and env_failed in the reader. The 2
