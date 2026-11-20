@@ -48,12 +48,27 @@ def set_keepalive(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_COUNT)
 
 
-async def close_writer(writer: asyncio.StreamWriter | None) -> None:
+async def close_writer(writer: asyncio.StreamWriter | None, timeout: float = 5.0) -> None:
+    """Close ``writer`` and wait (at most ``timeout`` s) until its transport is gone; past that, abort it.
+
+    The wait is shielded: ``writer.wait_closed()`` awaits the protocol's close future, which every later
+    ``wait_closed()`` of the same writer shares. Timing it out unshielded cancels that future, and the next await
+    on it (a second close of the same writer, as the relay's splice and its handler both do) raises a raw
+    ``CancelledError`` in a task nobody cancelled. A writer that will not close in time (a peer that stopped
+    reading: the transport waits to flush first) is aborted instead of left half-closed."""
     if writer is None:
         return
     with contextlib.suppress(Exception):
         writer.close()
-        await asyncio.wait_for(writer.wait_closed(), 5)
+    try:
+        await asyncio.wait_for(asyncio.shield(writer.wait_closed()), timeout)
+    except asyncio.CancelledError:
+        raise                                      # this task's own cancellation goes on
+    except Exception:  # noqa: BLE001 - a timeout or a broken connection: drop it hard
+        transport = getattr(writer, "transport", None)
+        if transport is not None:
+            with contextlib.suppress(Exception):
+                transport.abort()
 
 
 async def splice(r1: asyncio.StreamReader, w1: asyncio.StreamWriter,
