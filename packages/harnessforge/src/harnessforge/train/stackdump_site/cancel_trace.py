@@ -5,6 +5,8 @@ the task they hit. This records the canceller: every event loop gets
 
 * a task factory whose tasks are a ``Task`` subclass: its ``cancel()`` logs the caller's stack when the task is a
   target (the ``train_loop`` task, or a rollout / group-member task) and the caller is not that task itself;
+* (asyncio.Timeout records where it was created: a cancel by a timeout names that ``asyncio.timeout`` /
+  ``wait_for`` call, the timeout's state and the task that entered it;)
 * a ``create_future`` whose futures are a ``Future`` subclass: its ``cancel()`` logs the caller's stack when a
   target task is waiting on it (its wake-up callback) and the caller is not that task. A task's own ``cancel()``
   cancelling the future it waits on is the task's event, logged there, and skipped here.
@@ -72,9 +74,37 @@ def _write(kind: str, target, msg) -> None:
         cur = asyncio.current_task()
     except RuntimeError:
         cur = None
-    stack = "".join(traceback.format_stack(sys._getframe(2), limit=25))
+    caller = sys._getframe(2)
+    stack = "".join(traceback.format_stack(caller, limit=25))
     f.write(f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} {kind} cancel of {_describe(target)} "
-            f"(msg={msg!r}) by {_describe(cur)} [thread {threading.current_thread().name}]\n{stack}")
+            f"(msg={msg!r}) by {_describe(cur)} [thread {threading.current_thread().name}]\n{stack}"
+            f"{_timeout_note(caller)}")
+
+
+def _timeout_note(frame) -> str:
+    """When an asyncio.Timeout fired the cancel: where it was created, its state, and the task that entered it."""
+    while frame is not None and frame.f_code.co_name != "_on_timeout":
+        frame = frame.f_back
+    if frame is None:
+        return ""
+    t = frame.f_locals.get("self")
+    if t is None:
+        return ""
+    site = getattr(t, "_hf_site", "?")
+    state = getattr(getattr(t, "_state", None), "name", getattr(t, "_state", "?"))
+    return (f"  -> the asyncio.Timeout was created at:\n{site}"
+            f"  -> its state: {state}; its task: {_describe(getattr(t, '_task', None))}\n")
+
+
+def _site(skip: int = 2, n: int = 4) -> str:
+    """The first ``n`` frames above ``skip`` outside asyncio itself: where a timeout / wait_for was written."""
+    frame, out = sys._getframe(skip), []
+    while frame is not None and len(out) < n:
+        fn = frame.f_code.co_filename
+        if "/asyncio/" not in fn:
+            out.append(f'    File "{fn}", line {frame.f_lineno}, in {frame.f_code.co_name}\n')
+        frame = frame.f_back
+    return "".join(out)
 
 
 class TracedTask(asyncio.Task):
@@ -140,4 +170,15 @@ def install() -> bool:
     __init__._hf_traced = True
     be.BaseEventLoop.__init__ = __init__
     be.BaseEventLoop.create_future = lambda self: TracedFuture(loop=self)
+
+    import asyncio.timeouts as tm                  # where each timeout / wait_for was written (see _timeout_note)
+    t_init = tm.Timeout.__init__
+
+    def t__init__(self, when):
+        t_init(self, when)
+        try:
+            self._hf_site = _site()
+        except Exception:
+            self._hf_site = "?"
+    tm.Timeout.__init__ = t__init__
     return True
