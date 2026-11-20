@@ -72,3 +72,15 @@ def test_scan_secrets(tmp_path, capsys):
     assert cli.main(["scan-secrets", "--run-dir", str(run.dir)]) == 1
     out = capsys.readouterr().out
     assert "leak.log" in out and KEY not in out
+
+
+
+def test_node_sample_reads_proc():
+    import os
+    if not os.path.exists("/proc/stat"):
+        import pytest
+        pytest.skip("no /proc")
+    row, prev = D.node_sample(None)
+    assert row["cpu_busy_pct"] is None and row["mem_total_gb"] > 0
+    row, _ = D.node_sample(prev)
+    assert row["cores"] and row["load1"] >= 0

@@ -110,6 +110,9 @@ def environment_entry(run: TrainRun, tasks: Sequence[str], spec: Path) -> dict[s
         },
         "harness": str(spec),
         "on_harness_exit": env.get("on_harness_exit", {"timeout": "grade", "crash": "grade"}),
+        # a prompt over train.context_window_length is refused by platoon's gateway; "grade" scores
+        # the trajectory as a policy failure (reward 0, reason context_overflow)
+        "on_context_overflow": env.get("on_context_overflow", "grade"),
     }
 
 

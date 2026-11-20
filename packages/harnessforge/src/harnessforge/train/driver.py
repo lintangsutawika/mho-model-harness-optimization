@@ -159,6 +159,81 @@ def prepare(run: TrainRun, url: str) -> Path:
     return run.paths.platoon_config
 
 
+def _cpu_times() -> tuple[int, int]:
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:]]
+    idle = v[3] + (v[4] if len(v) > 4 else 0)
+    return sum(v), idle
+
+
+def node_sample(prev: tuple[int, int] | None) -> tuple[dict, tuple[int, int]]:
+    """One row of this node's load: CPU busy % since `prev`, load average, memory (stdlib, /proc)."""
+    cur = _cpu_times()
+    busy = None
+    if prev is not None and cur[0] > prev[0]:
+        busy = round(100.0 * (1 - (cur[1] - prev[1]) / (cur[0] - prev[0])), 1)
+    with open("/proc/loadavg") as f:
+        load1 = float(f.read().split()[0])
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            mem[k] = int(v.split()[0])
+    total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+    return {"time": round(time.time()), "cpu_busy_pct": busy, "load1": load1, "cores": os.cpu_count(),
+            "mem_used_gb": round((total - avail) / 2**20, 1), "mem_total_gb": round(total / 2**20, 1)}, cur
+
+
+def node_monitor(path: Path, stop: "threading.Event", interval: float = 30.0) -> None:
+    prev = None
+    with open(path, "a") as f:
+        while not stop.wait(interval if prev is not None else 1.0):
+            try:
+                row, prev = node_sample(prev)
+            except OSError:
+                continue
+            if row["cpu_busy_pct"] is not None:
+                f.write(json.dumps(row) + "\n")
+                f.flush()
+
+
+def previous_model_ids(run: TrainRun) -> list[str]:
+    """Tinker model ids a previous platoon process of this run trained (from its checkpoints)."""
+    import re
+    ids: list[str] = []
+    for f in run.paths.platoon_dir.glob("*/*/checkpoints.jsonl"):
+        for m in re.finditer(r"tinker://([A-Za-z0-9_.-]+)/", f.read_text()):
+            if m.group(1) not in ids:
+                ids.append(m.group(1))
+    return ids
+
+
+def release_previous_models(run: TrainRun, url: str, *, post=None, wait_s: float = 20.0) -> list[str]:
+    """The full-fine-tuning gateway serves one model at a time and holds a client's lease for an hour:
+    a restarted driver's platoon (resume = a new training client) is refused until the previous model is
+    unloaded. Unload every model this run trained; ids the gateway does not know (a fresh gateway) are
+    ignored. Returns the ids it unloaded."""
+    import urllib.error
+    import urllib.request
+
+    def _post(u: str, body: dict) -> int:
+        req = urllib.request.Request(u, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "X-API-Key": TINKER_API_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except OSError:
+            return 0
+    post = post or _post
+    done = [m for m in previous_model_ids(run)
+            if post(url.rstrip("/") + "/api/v1/unload_model", {"model_id": m}) == 200]
+    if done:
+        time.sleep(wait_s)                  # the unload completes behind a future
+    return done
+
+
 def resume_batch(run: TrainRun) -> int:
     """The batch platoon resumes from: its newest checkpoint in log_path (0 for a fresh run)."""
     last = 0
@@ -212,6 +287,9 @@ def run_driver_job(run_dir: str | Path) -> int:
                 "WANDB_API_KEY" not in secrets:
             _log(run, "WARNING: no WANDB_API_KEY; logging to W&B offline instead (wandb sync later)")
             run.raw.setdefault("stats", {}).setdefault("wandb", {})["mode"] = "offline"
+        freed = release_previous_models(run, url)
+        if freed:
+            _log(run, f"unloaded the previous platoon process's model(s) {freed} from the gateway")
         cfg = prepare(run, url)
         env = platoon_env(run, url, secrets)
         record_stream_base(run)
@@ -224,6 +302,10 @@ def run_driver_job(run_dir: str | Path) -> int:
                 exporter = subprocess.Popen(exporter_argv(run, follow=True), stdout=out,
                                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                             start_new_session=True)
+        import threading
+        mon_stop = threading.Event()
+        threading.Thread(target=node_monitor, daemon=True,
+                         args=(P.logs / f"node.{os.uname().nodename}.jsonl", mon_stop)).start()
         platoon = str(run.driver.get("platoon", "platoon"))
         _write_json(P.driver_file, {"status": "training", "job_id": job_id, "host": os.uname().nodename,
                                     "gateway": url, "started_at": time.time()})

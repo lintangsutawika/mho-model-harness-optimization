@@ -236,7 +236,7 @@ its log (`logs/train-*.out`, the `ray job submit` line and the env).
 | `--async-max-concurrent-samples` | 256 | `train.max_concurrent_rollouts: 160` | **differs**: limited by the client node's cores (remote sandbox hosts lift it: `sandboxes`, docs/sandboxhost.md) |
 | `--rollout-temperature` | 1.0 | `inference_params.temperature: 1.0` (miles-tinker requires 1.0) | same |
 | `AGENT_MAX_OUTPUT_TOKENS` | 16384 per call | `max_completion_tokens: 16384`, `sampling_precedence: config` | same |
-| `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | 65536 | `train.context_window_length: 65536`; SGLang context 65536 | same |
+| context: `AGENT_MAX_INPUT_TOKENS`, `--max-seq-len` | rollouts **uncapped**: SGLang served 262144, the agent kept going past 64k, and only training truncated each sample to 65536 | `naive_ext_64kcap`: `train.context_window_length: 65536` **at rollout**. platoon's gateway refuses an over-window prompt and the trajectory scores 0 (`on_context_overflow: grade`); training datums ≤ 65536 | **differs** (user decision). In the old run, over-64k trajectories were ~45-60 % of rollout time but only 5-10 % of successes (context study, `~/hf-dev/ctxstudy/out/`) |
 | agent timeout | 1800 s override × 2.0 = 3600 s | `agent_timeout_multiplier: 6` (each task's 600 s × 6) | same |
 | `AGENT_TRIAL_TIMEOUT` | 7200 s, scores 0 | `rollout_config.timeout: 7200` | mapped |
 | harness | micro-swe-agent base scaffold via harbor's MiniSweAgent | the same dir, through the evals backend's spec (runner and toolchain) | same code |
@@ -490,6 +490,47 @@ around 00:55 JST Nov 23. Node budget: 8 rt_HF.
    ```
 4. Check that platoon logged `Resuming from ... batch N`, the W&B run id is unchanged, and `hf/step_<N+...>`
    exports continue. Then stop n4hf72 if nothing else uses it (a user call).
+
+## Sandbox tools without per-trial apt (`provider_options.sysdeps`)
+
+**What the images lack.** harbor's installed-agent setup ran
+`apt-get update && apt-get install -y curl bash build-essential git python3 python3-pip` in every trial, and the
+platoon path kept it for parity (`harbor_system_deps`). Probing 50 random tmax-v11-train-naive images
+(`scripts/hpcsb/prepare_images.py --no-build`; 6684 distinct images, one per task):
+- all are Ubuntu 22.04 (glibc 2.35) with apt, and the agent toolchain imports in all of them;
+- curl is missing in **50/50**, git in 48/50, make in 43/50, gcc in 30/50.
+
+So the step cannot simply be dropped. Deriving 6684 images was ruled out.
+
+**The bundle: `/groups/gai51740/aci18914wh/mho/sysdeps/jammy-harbor-deps-2/bundle.tar`.**
+- *Contents:* 299 MB, 6514 files, root-owned. It holds exactly the files that apt command adds to a tmax image
+  that lacks all four tools, minus dpkg/apt state, caches and logs. Built in a fakeroot sandbox of
+  `sha256-81f38290….sif`.
+- *Records:* `manifest.json`, plus `packages-base.txt`, `packages-after.txt` and `packages-added-or-changed.txt`
+  (121 packages).
+- *How it is used:* the pod provider (`provider_options.sysdeps`) mounts the directory read-only at
+  `/opt/mho/sysdeps`. **Inside the start-gate slot**, right after the pod starts, it runs
+  `tar -xf bundle.tar --skip-old-files -C / && ldconfig`. A failed extraction fails the sandbox start.
+- *Config:* use it with `harbor_system_deps: false` (`naive_ext_64kcap.json`).
+
+**Validation** (rt_HC, fakeroot sandboxes of 49 other sample images):
+- In every image: curl, git, make, gcc and g++ present; a C and a C++ hello world compile, link and run against
+  the image's own libc/libstdc++; `git clone` of a local repo works; an agent's later
+  `apt-get update && apt-get install jq` succeeds; tar exits 0. 49/49 passed.
+- Extraction takes 0.1-0.4 s alone and 0.23-0.63 s each with 16 extracting at once (0.95 s wall). It adds 117-368 MB
+  per sandbox. By comparison the apt step took ~1 min per trial on the trainer node and >10 min on an rt_HC node
+  with 8 at once.
+- Ownership: the first bundle (`-1`, built unprivileged) made tar exit 2 on `/usr/bin/ssh-agent`'s setgid group;
+  `-2` is the same files owned by root.
+
+**Parity with the old run's per-trial apt.** Same command, same package set and versions, among them:
+`binutils` 2.38-4ubuntu2.12, `binutils-common` 2.38-4ubuntu2.12, `binutils-x86-64-linux-gnu` 2.38-4ubuntu2.12, `build-essential` 12.9ubuntu3, `bzip2` 1.0.8-5ubuntu0.1, `cpp` 4:11.2.0-1ubuntu1, `cpp-11` 11.4.0-1ubuntu1~22.04.3, `curl` 7.81.0-1ubuntu1.30, `dirmngr` 2.2.27-3ubuntu2.5, `dpkg-dev` 1.21.1ubuntu2.6, `fakeroot` 1.28-1ubuntu1, `fontconfig-config` 2.13.1-4.2ubuntu5, `fonts-dejavu-core` 2.37-2build1, `g++` 4:11.2.0-1ubuntu1, `g++-11` 11.4.0-1ubuntu1~22.04.3, `gcc` 4:11.2.0-1ubuntu1, `gcc-11` 11.4.0-1ubuntu1~22.04.3, `gcc-11-base` 11.4.0-1ubuntu1~22.04.3, `git` 1:2.34.1-1ubuntu1.18, `git-man` 1:2.34.1-1ubuntu1.18, `gnupg` 2.2.27-3ubuntu2.5, `gnupg-l10n` 2.2.27-3ubuntu2.5, `gnupg-utils` 2.2.27-3ubuntu2.5, `gpg` 2.2.27-3ubuntu2.5, `gpg-agent` 2.2.27-3ubuntu2.5, `gpg-wks-client` 2.2.27-3ubuntu2.5, `gpg-wks-server` 2.2.27-3ubuntu2.5, `gpgconf` 2.2.27-3ubuntu2.5, `gpgsm` 2.2.27-3ubuntu2.5, `less` 590-1ubuntu0.22.04.3, `libalgorithm-diff-perl` 1.201-1, `libalgorithm-diff-xs-perl` 0.04-6build3, `libalgorithm-merge-perl` 0.08-3, `libasan6` 11.4.0-1ubuntu1~22.04.3, `libassuan0` 2.5.5-1build1, `libatomic1` 12.3.0-1ubuntu1~22.04.3, `libbinutils` 2.38-4ubuntu2.12, `libbrotli1` 1.0.9-2ubuntu0.1, `libbsd0` 0.11.5-1, `libbz2-1.0` 1.0.8-5ubuntu0.1, `libc-dev-bin` 2.35-0ubuntu3.18, `libc-devtools` 2.35-0ubuntu3.18, `libc6` 2.35-0ubuntu3.18, `libc6-dev` 2.35-0ubuntu3.18, `libcbor0.8` 0.8.0-2ubuntu1, `libcc1-0` 12.3.0-1ubuntu1~22.04.3, `libcrypt-dev` 1:4.4.27-1, `libctf-nobfd0` 2.38-4ubuntu2.12, `libctf0` 2.38-4ubuntu2.12, `libcurl3-gnutls` 7.81.0-1ubuntu1.30, `libcurl4` 7.81.0-1ubuntu1.30, `libdeflate0` 1.10-2, `libdpkg-perl` 1.21.1ubuntu2.6, `libedit2` 3.1-20210910-1build1, `liberror-perl` 0.17029-1, `libfakeroot` 1.28-1ubuntu1, `libfido2-1` 1.10.0-1, `libfile-fcntllock-perl` 0.22-3build7, `libfontconfig1` 2.13.1-4.2ubuntu5, `libfreetype6` 2.11.1+dfsg-1ubuntu0.4, `libgcc-11-dev` 11.4.0-1ubuntu1~22.04.3, `libgd3` 2.3.0-2ubuntu2.3, `libgdbm-compat4` 1.23-1, `libgdbm6` 1.23-1, `libgomp1` 12.3.0-1ubuntu1~22.04.3, `libisl23` 0.24-2build1, `libitm1` 12.3.0-1ubuntu1~22.04.3, `libjbig0` 2.1-3.1ubuntu0.22.04.1, `libjpeg-turbo8` 2.1.2-0ubuntu1, `libjpeg8` 8c-2ubuntu10, `libksba8` 1.6.0-2ubuntu0.2, `libldap-2.5-0` 2.5.20+dfsg-0ubuntu0.22.04.1, `libldap-common` 2.5.20+dfsg-0ubuntu0.22.04.1, `liblocale-gettext-perl` 1.07-4build3, `liblsan0` 12.3.0-1ubuntu1~22.04.3, `libmd0` 1.0.4-1build1, `libmpc3` 1.2.1-2build1, `libmpfr6` 4.1.0-3build3, `libnghttp2-14` 1.43.0-1ubuntu0.4, `libnpth0` 1.6-3build2, `libnsl-dev` 1.3.0-2build2, `libperl5.34` 5.34.0-3ubuntu1.10, `libpng16-16` 1.6.37-3ubuntu0.7, `libpsl5` 0.21.0-1.2build2, `libquadmath0` 12.3.0-1ubuntu1~22.04.3, `librtmp1` 2.4+20151223.gitfa8646d.1-2build4, `libsasl2-2` 2.1.27+dfsg2-3ubuntu1.2, `libsasl2-modules` 2.1.27+dfsg2-3ubuntu1.2, `libsasl2-modules-db` 2.1.27+dfsg2-3ubuntu1.2, `libssh-4` 0.9.6-2ubuntu0.22.04.8, `libstdc++-11-dev` 11.4.0-1ubuntu1~22.04.3, `libtiff5` 4.3.0-6ubuntu0.13, `libtirpc-dev` 1.3.2-2ubuntu0.1, `libtsan0` 11.4.0-1ubuntu1~22.04.3, `libubsan1` 12.3.0-1ubuntu1~22.04.3, `libwebp7` 1.2.2-2ubuntu0.22.04.2, `libx11-6` 2:1.7.5-1ubuntu0.4, `libx11-data` 2:1.7.5-1ubuntu0.4, `libxau6` 1:1.0.9-1build5, `libxcb1` 1.14-3ubuntu3, `libxdmcp6` 1:1.1.3-0ubuntu5, `libxext6` 2:1.3.4-1build1, `libxmuu1` 2:1.1.3-3, `libxpm4` 1:3.5.12-1ubuntu0.22.04.4, `linux-libc-dev` 5.15.0-204.214, `lto-disabled-list` 24, `make` 4.3-4.1build1, `manpages` 5.10-1ubuntu1, `manpages-dev` 5.10-1ubuntu1, `netbase` 6.3, `openssh-client` 1:8.9p1-3ubuntu0.18, `patch` 2.7.6-7build2, `perl` 5.34.0-3ubuntu1.10, `perl-base` 5.34.0-3ubuntu1.10, `perl-modules-5.34` 5.34.0-3ubuntu1.10, `pinentry-curses` 1.1.1-1build2, `publicsuffix` 20211207.1025-1, `rpcsvc-proto` 1.4.2-0ubuntu6, `ucf` 3.0043, `xauth` 1:1.1-1build2, `xz-utils` 5.2.5-2ubuntu1.2.
+
+One difference is deliberate. apt also **upgrades** packages already in the image that the new ones pin; notably
+`libc6` 2.35-0ubuntu3.13 → 3.18, pulled in by `libc6-dev`. The no-clobber extract keeps the image's own files, so
+the sandbox keeps the image's libc 3.13 runtime and libstdc++, next to the bundle's 3.18 headers and crt objects.
+Both are glibc 2.35 patch releases, and linking works in every sampled image. The dpkg database does not know
+about the copied files; an agent's apt still works and may reinstall over them.
 
 ## W&B logging
 
