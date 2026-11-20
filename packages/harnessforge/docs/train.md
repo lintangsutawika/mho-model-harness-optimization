@@ -65,7 +65,8 @@ All of this runs in CPU jobs (no compute on the login node), and nothing is inst
 3. **Base model.** The HF snapshot is in `~/.cache/huggingface`. `--ref-load` is the old run's torch_dist
    conversion of the same snapshot, used read-only.
 4. **platoon.** The evals venv (`~/hf-dev/evals/venv`: platoon 0.6.0, tinker 0.16.1), with its site profile and the
-   `hf-micro-swe-1` toolchain.
+   `hf-micro-swe-1` toolchain. For training, optionally its patched copy `~/hf-dev/train/platoon-tito-venv`
+   (token-in/token-out; see "Token-in/token-out prompts" below).
 
 **The disk-delta patch.**
 - *Problem.* Qwen3.5 stores 24 tensors in F32 in the HF checkpoint (`linear_attn.norm.weight`, `A_log`, ...).
