@@ -34,6 +34,8 @@ CHUNK = 1024 * 1024
 #: payloads up to this size are kept in memory; larger ones go to a temporary file
 INLINE_PAYLOAD_BYTES = 8 * 1024 * 1024
 AUTH_TIMEOUT_S = 20.0
+#: a payload that stalls this long is a dead peer
+PAYLOAD_IDLE_S = 120.0
 
 
 class WireError(ConnectionError):
@@ -100,41 +102,45 @@ async def write_frame(writer: asyncio.StreamWriter, header: dict[str, Any],
 
 async def read_frame(reader: asyncio.StreamReader, *, spool_dir: str | os.PathLike | None = None,
                      timeout: float | None = None) -> tuple[dict[str, Any], bytes | Path | None]:
-    """(header, payload). A payload larger than INLINE_PAYLOAD_BYTES is written to a temporary file in `spool_dir`
-    (the caller removes it); smaller ones are bytes. EOF raises WireError."""
-    async def _read() -> tuple[dict[str, Any], bytes | Path | None]:
+    """(header, payload). `timeout` bounds the wait for the header; a payload then only has to keep coming (each
+    chunk within PAYLOAD_IDLE_S), however large it is. A payload larger than INLINE_PAYLOAD_BYTES is written to a
+    temporary file in `spool_dir` (the caller removes it); smaller ones are bytes. EOF raises WireError."""
+    async def exactly(n: int, limit: float | None) -> bytes:
         try:
-            size = int.from_bytes(await reader.readexactly(4), "big")
-            if size > MAX_HEADER_BYTES:
-                raise WireError(f"frame header of {size} bytes")
-            header = json.loads(await reader.readexactly(size))
+            return await (asyncio.wait_for(reader.readexactly(n), limit) if limit else reader.readexactly(n))
         except asyncio.IncompleteReadError as exc:
             raise WireError("connection closed") from exc
-        if not isinstance(header, dict):
-            raise WireError("frame header is not an object")
-        n = header.get("nbytes")
-        if n is None:
-            return header, None
-        n = int(n)
-        try:
-            if n <= INLINE_PAYLOAD_BYTES:
-                return header, await reader.readexactly(n)
-            fd, name = tempfile.mkstemp(prefix="hfsbh-", suffix=".part", dir=spool_dir)
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    left = n
-                    while left:
-                        chunk = await reader.readexactly(min(CHUNK, left))
-                        f.write(chunk)
-                        left -= len(chunk)
-            except BaseException:
-                Path(name).unlink(missing_ok=True)
-                raise
-            return header, Path(name)
-        except asyncio.IncompleteReadError as exc:
-            raise WireError("connection closed in a payload") from exc
 
-    return await (asyncio.wait_for(_read(), timeout) if timeout else _read())
+    async def header() -> dict[str, Any]:
+        size = int.from_bytes(await exactly(4, None), "big")
+        if size > MAX_HEADER_BYTES:
+            raise WireError(f"frame header of {size} bytes")
+        return json.loads(await exactly(size, PAYLOAD_IDLE_S))
+
+    head = await (asyncio.wait_for(header(), timeout) if timeout else header())
+    if not isinstance(head, dict):
+        raise WireError("frame header is not an object")
+    n = head.get("nbytes")
+    if n is None:
+        return head, None
+    n = int(n)
+    if n <= INLINE_PAYLOAD_BYTES:
+        out = bytearray()
+        while len(out) < n:
+            out += await exactly(min(CHUNK, n - len(out)), PAYLOAD_IDLE_S)
+        return head, bytes(out)
+    fd, name = tempfile.mkstemp(prefix="hfsbh-", suffix=".part", dir=spool_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            left = n
+            while left:
+                chunk = await exactly(min(CHUNK, left), PAYLOAD_IDLE_S)
+                f.write(chunk)
+                left -= len(chunk)
+    except BaseException:
+        Path(name).unlink(missing_ok=True)
+        raise
+    return head, Path(name)
 
 
 def payload_bytes(payload: bytes | Path | None) -> bytes:

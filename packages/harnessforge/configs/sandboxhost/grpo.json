@@ -1,0 +1,24 @@
+{
+ "_comment": "Sandbox hosts for the platoon GRPO driver (docs/sandboxhost.md): 5 rt_HC jobs x 96 pods; with sandboxes.local_slots 160 on the trainer's head node, 640 concurrent rollouts.",
+ "fleet_id": "sbh-grpo",
+ "state_root": "~/hf-dev/sandboxhosts/state",
+ "hosts": 5,
+ "slots_per_host": 96,
+ "lease_s": 900,
+ "python": "/home/aci18914wh/hf-dev/remote-sandboxes/venv/bin/python",
+ "harnessforge_src": "/home/aci18914wh/hf-dev/remote-sandboxes/harnessforge-live/src",
+ "provider_options": {
+  "image_cache": "/groups/gai51740/aci18914wh/mho/hpc-sandbox-images",
+  "max_starting": 16,
+  "fakeroot": true,
+  "allow_network_none": true
+ },
+ "launcher": {
+  "kind": "pbs",
+  "queue": "R9920261300",
+  "account": "gai51740",
+  "resource_type": "rt_HC",
+  "walltime": "72:00:00",
+  "name_prefix": "hfsbh"
+ }
+}

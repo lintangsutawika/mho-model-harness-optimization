@@ -132,6 +132,9 @@ Both eval paths (this backend, and harbor's `scripts/optimize/eval.sh` with `HAR
   i.e. before harbor's `wait_for` on `environment.start` (task `build_timeout_sec`, 600 s) and on `agent.setup`
   (360 s): a trial waiting for a slot never times out for it, and the wait is not part of its `environment_setup`
   timing (it is the gap between the trial's `started_at` and `environment_setup.started_at`).
+- **Sandboxes on other jobs**: `options.sandboxes = {mode: remote, hosts_spec: FLEET, local_slots: N}` starts the
+  pods on sandbox host jobs (`harnessforge.sandboxhost`, docs/sandboxhost.md) instead of, or besides, this job's
+  node; a trial whose host dies is env_failed (`unexpected:SandboxLostError`).
 - **Agent toolchain**: this backend already runs candidates from the `hf-micro-swe-1` toolchain. harbor's path now
   does too: `scripts/hpcsb/build_toolchain.sh` builds the same lock (`assets/hf-micro-swe-1.txt`, wheels for glibc
   >= 2.28) into `/groups/.../mho/toolchains/hf-micro-swe-1`; `hpc_sandbox_env` copies it node-local once and mounts
