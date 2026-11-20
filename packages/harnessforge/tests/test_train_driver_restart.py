@@ -45,3 +45,26 @@ def test_train_driver_on_gateway_head_restarts_through_gateway(tmp_path, monkeyp
                      "--set", "stats.wandb.mode=\"online\""]) == 0
     t.join()
     assert TrainRun.load(run.paths.config)["stats"]["wandb"]["mode"] == "online"
+
+
+
+def test_release_previous_models(tmp_path):
+    from harnessforge.train import driver as D
+    cfg = json.loads((CONFIGS / "naive.json").read_text())
+    cfg.update(extends=str(CONFIGS / "abci-base.json"), runs_root=str(tmp_path / "runs"))
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps(cfg))
+    run = TrainRun.load(p)
+    d = run.paths.platoon_dir / "x" / "train"
+    d.mkdir(parents=True)
+    (d / "checkpoints.jsonl").write_text(
+        json.dumps({"state_path": "tinker://model-aaa/weights/recovery-000000"}) + "\n" +
+        json.dumps({"state_path": "tinker://model-aaa/weights/000002_interrupted",
+                    "sampler_path": "tinker://model-bbb/sampler_weights/x"}) + "\n")
+    assert D.previous_model_ids(run) == ["model-aaa", "model-bbb"]
+    calls = []
+    def post(u, body):
+        calls.append((u, body["model_id"]))
+        return 200 if body["model_id"] == "model-aaa" else 404     # bbb: unknown to a fresh gateway
+    assert D.release_previous_models(run, "http://g:1/", post=post, wait_s=0) == ["model-aaa"]
+    assert calls[0][0] == "http://g:1/api/v1/unload_model"

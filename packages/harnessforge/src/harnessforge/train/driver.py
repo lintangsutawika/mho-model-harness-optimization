@@ -197,6 +197,43 @@ def node_monitor(path: Path, stop: "threading.Event", interval: float = 30.0) ->
                 f.flush()
 
 
+def previous_model_ids(run: TrainRun) -> list[str]:
+    """Tinker model ids a previous platoon process of this run trained (from its checkpoints)."""
+    import re
+    ids: list[str] = []
+    for f in run.paths.platoon_dir.glob("*/*/checkpoints.jsonl"):
+        for m in re.finditer(r"tinker://([A-Za-z0-9_.-]+)/", f.read_text()):
+            if m.group(1) not in ids:
+                ids.append(m.group(1))
+    return ids
+
+
+def release_previous_models(run: TrainRun, url: str, *, post=None, wait_s: float = 20.0) -> list[str]:
+    """The full-fine-tuning gateway serves one model at a time and holds a client's lease for an hour:
+    a restarted driver's platoon (resume = a new training client) is refused until the previous model is
+    unloaded. Unload every model this run trained; ids the gateway does not know (a fresh gateway) are
+    ignored. Returns the ids it unloaded."""
+    import urllib.error
+    import urllib.request
+
+    def _post(u: str, body: dict) -> int:
+        req = urllib.request.Request(u, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json", "X-API-Key": TINKER_API_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except OSError:
+            return 0
+    post = post or _post
+    done = [m for m in previous_model_ids(run)
+            if post(url.rstrip("/") + "/api/v1/unload_model", {"model_id": m}) == 200]
+    if done:
+        time.sleep(wait_s)                  # the unload completes behind a future
+    return done
+
+
 def resume_batch(run: TrainRun) -> int:
     """The batch platoon resumes from: its newest checkpoint in log_path (0 for a fresh run)."""
     last = 0
@@ -250,6 +287,9 @@ def run_driver_job(run_dir: str | Path) -> int:
                 "WANDB_API_KEY" not in secrets:
             _log(run, "WARNING: no WANDB_API_KEY; logging to W&B offline instead (wandb sync later)")
             run.raw.setdefault("stats", {}).setdefault("wandb", {})["mode"] = "offline"
+        freed = release_previous_models(run, url)
+        if freed:
+            _log(run, f"unloaded the previous platoon process's model(s) {freed} from the gateway")
         cfg = prepare(run, url)
         env = platoon_env(run, url, secrets)
         record_stream_base(run)
