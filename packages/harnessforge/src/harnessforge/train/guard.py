@@ -5,11 +5,14 @@ Why: platoon's own watchdog is fed by every rollout group in flight, so a wedged
 invisible for as long as straggler rollouts run (up to the agent timeout, 3600 s); the trial run of
 2026-11-20 sat 86 min after its last Tinker call, the gateway reclaimed the model on its lease, and
 the watchdog then exited rc=2 with no stack. The guard watches progress itself: platoon's
-"| Step N/M |" log lines.
+"| Step N/M |" log lines, and platoon's own "Still waiting for <call>" heartbeats while a
+step waits on the training service (a long final forward_backward is not a stall: v2's step 200).
 
     driver.stall_timeout        seconds without a new step before the guard acts (default 1200; 0 = off)
     driver.stall_startup_grace  extra seconds allowed before the first step of a platoon process (default 3600)
     driver.max_auto_restarts    restarts the guard may ask for over the run's life (default 8)
+    driver.stall_wait_ceiling   a "Still waiting for <call>" heartbeat counts as progress only while that one wait
+                                is under this many seconds (default 3600): a call that never returns still fires
 
 On a stall: dump every platoon Python process's thread stacks and asyncio task stacks
 (stackdump_site), copy them to logs/stall.<n>.<time>.txt, stop platoon (SIGTERM; after
@@ -32,6 +35,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 STEP_RE = re.compile(rb"\| Step (\d+)/\d+")
+#: platoon's own "the trainer is waiting on the service" heartbeat (trainer/waiting.py, every 60 s while a
+#: forward_backward / optim_step / save is outstanding): the trainer is alive, so it is progress, not a stall.
+#: A wedged train loop logs neither (the 64kcap hangs).
+ALIVE_RE = re.compile(rb"platoon\.train\.trainer\.waiting \| Still waiting for .*?\((\d+)s elapsed\)")
 WATCHDOG_RE = re.compile(rb"WATCHDOG: No heartbeat for")
 WATCHDOG_RC = 2
 AUTO_RESTARTS = "auto_restarts.json"
@@ -48,8 +55,9 @@ class StallGuard:
     """Reads a platoon log incrementally; says when steps stop coming."""
 
     def __init__(self, log: Path, timeout: float, startup_grace: float = 3600.0,
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time, wait_ceiling: float = 3600.0) -> None:
         self.log, self.timeout, self.grace, self.clock = Path(log), float(timeout), float(startup_grace), clock
+        self.wait_ceiling = float(wait_ceiling)
         self.offset = self.log.stat().st_size if self.log.exists() else 0   # this process's lines only
         self.start_offset = self.offset
         self.started = self.last_progress = clock()
@@ -73,6 +81,11 @@ class StallGuard:
                 data, self._tail = b"", buf[-65536:]
             for m in STEP_RE.finditer(data):
                 self.last_step, self.last_progress = int(m.group(1)), self.clock()
+            for m in ALIVE_RE.finditer(data):
+                # only while the one wait it reports is under the ceiling: a call that never returns server-side
+                # keeps heartbeating, and must still count as a hang
+                if int(m.group(1)) < self.wait_ceiling:
+                    self.last_progress = self.clock()
             if not self.watchdog_warned and WATCHDOG_RE.search(data):
                 self.watchdog_warned, event = True, "watchdog"
         if not self.timeout:
