@@ -199,24 +199,80 @@ def test_resumed_stream_steps_continue(tmp_path):
     assert ex.step_of(3) == 2                          # a stale marker for another stream is ignored
 
 
-def test_stream_id_is_stable_while_versions_are_added(tmp_path):
-    """The bug: the id used the delta dir's ctime, which changes when a version dir is added, so the exporter
-    rebuilt from the base over and over (v2: a rebuild every ~10 versions; the final export took > 1 h)."""
+
+def _stream_fixture(tmp_path):
     import os
-    import time
-    from harnessforge.train.export import DeltaExporter
+    from harnessforge.train.export import DeltaExporter, STREAM_FILE, VERSION_FILE
     deltas = tmp_path / "deltas"
-    (deltas / "weight_v000001").mkdir(parents=True)
-    ex = DeltaExporter(base=".", deltas=deltas, work=tmp_path / "w", out=tmp_path / "o")
-    sid = ex.stream_id()
+    deltas.mkdir()
+    work = tmp_path / "w"
+    work.mkdir()
+    ex = DeltaExporter(base=tmp_path / "base", deltas=deltas, work=work, out=tmp_path / "o",
+                       log=lambda *_: None)
+    resets = []
+    ex.reset = lambda: (resets.append(1), (work / VERSION_FILE).write_text("0"))  # count rebuilds, no base copy
+
+    def publish(v):
+        d = deltas / f"weight_v{v:06d}"
+        d.mkdir()
+        (d / "model.safetensors.index.json").write_text("{}")
+
+    def at_version(v):                    # the work copy as the exporter leaves it after applying v
+        (work / VERSION_FILE).write_text(str(v))
+        (work / STREAM_FILE).write_text(ex.stream_id())
+    return ex, deltas, publish, at_version, resets, os
+
+
+def test_stream_id_is_stable_while_versions_are_added(tmp_path):
+    """The bug: the id used the delta dir's ctime, which moves when a version dir is added, so the exporter
+    rebuilt from the base over and over (v2: a rebuild every ~10 versions; the final export took > 1 h)."""
+    import time
+    ex, deltas, publish, at_version, resets, os = _stream_fixture(tmp_path)
+    publish(1)
+    at_version(1)
     ctime = os.stat(deltas).st_ctime
     time.sleep(1.1)
-    (deltas / "weight_v000002").mkdir()                          # a new version is published
+    publish(2)
     assert int(os.stat(deltas).st_ctime) != int(ctime)          # the dir's ctime moved (what the old id used)
-    assert ex.stream_id() == sid                                 # the stream did not change
-    # a new gateway: miles recreates the dir -> a new stream (the old dir moved aside, so no inode is reused)
+    ex.ensure()
+    assert resets == []                                          # same stream: no rebuild
+
+
+def test_pruning_old_versions_does_not_reset(tmp_path):
+    import shutil
+    ex, deltas, publish, at_version, resets, os = _stream_fixture(tmp_path)
+    publish(1)
+    publish(2)
+    at_version(2)
+    shutil.rmtree(deltas / "weight_v000001")                     # miles prunes the oldest version
+    publish(3)
+    ex.ensure()
+    assert resets == []
+
+
+def test_recreated_dir_starting_over_resets_even_with_the_same_inode(tmp_path):
+    import shutil
+    ex, deltas, publish, at_version, resets, os = _stream_fixture(tmp_path)
+    for v in (1, 2, 3, 4):
+        publish(v)
+    at_version(4)
+    for v in (1, 2, 3, 4):                                       # the same dir (same inode) emptied and refilled
+        shutil.rmtree(deltas / f"weight_v{v:06d}")
+    publish(1)                                                   # a new gateway's stream starts over at v1
+    ex.ensure()
+    assert resets == [1]
+
+
+def test_recreated_dir_with_a_new_inode_resets(tmp_path):
+    ex, deltas, publish, at_version, resets, os = _stream_fixture(tmp_path)
+    publish(1)
+    at_version(1)
+    sid = ex.stream_id()
     fresh = tmp_path / "fresh"
-    (fresh / "weight_v000001").mkdir(parents=True)
-    deltas.rename(tmp_path / "old-deltas")
+    fresh.mkdir()
+    deltas.rename(tmp_path / "old-deltas")                       # moved aside, so its inode is not reused
     fresh.rename(deltas)
+    publish(1)
     assert ex.stream_id() != sid
+    ex.ensure()
+    assert resets == [1]

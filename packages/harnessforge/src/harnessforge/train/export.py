@@ -175,27 +175,24 @@ class DeltaExporter:
         self._set_version(0)
 
     def stream_id(self) -> str:
-        """miles recreates the delta dir at every gateway start (a new stream from version 0): the dir's inode, and
-        the inode of its first version dir (an inode can be reused by a recreated dir; both together rarely are).
-        Not the dir's ctime: that changes whenever a version is added or removed, which made every later poll see
-        a "new stream" and rebuild the export from the base (a full replay, ~14 s per version)."""
+        """The delta dir's device and inode: miles recreates the dir at every gateway start (a new stream from v1).
+        Not its ctime (it moves whenever a version is added or pruned, which made the exporter rebuild from the base
+        every few versions), nor any version dir's (pruning changes which ones exist). A recreated dir that reuses
+        the old inode is caught by its versions starting over (``ensure``)."""
         try:
             st = os.stat(self.deltas)
         except FileNotFoundError:
             return ""
-        first = sorted(Path(self.deltas).glob("weight_v*"))
-        try:
-            first_ino = os.stat(first[0]).st_ino if first else 0
-        except FileNotFoundError:
-            first_ino = 0
-        return f"{st.st_dev}-{st.st_ino}-{first_ino}"
+        return f"{st.st_dev}-{st.st_ino}"
 
     def ensure(self) -> None:
         try:
             built_from = (self.work / STREAM_FILE).read_text().strip()
         except FileNotFoundError:
             built_from = None
-        if (self.work / APPLYING_FILE).exists() or self.version < 0 or built_from != self.stream_id():
+        present = versions(self.deltas)
+        restarted = bool(present) and self.version > 0 and max(present) < self.version   # a new stream from v1
+        if (self.work / APPLYING_FILE).exists() or self.version < 0 or built_from != self.stream_id() or restarted:
             self.log(f"[export] (re)building {self.work} from {self.base}")
             self.reset()
             (self.work / STREAM_FILE).write_text(self.stream_id())
