@@ -175,19 +175,24 @@ class DeltaExporter:
         self._set_version(0)
 
     def stream_id(self) -> str:
-        """miles recreates the delta dir at every gateway start (a new stream from version 0)."""
+        """The delta dir's device and inode: miles recreates the dir at every gateway start (a new stream from v1).
+        Not its ctime (it moves whenever a version is added or pruned, which made the exporter rebuild from the base
+        every few versions), nor any version dir's (pruning changes which ones exist). A recreated dir that reuses
+        the old inode is caught by its versions starting over (``ensure``)."""
         try:
             st = os.stat(self.deltas)
-            return f"{st.st_ino}-{int(st.st_ctime)}"
         except FileNotFoundError:
             return ""
+        return f"{st.st_dev}-{st.st_ino}"
 
     def ensure(self) -> None:
         try:
             built_from = (self.work / STREAM_FILE).read_text().strip()
         except FileNotFoundError:
             built_from = None
-        if (self.work / APPLYING_FILE).exists() or self.version < 0 or built_from != self.stream_id():
+        present = versions(self.deltas)
+        restarted = bool(present) and self.version > 0 and max(present) < self.version   # a new stream from v1
+        if (self.work / APPLYING_FILE).exists() or self.version < 0 or built_from != self.stream_id() or restarted:
             self.log(f"[export] (re)building {self.work} from {self.base}")
             self.reset()
             (self.work / STREAM_FILE).write_text(self.stream_id())
