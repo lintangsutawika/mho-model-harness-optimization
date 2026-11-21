@@ -21,6 +21,14 @@ small next to the trials; the toolchain is staged once per node and shared.
 dataset order here is `request.tasks` (a split manifest lists them in that order), so `order = TASK_MAJOR` and a
 look's task prefix is a prefix of `request.tasks`.
 
+**Attempt-major / look-major launch** (option `order: attempt_major`, with optional `trial_looks` or `plan` as in
+`stats.LookSchedule`): platoon itself only launches task-major. The backend gives every unit (task, trial index) a task
+name of its own, `<task>__hfa<index>`, listed in a `registry.json` of the materialized dataset that points at the
+task's one directory (platoon's harbor datasets resolve names through the registry, so nothing is copied), puts the
+aliases in the split in `LookSchedule.launch_order()` (look by look; within a look by trial index, then task) and runs
+1 rollout per alias. platoon's FIFO semaphore then launches the units in exactly that order. The reader maps each alias
+back to (task, index), so records look like any other run's. Needs `materialize` (the default).
+
 **Records** come from the rollout directories (`harnessforge.evals.reader`): finished trials from their
 metadata.json and trajectory, launched-but-unfinished ones as `finished=False`, and, once a candidate is stopped
 and its process has exited, those it never finished as `finished=True, env_failed=True, error="stopped"`.
@@ -71,6 +79,7 @@ from harnessforge.evals import dataset as datasets
 from harnessforge.evals.harness import CANDIDATE_MOUNT, TOOLCHAIN, check_candidate, render_spec
 from harnessforge.evals.reader import RolloutReader
 from harnessforge.records import TrialRecord, write_jsonl
+from harnessforge.stats.looks import LookSchedule
 from harnessforge.sandboxhost import provider_settings
 
 DEFAULT_PROVIDER = "harnessforge.evals.pods:PodSingularityProvider"
@@ -120,11 +129,42 @@ class _Member:
         return self.process is None or self.returncode is not None
 
 
+ALIAS_SEP = "__hfa"
+
+
+def attempt_alias(task: str, index: int) -> str:
+    """The task name one unit runs under in a look-major launch."""
+    return f"{task}{ALIAS_SEP}{index}"
+
+
+def launch_units(request: EvalRequest) -> list[tuple[str, int]] | None:
+    """The units in launch order for an attempt-major request (option `order`), None for task-major."""
+    opts = request.options
+    if Order(opts.get("order", Order.TASK_MAJOR.value)) is not Order.ATTEMPT_MAJOR:
+        if opts.get("trial_looks") or opts.get("plan"):
+            raise ValueError("trial_looks / plan need options.order = attempt_major")
+        return None
+    looks = opts.get("trial_looks")
+    plan = opts.get("plan")
+    sched = LookSchedule(Order.ATTEMPT_MAJOR, tuple(request.tasks), int(request.trials),
+                         trial_looks=None if looks is None else tuple(looks),
+                         plan=None if plan is None else tuple(tuple(tuple(seg) for seg in lk) for lk in plan))
+    return sched.launch_order()
+
+
+def write_alias_registry(dataset_dir: Path, units: list[tuple[str, int]]) -> None:
+    """registry.json naming every unit's alias, each pointing at its task's directory."""
+    tasks = [{"name": attempt_alias(t, i), "path": t} for t, i in units]
+    (dataset_dir / "registry.json").write_text(json.dumps([{"name": "harnessforge-units", "version": "1",
+                                                             "tasks": tasks}], indent=1))
+
+
 class PlatoonRun:
     order = Order.TASK_MAJOR
 
     def __init__(self, request: EvalRequest, members: dict[str, _Member], *, stop_grace_s: float,
-                 reap: Any = None) -> None:
+                 reap: Any = None, order: Order = Order.TASK_MAJOR) -> None:
+        self.order = order
         self.request = request
         self._members = members
         self._stop_grace_s = stop_grace_s
@@ -228,6 +268,9 @@ class PlatoonBackend:
         run_dir.mkdir(parents=True, exist_ok=True)
         dataset_dir = Path(request.dataset)
         prepare = [HARBOR_SYSTEM_DEPS] if opts.get("harbor_system_deps", True) else []
+        units = launch_units(request)
+        if units is not None and not opts.get("materialize", True):
+            raise ValueError("an attempt-major launch needs materialize (its registry goes into the run's dataset)")
         if opts.get("materialize", True):
             replays = datasets.materialize(dataset_dir, request.tasks, run_dir / "dataset")
             commands = {datasets.replay_command(r) for r in replays.values()} - {None}
@@ -236,6 +279,9 @@ class PlatoonBackend:
                                  + "; ".join(sorted(commands))[:500])
             prepare = [*commands, *prepare]
             dataset_dir = run_dir / "dataset"
+            if units is not None:
+                write_alias_registry(dataset_dir, units)
+        aliases = None if units is None else {attempt_alias(t, i): (t, i) for t, i in units}
         model = opts.get("model") or (served_model(request.endpoint) if self.launch else "policy")
         members: dict[str, _Member] = {}
         for candidate in request.candidates:
@@ -244,20 +290,21 @@ class PlatoonBackend:
                                toolchain=opts.get("toolchain", TOOLCHAIN), prepare=prepare,
                                keep_children=bool(opts.get("harbor_keep_processes", True)))
             config = out / "eval.yaml"  # JSON, which is YAML
-            config.write_text(json.dumps(self._config(request, candidate, model, spec, dataset_dir, out, opts),
-                                         indent=1))
+            config.write_text(json.dumps(self._config(request, candidate, model, spec, dataset_dir, out, opts,
+                                                      units), indent=1))
             members[candidate.id] = _Member(candidate, out / "platoon", config, out / "platoon.log",
                                             RolloutReader(out / "platoon", candidate.id, policy=request.policy,
-                                                          tasks=request.tasks))
+                                                          tasks=request.tasks, aliases=aliases))
         (run_dir / "request.json").write_text(json.dumps(_request_json(request, model), indent=1))
         if self.launch:
             for member in members.values():
                 member.process = self._spawn(member, opts)
-        return PlatoonRun(request, members, stop_grace_s=self.stop_grace_s, reap=self._reaper(opts))
+        return PlatoonRun(request, members, stop_grace_s=self.stop_grace_s, reap=self._reaper(opts),
+                          order=Order.TASK_MAJOR if units is None else Order.ATTEMPT_MAJOR)
 
     # ------------------------------------------------------------------ helpers
     def _config(self, request: EvalRequest, candidate: Candidate, model: str, spec: Path, dataset_dir: Path,
-                out: Path, opts: Mapping[str, Any]) -> dict[str, Any]:
+                out: Path, opts: Mapping[str, Any], units: list[tuple[str, int]] | None = None) -> dict[str, Any]:
         provider_options = {"fakeroot": True, "allow_network_none": True, **opts.get("provider_options", {})}
         provider = opts.get("provider", DEFAULT_PROVIDER)
         remote, remote_options = provider_settings(opts.get("sandboxes"))
@@ -278,7 +325,7 @@ class PlatoonBackend:
                 provider_options.setdefault("collect_dir", str(out / "collected"))
         service_kwargs = {
             "dataset_dir": str(dataset_dir),
-            "splits": {"eval": list(request.tasks)},
+            "splits": {"eval": list(request.tasks) if units is None else [attempt_alias(t, i) for t, i in units]},
             "provider": provider,
             "provider_options": provider_options,
             "mounts": [{"source": str(Path(candidate.harness_dir).resolve()), "target": CANDIDATE_MOUNT,
@@ -300,7 +347,7 @@ class PlatoonBackend:
                 "retry_errored": False,
                 "hosted": hosted,
                 "workflow": {
-                    "num_rollouts_per_task": int(request.trials),
+                    "num_rollouts_per_task": int(request.trials) if units is None else 1,
                     "num_concurrent_workers": int(request.concurrency),
                     "rollout_config": {"verbose": False, **opts.get("rollout_config", {})},
                     **opts.get("workflow", {}),
@@ -353,5 +400,7 @@ def _request_json(request: EvalRequest, model: str) -> dict[str, Any]:
     return {"run_id": request.run_id, "tasks": list(request.tasks), "dataset": request.dataset,
             "trials": request.trials, "endpoint": request.endpoint, "model": model, "policy": request.policy,
             "concurrency": request.concurrency,
+            "order": request.options.get("order", Order.TASK_MAJOR.value),
+            **{k: request.options[k] for k in ("trial_looks", "plan") if request.options.get(k) is not None},
             "candidates": [{"id": c.id, "harness_dir": str(c.harness_dir), "parent": c.parent}
                            for c in request.candidates]}

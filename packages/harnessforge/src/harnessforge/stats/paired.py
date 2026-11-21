@@ -62,26 +62,45 @@ def _value(s: TaskStats, key: str) -> float | None:
 
 
 def paired(a: Mapping[str, TaskStats], b: Mapping[str, TaskStats],
-           key: str = "reward") -> Paired | None:
+           key: str = "reward", weights: Mapping[str, float] | None = None) -> Paired | None:
     """Paired stats of `b` minus `a` over the tasks both have (and, for key="cost", that both
-    report a cost for). None with fewer than 2 common tasks."""
+    report a cost for). None with fewer than 2 common tasks.
+
+    `weights` (task -> w > 0; tasks without one are left out): the weighted mean D = sum w d / sum w with
+    the robust (sandwich) standard error SE = sqrt(n / (n - 1) * sum w^2 (d - D)^2) / sum w. This is the
+    estimator of a look whose tasks have unequal trials (inverse-variance weights from
+    `LookSchedule.weights`); the SE does not rely on the weights being right, and with equal weights it is
+    the plain sd / sqrt(n)."""
     xa: list[float] = []
     xb: list[float] = []
+    ws: list[float] = []
     for k in sorted(set(a) & set(b)):
         va, vb = _value(a[k], key), _value(b[k], key)
         if va is None or vb is None:
             continue
+        w = 1.0 if weights is None else weights.get(k)
+        if w is None or not w > 0:
+            continue
         xa.append(va)
         xb.append(vb)
+        ws.append(float(w))
     n = len(xa)
     if n < 2:
         return None
     d = [y - x for x, y in zip(xa, xb)]
-    md = math.fsum(d) / n
-    sd = math.sqrt(math.fsum((x - md) ** 2 for x in d) / (n - 1))
-    if sd < 1e-12:                       # identical differences up to float noise
-        sd = 0.0
-    return Paired(n, math.fsum(xa) / n, math.fsum(xb) / n, md, sd / math.sqrt(n))
+    if weights is None:
+        md = math.fsum(d) / n
+        sd = math.sqrt(math.fsum((x - md) ** 2 for x in d) / (n - 1))
+        if sd < 1e-12:                       # identical differences up to float noise
+            sd = 0.0
+        return Paired(n, math.fsum(xa) / n, math.fsum(xb) / n, md, sd / math.sqrt(n))
+    sw = math.fsum(ws)
+    md = math.fsum(w * x for w, x in zip(ws, d)) / sw
+    se = math.sqrt(n / (n - 1) * math.fsum((w * (x - md)) ** 2 for w, x in zip(ws, d))) / sw
+    if se < 1e-12:
+        se = 0.0
+    return Paired(n, math.fsum(w * x for w, x in zip(ws, xa)) / sw, math.fsum(w * x for w, x in zip(ws, xb)) / sw,
+                  md, se)
 
 
 def task_mean(pt: Mapping[str, TaskStats]) -> float:

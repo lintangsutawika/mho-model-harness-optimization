@@ -6,7 +6,7 @@
         records = run.records()      # each call advances the clock one tick (auto_advance=True)
 
 Time is a tick counter. Each candidate launches its trials in TASK_MAJOR order (every trial of task 1, then task 2,
-...) with at most `request.concurrency` in flight; a trial launched at tick t finishes at t + duration(task).
+...; with `options["order"] = "attempt_major"` (and optional trial_looks / plan) in look-major order, as PlatoonBackend) with at most `request.concurrency` in flight; a trial launched at tick t finishes at t + duration(task).
 `records()` returns the snapshot at the current tick (finished trials, and in-flight ones as finished=False), then
 advances one tick unless `auto_advance=False` (call `step()` yourself). `wait()` runs the clock to the end.
 
@@ -59,7 +59,10 @@ class FakeRun:
         self._request = request
         self._auto = auto_advance
         self.tick = 0
-        queue = [(t, i) for t in request.tasks for i in range(request.trials)]
+        from harnessforge.evals.backend import launch_units
+        units = launch_units(request)          # options order / trial_looks / plan, as PlatoonBackend
+        self.order = Order.TASK_MAJOR if units is None else Order.ATTEMPT_MAJOR
+        queue = units if units is not None else [(t, i) for t in request.tasks for i in range(request.trials)]
         self._lanes = {c.id: _Lane(c.id, list(queue)) for c in request.candidates}
         self._launch()
 

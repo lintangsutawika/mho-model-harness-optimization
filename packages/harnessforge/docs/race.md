@@ -34,6 +34,12 @@ python -m harnessforge.race_run drive --request request.json --reference A --out
 python -m harnessforge.race_run replay runs/race1.records.jsonl --tasks runs/race1-A/request.json --reference B
 ```
 
+Attempt-major (look-major) evaluations: `--trial-looks 2,4,8,24` or `--plan '100x1;200x2;200x8;200x24'` (default: the
+request's own `trial_looks` / `plan` options), `--tau2/--sigma2` the planning variance components (default val200), and
+`--design auto|obf|spending` (`auto`: `race.default_design`, Lan-DeMets OBF spending on observed information for trial
+looks), `--alpha`, `--spending obf|pocock|power:R`, `--planned` (planned instead of observed information). Replay reads
+`order` from the request JSON (or `--order`). See docs/stats.md section 7.
+
 `--c` overrides the efficacy constant (default `recommended_c`: 1.77 for TASK_MAJOR / SAME_UNITS), `--mode all` pairs with
 all of the reference's trials, `--max-env-fail` skips infra-suspect interim looks, `--checkpoints` sets the look
 fractions.

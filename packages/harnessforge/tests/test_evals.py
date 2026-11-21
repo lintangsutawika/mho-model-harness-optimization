@@ -383,3 +383,47 @@ def test_platoon_backend_remote_sandboxes(tmp_path):
     po = kw["provider_options"]
     assert po["hosts_spec"] == "/fleet" and po["local_slots"] == 4 and po["keep_agent_processes"] is True
     assert po["collect_dir"].endswith("/collected")
+
+
+# ----------------------------------------------------------------------------- look-major launch
+def test_platoon_backend_attempt_major_aliases(tmp_path):
+    from harnessforge.evals.backend import attempt_alias
+    request = platoon_request(tmp_path, n_candidates=1, trials=4)
+    request.options.update({"order": "attempt_major", "trial_looks": [2, 4]})
+    run = PlatoonBackend(launch=False).start(request)
+    assert run.order is Order.ATTEMPT_MAJOR
+    cfg = json.loads((tmp_path / "out" / "r1" / "c0" / "eval.yaml").read_text())
+    kw = cfg["environments"][0]["service_kwargs"]
+    units = [(t, i) for i in range(2) for t in ("t1", "t2", "t3")] + [(t, i) for i in range(2, 4) for t in ("t1", "t2", "t3")]
+    assert kw["splits"]["eval"] == [attempt_alias(t, i) for t, i in units]
+    assert cfg["inference"]["workflow"]["num_rollouts_per_task"] == 1
+    registry = json.loads((tmp_path / "out" / "r1" / "dataset" / "registry.json").read_text())
+    assert {e["name"]: e["path"] for e in registry[0]["tasks"]}[attempt_alias("t2", 3)] == "t2"
+    req = json.loads((tmp_path / "out" / "r1" / "request.json").read_text())
+    assert req["order"] == "attempt_major" and req["trial_looks"] == [2, 4]
+    bad = platoon_request(tmp_path / "x", n_candidates=1)
+    bad.options.update({"trial_looks": [1, 2]})
+    with pytest.raises(ValueError, match="attempt_major"):
+        PlatoonBackend(launch=False).start(bad)
+
+
+def test_platoon_backend_attempt_major_runs_in_unit_order(tmp_path, monkeypatch):
+    monkeypatch.setenv("HF_FAKE_TRIAL_S", "0.1")
+    request = platoon_request(tmp_path, n_candidates=1, trials=3, tasks=("t1", "t2"))
+    request.options.update({"order": "attempt_major"})
+    run = PlatoonBackend(platoon=FIXTURES / "fake_platoon.py", stop_grace_s=5).start(request)
+    assert run.wait(timeout=30, poll_s=0.1)
+    recs = sorted(run.records(), key=lambda r: r.started_at)
+    assert [(r.task, r.index) for r in recs] == [(t, i) for i in range(3) for t in ("t1", "t2")]
+    assert all(r.finished and r.scored and r.candidate == "c0" for r in recs)
+
+
+def test_fake_backend_attempt_major_plan():
+    req = fake_request(tasks=("t1", "t2", "t3", "t4"), trials=2, concurrency=1)
+    req.options.update({"order": "attempt_major", "plan": [[[2, 1]], [[4, 2]]]})
+    run = FakeBackend({}, auto_advance=False).start(req)
+    assert run.order is Order.ATTEMPT_MAJOR
+    run.wait()
+    recs = sorted((r for r in run.records() if r.candidate == "A"), key=lambda r: r.started_at)
+    assert [(r.task, r.index) for r in recs] == [("t1", 0), ("t2", 0), ("t3", 0), ("t4", 0), ("t1", 1), ("t2", 1),
+                                                 ("t3", 1), ("t4", 1)]

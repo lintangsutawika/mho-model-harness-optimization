@@ -31,7 +31,7 @@ from typing import Any, Sequence
 
 from harnessforge.stats.looks import LookSchedule
 
-__all__ = ["DEFAULT_C", "DEFAULT_FUTILITY", "Design", "Verdict", "linear_futility"]
+__all__ = ["DEFAULT_C", "DEFAULT_FUTILITY", "Design", "LookBounds", "Verdict", "linear_futility"]
 
 DEFAULT_C = 1.72
 DEFAULT_FUTILITY = (-0.5, 0.0, 0.5, 1.0)     # = linear_futility at K = 5 attempt looks
@@ -46,6 +46,26 @@ class Verdict(str, enum.Enum):
     PASS = "pass"
     FAIL = "fail"
     CONTINUE = "continue"
+
+
+@dataclass(frozen=True)
+class LookBounds:
+    """The boundaries of one look as a design applies them (`Design.bounds`, `SpendingDesign.bounds`)."""
+    efficacy: float              # pass iff t > efficacy
+    futility: float              # fail iff t <= futility (= efficacy at a final look)
+    final: bool                  # the look decides pass or fail
+    fraction: float              # information fraction used (capped at 1)
+    ratio: float | None = None   # observed information / planned maximum (uncapped); None = planned
+
+    def verdict(self, t: float | None) -> Verdict:
+        """Decision for paired t (None = no paired data: continue, fail at a final look)."""
+        if t is None or math.isnan(t):
+            return Verdict.FAIL if self.final else Verdict.CONTINUE
+        if t > self.efficacy:
+            return Verdict.PASS
+        if t <= self.futility:
+            return Verdict.FAIL
+        return Verdict.CONTINUE
 
 
 @dataclass(frozen=True)
@@ -108,6 +128,12 @@ class Design:
             return linear_futility(self.fractions[j - 1])
         return self.futility[j - 1] if j - 1 < len(self.futility) else -math.inf
 
+    def bounds(self, j: int, info: float | None = None,
+               history: Sequence[tuple[int, float | None]] = ()) -> LookBounds:
+        """Look j's boundaries. This design's are fixed by its fractions; `info` and `history` (observed
+        information, see `SpendingDesign.bounds`) are accepted for a common interface and ignored."""
+        return LookBounds(self.efficacy(j), self.futility_bound(j), self.is_final(j), self.fractions[j - 1])
+
     def verdict(self, j: int, t: float | None) -> Verdict:
         """Decision at look j for paired t (None = no paired data: continue, fail at the end)."""
         if t is None or math.isnan(t):
@@ -125,6 +151,6 @@ class Design:
     def as_dict(self) -> dict[str, Any]:
         def r(x: float) -> float | None:
             return round(x, 4) if math.isfinite(x) else None
-        return {"c": self.c, "fractions": [round(f, 4) for f in self.fractions],
+        return {"kind": "obf", "c": self.c, "fractions": [round(f, 4) for f in self.fractions],
                 "efficacy": [r(self.efficacy(j)) for j in range(1, self.n_looks + 1)],
                 "futility": [r(self.futility_bound(j)) for j in range(1, self.n_looks)]}

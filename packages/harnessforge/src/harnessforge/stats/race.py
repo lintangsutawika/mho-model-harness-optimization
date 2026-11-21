@@ -49,20 +49,27 @@ Optional cheaper path (`cheaper=GateConfig(cheaper_delta=...)`): a candidate tha
 better path at the FINAL look may still pass via non-inferiority + lower cost
 (`paired.decide`). It is a fixed-sample test applied once at the end and is not part of the
 sequential calibration; off by default.
+
+Designs: `Design` (c / sqrt(tau) with a calibrated c) or `spending.SpendingDesign` (Lan-DeMets alpha spending,
+optionally on the OBSERVED information 1 / SE^2 of each look). The race passes each look's observed
+information and the candidate's earlier looks to `design.bounds`, so a spending design's boundaries follow the
+information each candidate actually has. An attempt-major schedule with `trial_looks` or a `plan` gets a spending
+design by default (`default_design`). Looks of unequal depth (a plan) are estimated with inverse-variance
+task weights (`LookSchedule.weights`, `paired(weights=)`).
 """
 from __future__ import annotations
 
 import enum
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from harnessforge.records import TrialRecord
-from harnessforge.stats.boundaries import Design, Verdict
+from harnessforge.stats.boundaries import Design, LookBounds, Verdict
 from harnessforge.stats.looks import LookData, LookSchedule, UnitIndex, collect
 from harnessforge.stats.paired import Decision, GateConfig, Paired, decide, paired
 
-__all__ = ["CandidateState", "Race", "RaceStatus", "ReferenceMode", "recommended_c"]
+__all__ = ["CandidateState", "Race", "RaceStatus", "ReferenceMode", "default_design", "recommended_c"]
 
 
 class ReferenceMode(str, enum.Enum):
@@ -85,6 +92,16 @@ def recommended_c(schedule: LookSchedule, mode: "ReferenceMode | str") -> float:
     return C_CONSERVATIVE
 
 
+def default_design(schedule: LookSchedule, mode: "ReferenceMode | str" = "same") -> Any:
+    """The race's design when none is given: for an ATTEMPT_MAJOR schedule with `trial_looks` or a `plan`, Lan-DeMets OBF
+    spending at alpha 0.05 (observed information when the schedule has planning `information`), efficacy from look
+    1, linear non-binding futility; otherwise `Design` with `recommended_c`."""
+    if schedule.planned:
+        from harnessforge.stats.spending import SpendingDesign
+        return SpendingDesign.for_schedule(schedule, all_trials_reference=ReferenceMode(mode) is ReferenceMode.ALL_TRIALS)
+    return Design.for_schedule(schedule, c=recommended_c(schedule, mode))
+
+
 def _r(x: float | None) -> float | None:
     return None if x is None or not math.isfinite(x) else round(x, 4)
 
@@ -102,6 +119,7 @@ class CandidateState:
     path: str | None = None          # "better" | "cheaper" when passed
     skipped: tuple[int, ...] = ()    # interim looks skipped as infra-suspect
     cheaper: Decision | None = None
+    fraction: float | None = None    # information fraction at that look (observed, for a spending design)
 
     @property
     def alive(self) -> bool:
@@ -132,7 +150,7 @@ class CandidateState:
                 "acc": self.acc.as_dict() if self.acc else None, "efficacy": self.efficacy,
                 "futility": self.futility, "env_fail_frac": round(self.env_fail_frac, 4),
                 "infra_suspect": self.infra_suspect, "path": self.path,
-                "skipped": list(self.skipped), "reason": self.reason}
+                "skipped": list(self.skipped), "fraction": _r(self.fraction), "reason": self.reason}
 
 
 @dataclass(frozen=True)
@@ -163,6 +181,8 @@ class _Track:
     next_look: int = 1
     state: CandidateState | None = None
     skipped: list[int] = field(default_factory=list)
+    history: list[tuple[int, float | None]] = field(default_factory=list)   # (look, info ratio) of decided looks
+    bounds: dict[int, LookBounds] = field(default_factory=dict)            # every evaluated look's bounds
 
 
 class Race:
@@ -179,7 +199,7 @@ class Race:
         self.candidates = tuple(cands)
         self.schedule = schedule
         self.reference_mode = ReferenceMode(reference_mode)
-        self.design = design or Design.for_schedule(schedule, c=recommended_c(schedule, self.reference_mode))
+        self.design = design or default_design(schedule, self.reference_mode)
         if self.design.n_looks != len(schedule.looks):
             raise ValueError(f"design has {self.design.n_looks} looks, schedule "
                              f"{len(schedule.looks)}")
@@ -205,7 +225,16 @@ class Race:
     def status(self) -> RaceStatus:
         return self._last or self._status(())
 
+    def look_bounds(self, candidate: str, j: int) -> LookBounds:
+        """The boundaries the race applied to `candidate` at look j (planned ones if it has not evaluated it)."""
+        tr = self._tracks[candidate]
+        return tr.bounds.get(j) or self.design.bounds(j, history=tuple(tr.history))
+
     # ------------------------------------------------------------------ internals
+    def _weights(self, j: int) -> dict[str, float] | None:
+        return self.schedule.weights(self.schedule.look(j),
+                                     self.reference_mode is ReferenceMode.ALL_TRIALS)
+
     def _ref_look(self, j: int, idx: UnitIndex, cache: dict[int, LookData]) -> LookData:
         if j not in cache:
             look = self.schedule.look(j)
@@ -228,21 +257,24 @@ class Race:
             env = max(a.env_fail_frac, b.env_fail_frac)
             suspect = self.max_env_fail is not None and env > self.max_env_fail
             tr.next_look = j + 1
-            if suspect and not d.is_final(j):
-                tr.skipped.append(j)
-                tr.state = CandidateState(c, Verdict.CONTINUE, j, None, _r(d.efficacy(j)),
-                                          _r(d.futility_bound(j)), env, True, None,
-                                          tuple(tr.skipped))
+            acc = paired(a.stats, b.stats, weights=self._weights(j))
+            info = 1.0 / acc.se ** 2 if acc is not None and acc.se > 0 else None
+            lb = d.bounds(j, info, tuple(tr.history))
+            tr.bounds[j] = lb
+            if suspect and not lb.final:
+                tr.skipped.append(j)          # spends nothing: its alpha moves on to the next look
+                tr.state = CandidateState(c, Verdict.CONTINUE, j, None, _r(lb.efficacy), _r(lb.futility), env,
+                                          True, None, tuple(tr.skipped), fraction=lb.fraction)
                 continue
-            acc = paired(a.stats, b.stats)
-            v = d.verdict(j, acc.t if acc else None)
+            tr.history.append((j, lb.ratio))
+            v = lb.verdict(acc.t if acc else None)
             path, cheap = ("better" if v is Verdict.PASS else None), None
-            if v is Verdict.FAIL and d.is_final(j) and self.cheaper is not None:
+            if v is Verdict.FAIL and lb.final and self.cheaper is not None:
                 cheap = decide(a.stats, b.stats, cfg=self.cheaper, z=math.inf)
                 if cheap.accept:
                     v, path = Verdict.PASS, "cheaper"
-            tr.state = CandidateState(c, v, j, acc, _r(d.efficacy(j)), _r(d.futility_bound(j)),
-                                      env, suspect, path, tuple(tr.skipped), cheap)
+            tr.state = CandidateState(c, v, j, acc, _r(lb.efficacy), _r(lb.futility), env, suspect, path,
+                                      tuple(tr.skipped), cheap, lb.fraction)
             if v is not Verdict.CONTINUE:
                 return True
         return False
