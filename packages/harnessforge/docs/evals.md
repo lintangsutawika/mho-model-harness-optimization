@@ -12,6 +12,7 @@ candidates on Harbor tasks, plus a `FakeBackend` for other workstreams' tests.
 | `dataset` | copies the requested tasks, giving Dockerfile-only tasks their `FROM` image | stdlib |
 | `fake` | `FakeBackend`: scripted rewards, simulated clock, task-major, stop | stdlib |
 | `jobs` | `eval_node_job`: the PBS job an evaluation runs in (`contracts.JobSpec`) | stdlib |
+| `ctxcap` | an OpenAI-compatible proxy that enforces a context window (training's end-at-limit rule) in front of a hosted endpoint | aiohttp, transformers (in the evals venv) |
 | `harbor_export` | platoon run dirs -> harbor-compatible trial dirs (result.json, agent/, verifier/) for harbor-era readers | stdlib |
 | `__main__` | `python -m harnessforge.evals run REQUEST.json [--harbor-export DIR]` / `export` / `stage-images` | stdlib |
 
@@ -171,6 +172,29 @@ four identical jobs `base-hpcsb-t7200/a1..a4` of the same day; after = `sandbox-
 
 The rest of the trial is unchanged (NonZeroAgentExitCodeError 45 vs 38-44, AgentTimeoutError 6 vs 0-4: the
 agent's own behaviour). A trial now reaches its agent about two minutes after launch at worst instead of up to ten.
+
+## A context-window cap for hosted evaluations (`ctxcap`)
+
+Training enforces its window at rollout in platoon's gateway (`train.context_window_length`; with
+`platoon-tito2.patch` a prompt that leaves less than `min(2048, max_tokens)` ends the trajectory, graded). A hosted
+evaluation has no cap: platoon leaves the window to the provider, and the pool's engines serve 262144 tokens.
+`python -m harnessforge.evals.ctxcap` is an OpenAI-compatible proxy that applies the training rule per request, so an
+evaluation runs at the training window without restarting (or capping) the pool:
+
+```bash
+python -m harnessforge.evals.ctxcap --upstream http://<router>:30000 --tokenizer <HF snapshot of the served model> \
+    --window 65536 --min-completion 2048 --port 0 --url-file ctxcap.url --stats ctxcap.json &
+# EvalRequest.endpoint = $(cat ctxcap.url)   (http://127.0.0.1:<port>/v1)
+```
+
+- Each chat request is rendered and counted with the model's chat template as SGLang renders it (tool-call arguments
+  parsed, tools as function dicts, the request's `chat_template_kwargs`), in `--workers` processes.
+- `room = window - prompt - margin`. `room < min(min_completion, max_tokens)`: HTTP 400 with the OpenAI/vLLM wording
+  ("This model's maximum context length is ..."). platoon's hosted gateway counts it as a context overflow and grades
+  the rollout (`scored:context_overflow`); litellm raises `ContextWindowExceededError`, on which micro-swe-agent aborts.
+  Otherwise `max_tokens` is clamped to `room`, as platoon's `fit_max_tokens` does.
+- `--stats` reports calls, clamped, refused, render time and the count's error against the engine's own
+  `usage.prompt_tokens` (`est_minus_engine`), which says whether a `--margin` is needed.
 
 ## Records and the outcome -> env_failed mapping
 
