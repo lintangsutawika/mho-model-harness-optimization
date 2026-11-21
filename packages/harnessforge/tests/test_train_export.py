@@ -197,3 +197,26 @@ def test_resumed_stream_steps_continue(tmp_path):
     assert sorted(p.name for p in (tmp_path / "hf").glob("step_*")) == ["step_20", "step_21", "step_22"]
     (deltas.parent / "stream_base.json").write_text(json.dumps({"stream": "other", "batch": 20}))
     assert ex.step_of(3) == 2                          # a stale marker for another stream is ignored
+
+
+def test_stream_id_is_stable_while_versions_are_added(tmp_path):
+    """The bug: the id used the delta dir's ctime, which changes when a version dir is added, so the exporter
+    rebuilt from the base over and over (v2: a rebuild every ~10 versions; the final export took > 1 h)."""
+    import os
+    import time
+    from harnessforge.train.export import DeltaExporter
+    deltas = tmp_path / "deltas"
+    (deltas / "weight_v000001").mkdir(parents=True)
+    ex = DeltaExporter(base=".", deltas=deltas, work=tmp_path / "w", out=tmp_path / "o")
+    sid = ex.stream_id()
+    ctime = os.stat(deltas).st_ctime
+    time.sleep(1.1)
+    (deltas / "weight_v000002").mkdir()                          # a new version is published
+    assert int(os.stat(deltas).st_ctime) != int(ctime)          # the dir's ctime moved (what the old id used)
+    assert ex.stream_id() == sid                                 # the stream did not change
+    # a new gateway: miles recreates the dir -> a new stream (the old dir moved aside, so no inode is reused)
+    fresh = tmp_path / "fresh"
+    (fresh / "weight_v000001").mkdir(parents=True)
+    deltas.rename(tmp_path / "old-deltas")
+    fresh.rename(deltas)
+    assert ex.stream_id() != sid

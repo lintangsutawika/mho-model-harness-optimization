@@ -175,12 +175,20 @@ class DeltaExporter:
         self._set_version(0)
 
     def stream_id(self) -> str:
-        """miles recreates the delta dir at every gateway start (a new stream from version 0)."""
+        """miles recreates the delta dir at every gateway start (a new stream from version 0): the dir's inode, and
+        the inode of its first version dir (an inode can be reused by a recreated dir; both together rarely are).
+        Not the dir's ctime: that changes whenever a version is added or removed, which made every later poll see
+        a "new stream" and rebuild the export from the base (a full replay, ~14 s per version)."""
         try:
             st = os.stat(self.deltas)
-            return f"{st.st_ino}-{int(st.st_ctime)}"
         except FileNotFoundError:
             return ""
+        first = sorted(Path(self.deltas).glob("weight_v*"))
+        try:
+            first_ino = os.stat(first[0]).st_ino if first else 0
+        except FileNotFoundError:
+            first_ino = 0
+        return f"{st.st_dev}-{st.st_ino}-{first_ino}"
 
     def ensure(self) -> None:
         try:
