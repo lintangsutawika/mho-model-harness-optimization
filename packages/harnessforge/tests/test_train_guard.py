@@ -401,3 +401,43 @@ def test_cancel_trace_names_the_timeout_site(tmp_path):
     log = next(tmp_path.glob("cancels.*.txt")).read_text()
     assert "_on_timeout" in log and "the asyncio.Timeout was created at" in log
     assert "in stale_timeout_owner" in log and "its state:" in log
+
+
+def test_stall_guard_counts_the_trainer_heartbeat_as_progress(tmp_path):
+    log = tmp_path / "platoon.log"
+    log.write_text("x | INFO | platoon.train.step.step | Step 199/200 | Epoch 0\n")
+    now = [0.0]
+    g = G.StallGuard(log, timeout=100, startup_grace=0, clock=lambda: now[0])
+    g.offset = 0
+    assert g.poll() is None and g.last_step == 199
+    for t in range(60, 600, 60):                       # a long final forward_backward, reported every minute
+        now[0] = float(t)
+        with open(log, "a") as f:
+            f.write(f"x | INFO | platoon.train.trainer.waiting | Still waiting for forward_backward (microbatch 0)... ({t}s elapsed)\n")
+        assert g.poll() is None
+    now[0] += 101                                       # then silence: a real stall
+    assert g.poll() == "stall" and g.last_step == 199
+
+
+def test_stall_guard_heartbeat_past_the_ceiling_is_a_stall(tmp_path):
+    """A forward_backward that never returns keeps platoon heartbeating; past the ceiling that is a hang."""
+    log = tmp_path / "platoon.log"
+    log.write_text("x | INFO | platoon.train.step.step | Step 34/200 | Epoch 0\n")
+    now = [0.0]
+    g = G.StallGuard(log, timeout=100, startup_grace=0, clock=lambda: now[0], wait_ceiling=300)
+    g.offset = 0
+    assert g.poll() is None
+    fired = None
+    for t in range(60, 1200, 60):
+        now[0] = float(t)
+        with open(log, "a") as f:
+            f.write(f"x | INFO | platoon.train.trainer.waiting | Still waiting for forward_backward (microbatch 0)... ({t}s elapsed)\n")
+        if g.poll() == "stall":
+            fired = t
+            break
+    assert fired is not None and 300 < fired <= 300 + 100 + 60       # heartbeats past 300 s no longer count
+
+
+def test_driver_passes_the_wait_ceiling():
+    import inspect
+    assert "stall_wait_ceiling" in inspect.getsource(D.run_driver_job)

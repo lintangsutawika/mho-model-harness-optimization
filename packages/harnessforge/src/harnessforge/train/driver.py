@@ -411,7 +411,8 @@ def run_driver_job(run_dir: str | Path) -> int:
         t0 = time.time()
         with open(P.logs / "platoon.log", "ab") as out:
             guard = StallGuard(P.logs / "platoon.log", float(run.driver.get("stall_timeout", 1200)),
-                               float(run.driver.get("stall_startup_grace", 3600)))
+                               float(run.driver.get("stall_startup_grace", 3600)),
+                               wait_ceiling=float(run.driver.get("stall_wait_ceiling", 3600)))
             platoon_proc = subprocess.Popen([platoon, "train", str(cfg)], env=env, stdout=out,
                                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                             cwd=str(run.dir), start_new_session=True)
