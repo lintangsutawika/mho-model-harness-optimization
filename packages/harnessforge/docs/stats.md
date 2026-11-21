@@ -8,8 +8,10 @@ for the calibration CLI.
 | module | what it does |
 |---|---|
 | `paired.py` | per-task paired statistics (`paired`), fixed-sample `decide` (better path; optional cheaper path) |
-| `looks.py` | `LookSchedule` for both `Order`s, `collect` (one candidate's data for one look, with readiness) |
-| `boundaries.py` | `Design`: O'Brien-Fleming efficacy, non-binding futility, final look; `Verdict` |
+| `looks.py` | `LookSchedule` for both `Order`s (trial looks and general look plans for ATTEMPT_MAJOR), `collect` (one candidate's data for one look, with readiness) |
+| `information.py` | `Information(tau2, sigma2)`: planned information I(k) = n / (tau2 + sigma2 / k), `VAL200` |
+| `boundaries.py` | `Design`: O'Brien-Fleming efficacy c / sqrt(tau), non-binding futility, final look; `LookBounds`, `Verdict` |
+| `spending.py` | `SpendingDesign`: Lan-DeMets alpha spending on planned or observed information (section 7) |
 | `calibrate.py` | Monte Carlo calibration (`simulate`, `Simulation.c_for`, `.operating`) and the CLI |
 | `race.py` | `Race`: K candidates vs one reference, run concurrently, as a pure state machine |
 | `gate.py` | `ValGate`: candidate vs current best on the val split (a one-candidate race) |
@@ -34,6 +36,8 @@ launched; a trial never launched has no record) and that record is finished.
 |---|---|---|
 | `ATTEMPT_MAJOR` (harbor) | trials with index < r of **every** task, r = 1..K | r / K |
 | `TASK_MAJOR` (platoon) | **all** trials of the first n_j tasks of `EvalRequest.tasks` (checkpoints, default 25/50/75/100%) | n_j / N |
+| `ATTEMPT_MAJOR` + `trial_looks=(2, 4, 8, 24)` | trials with index < k_j of every task | I(k_j) / I(K) with `information`, else k_j / K |
+| `ATTEMPT_MAJOR` + `plan` | per look, k trials of each task listed (segments over the task order; looks add tasks, trials, or both) | sum of per-task information, section 7 |
 
 **The bias argument.** Trial duration and outcome are correlated: slow trials are mostly
 timeouts, and timeouts are mostly failures. If a look used "whatever has finished so far", early

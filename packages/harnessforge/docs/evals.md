@@ -5,7 +5,7 @@ candidates on Harbor tasks, plus a `FakeBackend` for other workstreams' tests.
 
 | Module | What | Needs |
 |---|---|---|
-| `backend` | `PlatoonBackend` / `PlatoonRun`: one `platoon eval` process per candidate, TASK_MAJOR, per-candidate stop | stdlib (spawns platoon) |
+| `backend` | `PlatoonBackend` / `PlatoonRun`: one `platoon eval` process per candidate, TASK_MAJOR (or look-major via unit aliases), per-candidate stop | stdlib (spawns platoon) |
 | `reader` | rollout directories -> `TrialRecord`s, finished and in-flight; the outcome -> `env_failed` mapping | stdlib |
 | `harness` | a candidate dir as a platoon harness spec (toolchain + read-only mount); `assets/` holds the runner and the toolchain recipe | stdlib |
 | `pods` | a platoon sandbox provider that runs every task sandbox as a one-service hpc-sandbox pod | platoon[hpc] |
@@ -93,6 +93,19 @@ Found by reading the old trial logs and probing the pilot images (`probe.py` in 
 semaphore of `num_concurrent_workers`, so trials launch **task-major** in the order of the split manifest, which the
 backend writes as `EvalRequest.tasks`. `PlatoonRun.order` is `Order.TASK_MAJOR`; a look's task prefix is a prefix of
 `EvalRequest.tasks`. Shuffle that list once, up front.
+
+**Attempt-major / look-major launch** (`options: {"order": "attempt_major", "trial_looks": [2, 4, 8, 24]}`, or a
+`"plan"` as in `stats.LookSchedule`): platoon has no attempt-major mode, so the backend gives every unit (task, trial
+index) a task name of its own, `<task>__hfa<index>`, in a `registry.json` of the materialized dataset that points each
+alias at the task's one directory (platoon resolves dataset names through the registry, so nothing is copied). The
+split lists the aliases in `LookSchedule.launch_order()` (look by look; within a look by trial index, then task) with
+`num_rollouts_per_task = 1`, so the FIFO semaphore launches the units in exactly that order. `RolloutReader` maps each
+alias back to (task, index); `PlatoonRun.order` is `Order.ATTEMPT_MAJOR`; request.json records `order` and the looks,
+which `race_run` and `FileRun` read. Needs `materialize` (the default). Not yet: `harbor_export` of such a run (its
+trial and task paths would be the aliases). Not validated against a real platoon yet (the fake platoon fixture runs it):
+check on the first ABCI run that platoon 0.6's `HarborDataset` accepts the registry's many names for one directory
+(its code does: `read_registry` + `_dirs[name]`, no uniqueness check on paths) and that the rollout directories are
+named by alias.
 
 **One platoon process per candidate**, each with `EvalRequest.concurrency` trials in flight. platoon's runner has no
 way to stop one environment entry while the others go on (its stop ends the evaluation), and its SIGTERM path stops

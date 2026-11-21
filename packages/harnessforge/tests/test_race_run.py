@@ -184,3 +184,36 @@ def test_reverse_replay_after_a_stop_does_not_use_cancelled_units():
     rev = replay(driver.records, Race("B", ["A"], sched))
     looks = [e["look"] for e in rev["timeline"]]
     assert max(looks) <= s["decisions"]["states"]["B"]["look"]
+
+
+def test_attempt_major_trial_looks_drive_and_replay(tmp_path):
+    """A look-major evaluation with trial looks: the race uses a spending design, decides on whole rounds of trials,
+    and an offline replay reproduces the live decision."""
+    from harnessforge.stats.information import VAL200
+    from harnessforge.stats.spending import SpendingDesign
+    backend = FakeBackend({"A": A_REWARDS, "B": B_BETTER}, seed=0)
+    tasks = shuffled()
+    req = EvalRequest("r", [Candidate("A", "a"), Candidate("B", "b")], tasks, "ds", 8, "http://x/v1",
+                      concurrency=8, options={"order": "attempt_major", "trial_looks": [2, 4, 8]})
+    run = backend.start(req)
+    assert run.order is Order.ATTEMPT_MAJOR
+    sched = LookSchedule(run.order, tuple(tasks), 8, trial_looks=(2, 4, 8), information=VAL200)
+    race = Race("A", ["B"], sched)
+    assert isinstance(race.design, SpendingDesign)
+    driver, s, logs = drive(run, race)
+    st = s["decisions"]["states"]["B"]
+    assert st["verdict"] == "pass" and st["look"] == 1 and st["fraction"] is not None
+    e = s["timeline"][0]
+    assert e["trials"] == 2 and e["units"] == 2 * N and e["info_fraction"] == pytest.approx(st["fraction"], abs=1e-3)
+    assert s["design"]["kind"] == "spending"
+    rep = replay(driver.records, Race("A", ["B"], sched))
+    assert rep["decisions"]["states"]["B"]["verdict"] == "pass" and rep["decisions"]["states"]["B"]["look"] == 1
+    # CLI replay with the trial looks
+    recs = tmp_path / "r.jsonl"
+    write_jsonl(recs, driver.records)
+    (tmp_path / "req.json").write_text(json.dumps({"tasks": tasks, "trials": 8, "order": "attempt_major",
+                                                   "trial_looks": [2, 4, 8]}))
+    assert main(["replay", str(recs), "--tasks", str(tmp_path / "req.json"), "--reference", "A",
+                 "--out", str(tmp_path / "rep.json")]) == 0
+    out = json.loads((tmp_path / "rep.json").read_text())
+    assert out["design"]["kind"] == "spending" and out["decisions"]["states"]["B"]["verdict"] == "pass"

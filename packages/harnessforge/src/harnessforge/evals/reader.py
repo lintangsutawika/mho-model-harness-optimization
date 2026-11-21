@@ -140,12 +140,16 @@ class RolloutReader:
     change once metadata.json exists), so polling a long run stays cheap."""
 
     def __init__(self, output_dir: str | Path, candidate: str, *, policy: str | None = None,
-                 tasks: Iterable[str] | None = None) -> None:
+                 tasks: Iterable[str] | None = None,
+                 aliases: Mapping[str, tuple[str, int]] | None = None) -> None:
         self.output_dir = Path(output_dir)
         self.candidate = candidate
         self.policy = policy
         # safe dir name -> task id, for in-flight trials (which have no metadata naming their task yet)
         self._task_of = {safe_task_id(t): t for t in (tasks or ())}
+        # a look-major launch (PlatoonBackend option order): task name -> the (task, index) unit it runs
+        self._aliases = dict(aliases or {})
+        self._alias_of = {safe_task_id(a): unit for a, unit in self._aliases.items()}
         self._finished: dict[Path, TrialRecord] = {}
 
     def records(self, *, stopped: bool = False) -> list[TrialRecord]:
@@ -168,11 +172,14 @@ class RolloutReader:
         return out
 
     def _read(self, trial_dir: Path, safe_task: str, index: int, stopped: bool) -> TrialRecord | None:
+        task = ""
         meta_path = trial_dir / METADATA
         metadata = _load_json(meta_path) if meta_path.exists() else None
+        if safe_task in self._alias_of:
+            task, index = self._alias_of[safe_task]
         if not isinstance(metadata, Mapping):
             # Not finished (or metadata.json is being written: the next poll reads it).
-            task = self._task_of.get(safe_task, safe_task)
+            task = task if safe_task in self._alias_of else self._task_of.get(safe_task, safe_task)
             try:
                 started = trial_dir.stat().st_mtime
             except OSError:
@@ -181,7 +188,11 @@ class RolloutReader:
                 return TrialRecord(self.candidate, task, index, True, env_failed=True, error="stopped",
                                    started_at=started, policy=self.policy)
             return TrialRecord(self.candidate, task, index, False, started_at=started, policy=self.policy)
-        task = str(metadata.get("task_id") or self._task_of.get(safe_task, safe_task))
+        unit = self._aliases.get(str(metadata.get("task_id"))) or self._alias_of.get(safe_task)
+        if unit is not None:
+            task, index = unit
+        else:
+            task = str(metadata.get("task_id") or self._task_of.get(safe_task, safe_task))
         root = root_trajectory(_load_json(trial_dir / COLLECTION))
         verdict = classify(metadata, root)
         wall = metadata.get("wall_time_seconds")
@@ -204,7 +215,8 @@ class RolloutReader:
             extra["steps"] = len(root.get("steps") or [])
         usage = metadata.get("usage")
         record = TrialRecord(
-            candidate=self.candidate, task=task, index=int(metadata.get("rollout_index", index)), finished=True,
+            candidate=self.candidate, task=task,
+            index=index if unit is not None else int(metadata.get("rollout_index", index)), finished=True,
             reward=verdict.reward, env_failed=verdict.env_failed, error=verdict.error,
             output_tokens=_tokens(usage, "completion_tokens"), input_tokens=_tokens(usage, "prompt_tokens"),
             wall_seconds=wall, started_at=started_at, finished_at=finished_at, policy=self.policy, extra=extra)

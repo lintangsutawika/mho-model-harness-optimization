@@ -50,7 +50,9 @@ from harnessforge.records import TrialRecord, read_jsonl
 from harnessforge.stats.boundaries import Design, Verdict
 from harnessforge.stats.looks import LookSchedule, UnitIndex, collect
 from harnessforge.stats.paired import paired
-from harnessforge.stats.race import Race, RaceStatus, ReferenceMode
+from harnessforge.stats.information import VAL200, Information
+from harnessforge.stats.race import Race, RaceStatus, ReferenceMode, recommended_c
+from harnessforge.stats.spending import SpendingDesign
 
 __all__ = ["FileRun", "RaceDriver", "replay", "side_counts", "snapshot_at"]
 
@@ -241,21 +243,23 @@ def _fmt(x: float | None, nd: int = 4, sign: bool = True) -> str:
 
 def look_entry(idx: UnitIndex, race: Race, c: str, j: int) -> dict[str, Any]:
     """Candidate `c`'s look j against the race's reference: the units, the paired statistic and the bounds."""
-    design, sched = race.design, race.schedule
+    sched = race.schedule
     look = sched.look(j)
     b = collect(idx, c, look)
     ref_look = sched.full(look) if race.reference_mode is ReferenceMode.ALL_TRIALS else look
     a = collect(idx, race.reference, ref_look)
-    acc = paired(a.stats, b.stats) if a.ready and b.ready else None
+    acc = (paired(a.stats, b.stats, weights=sched.weights(look, race.reference_mode is ReferenceMode.ALL_TRIALS))
+           if a.ready and b.ready else None)
     t = acc.t if acc else None
     env = max(a.env_fail_frac, b.env_fail_frac)
-    skipped = (race.max_env_fail is not None and env > race.max_env_fail and not design.is_final(j))
-    verdict = Verdict.CONTINUE if skipped else design.verdict(j, t)
-    return {"candidate": c, "look": j, "tasks": len(look.tasks), "fraction": _r(look.fraction),
-            "units": look.size, "paired_tasks": acc.n if acc else 0,
+    lb = race.look_bounds(c, j)
+    skipped = race.max_env_fail is not None and env > race.max_env_fail and not lb.final
+    verdict = Verdict.CONTINUE if skipped else lb.verdict(t)
+    return {"candidate": c, "look": j, "tasks": len(look.tasks), "trials": look.trials, "fraction": _r(look.fraction),
+            "info_fraction": _r(lb.fraction), "units": look.size, "paired_tasks": acc.n if acc else 0,
             "acc_ref": _r(acc.mean_a) if acc else None, "acc_cand": _r(acc.mean_b) if acc else None,
             "d": _r(acc.d) if acc else None, "se": _r(acc.se) if acc else None, "t": _r(t, 3),
-            "efficacy": _r(design.efficacy(j), 3), "futility": _r(design.futility_bound(j), 3),
+            "efficacy": _r(lb.efficacy, 3), "futility": _r(lb.futility, 3),
             "verdict": verdict.value, "env_fail_frac": _r(env), "skipped": skipped}
 
 
@@ -319,13 +323,23 @@ def replay(records: Sequence[TrialRecord], race: Race) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------------------------------- FileRun
 class FileRun:
-    """EvalRun over `python -m harnessforge.evals run` jobs (one per side, possibly on different nodes)."""
+    """EvalRun over `python -m harnessforge.evals run` jobs (one per side, possibly on different nodes). The launch
+    order is the sides' request.json "order" (written by the evals CLI; default task_major)."""
 
-    order = Order.TASK_MAJOR
-
-    def __init__(self, sides: Mapping[str, str | Path], *, poll_s: float = 5.0) -> None:
+    def __init__(self, sides: Mapping[str, str | Path], *, poll_s: float = 5.0, order: Order | str | None = None) -> None:
         self.sides = {c: Path(d) for c, d in sides.items()}
         self.poll_s = poll_s
+        if order is None:
+            orders = set()
+            for d in self.sides.values():
+                try:
+                    orders.add(json.loads((d / "request.json").read_text()).get("order") or Order.TASK_MAJOR.value)
+                except (OSError, ValueError):
+                    orders.add(Order.TASK_MAJOR.value)
+            if len(orders) > 1:
+                raise ValueError(f"the sides were launched in different orders: {sorted(orders)}")
+            order = orders.pop() if orders else Order.TASK_MAJOR
+        self.order = Order(order)
 
     def records(self) -> list[TrialRecord]:
         out: list[TrialRecord] = []
@@ -362,18 +376,47 @@ class FileRun:
 
 
 # ---------------------------------------------------------------------------------------------------- CLI
-def _schedule_from(request_json: Path, checkpoints: Sequence[float]) -> LookSchedule:
+def _schedule_from(request_json: Path, a: argparse.Namespace, order: Order | None = None) -> LookSchedule:
     raw = json.loads(request_json.read_text())
-    return LookSchedule(Order.TASK_MAJOR, tuple(raw["tasks"]), int(raw["trials"]), tuple(checkpoints))
+    order = Order(order or getattr(a, "order", None) or raw.get("order") or Order.TASK_MAJOR)
+    return _schedule(order, tuple(raw["tasks"]), int(raw["trials"]), a, raw)
 
 
-def _design(schedule: LookSchedule, c: float | None) -> Design | None:
-    """None: the race picks `recommended_c` for its schedule and mode."""
-    return None if c is None else Design.for_schedule(schedule, c=c)
+def _schedule(order: Order, tasks: Sequence[str], trials: int, a: argparse.Namespace,
+              raw: Mapping[str, Any] | None = None) -> LookSchedule:
+    """The race's schedule: --trial-looks / --plan, else the request's own (options trial_looks / plan)."""
+    checkpoints = tuple(float(x) for x in a.checkpoints.split(","))
+    if order is not Order.ATTEMPT_MAJOR:
+        return LookSchedule(order, tuple(tasks), trials, checkpoints)
+    raw = raw or {}
+    raw = {**raw, **raw.get("options", {})}
+    looks = (tuple(int(x) for x in a.trial_looks.split(",")) if a.trial_looks
+             else tuple(raw["trial_looks"]) if raw.get("trial_looks") and not a.plan else None)
+    plan = (parse_plan(a.plan) if a.plan else tuple(tuple(tuple(seg) for seg in lk) for lk in raw["plan"])
+            if raw.get("plan") and not a.trial_looks else None)
+    info = Information(a.tau2, a.sigma2) if (looks or plan) and a.sigma2 > 0 else None
+    return LookSchedule(order, tuple(tasks), trials, checkpoints, looks, info, plan)
+
+
+def parse_plan(text: str) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """'50x2;50x2,100x4;50x2,100x4,150x8;50x2,100x4,150x8,200x24': looks separated by ';', each a list of
+    END x TRIALS segments over the ordered tasks (see LookSchedule.plan)."""
+    return tuple(tuple(tuple(int(v) for v in seg.split("x")) for seg in look.split(","))  # type: ignore[misc]
+                 for look in text.split(";") if look.strip())
+
+
+def _design(schedule: LookSchedule, a: argparse.Namespace) -> Any:
+    """None: the race picks its default (`race.default_design`) for the schedule and mode."""
+    if a.design == "obf" or a.c is not None:
+        return Design.for_schedule(schedule, c=a.c if a.c is not None else recommended_c(schedule, a.mode),
+                                   first_efficacy=1 if schedule.planned else 2)
+    if a.design == "spending":
+        return SpendingDesign.for_schedule(schedule, alpha=a.alpha, spending=a.spending, observed=not a.planned,
+                                           all_trials_reference=ReferenceMode(a.mode) is ReferenceMode.ALL_TRIALS)
+    return None
 
 
 def cmd_drive(a: argparse.Namespace) -> int:
-    checkpoints = tuple(float(x) for x in a.checkpoints.split(","))
     mode = ReferenceMode(a.mode)
     if a.request:
         from harnessforge.evals.__main__ import load_request
@@ -381,25 +424,25 @@ def cmd_drive(a: argparse.Namespace) -> int:
         request, raw = load_request(a.request)
         backend = PlatoonBackend(platoon=raw.get("platoon", "platoon"), site=raw.get("site"))
         run: Any = backend.start(request)
-        schedule = LookSchedule(run.order, tuple(request.tasks), request.trials, checkpoints)
+        schedule = _schedule(Order(run.order), request.tasks, request.trials, a, raw)
         ids = [c.id for c in request.candidates]
     else:
         sides = dict(s.split("=", 1) for s in a.side)
         run = FileRun(sides)
-        schedules = {c: _schedule_from(Path(d) / "request.json", checkpoints) for c, d in sides.items()}
+        schedules = {c: _schedule_from(Path(d) / "request.json", a, run.order) for c, d in sides.items()}
         schedule = next(iter(schedules.values()))
         if any(s != schedule for s in schedules.values()):
             raise SystemExit("the sides' requests differ in tasks or trials")
         ids = list(sides)
     cands = a.candidates.split(",") if a.candidates else [c for c in ids if c != a.reference]
-    race = Race(a.reference, cands, schedule, _design(schedule, a.c), reference_mode=mode,
+    race = Race(a.reference, cands, schedule, _design(schedule, a), reference_mode=mode,
                 max_env_fail=a.max_env_fail)
     out = Path(a.out)
     driver = RaceDriver(run, race, poll_s=a.poll, drain_timeout_s=a.drain_timeout,
                         summary_path=out, records_path=out.with_name(out.stem + ".records.jsonl"))
     summary = driver.drive()
     if a.reverse:
-        rev = Race(cands[0], [a.reference], schedule, _design(schedule, a.c), reference_mode=mode,
+        rev = Race(cands[0], [a.reference], schedule, _design(schedule, a), reference_mode=mode,
                    max_env_fail=a.max_env_fail)
         summary["reverse"] = replay(driver.records, rev)
         driver._write(summary)
@@ -410,12 +453,11 @@ def cmd_drive(a: argparse.Namespace) -> int:
 
 
 def cmd_replay(a: argparse.Namespace) -> int:
-    checkpoints = tuple(float(x) for x in a.checkpoints.split(","))
     mode = ReferenceMode(a.mode)
     records = [r for p in a.records for r in read_jsonl(p)]
-    schedule = _schedule_from(Path(a.tasks), checkpoints)
+    schedule = _schedule_from(Path(a.tasks), a)
     cands = a.candidates.split(",") if a.candidates else sorted({r.candidate for r in records} - {a.reference})
-    race = Race(a.reference, cands, schedule, _design(schedule, a.c), reference_mode=mode,
+    race = Race(a.reference, cands, schedule, _design(schedule, a), reference_mode=mode,
                 max_env_fail=a.max_env_fail)
     result = replay(records, race)
     text = json.dumps(result, indent=1)
@@ -438,8 +480,20 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--candidates", help="comma-separated (default: every other side)")
         s.add_argument("--checkpoints", default="0.25,0.5,0.75,1")
         s.add_argument("--mode", default=ReferenceMode.SAME_UNITS.value, choices=[m.value for m in ReferenceMode])
-        s.add_argument("--c", type=float, help="efficacy constant (default: race.recommended_c)")
+        s.add_argument("--c", type=float, help="efficacy constant of the c/sqrt(tau) design (implies --design obf)")
         s.add_argument("--max-env-fail", type=float)
+        s.add_argument("--trial-looks", help="ATTEMPT_MAJOR: trials per task at each look, e.g. 2,4,8,24")
+        s.add_argument("--plan", help="ATTEMPT_MAJOR look plan, e.g. '100x1;200x2;200x8;200x24' (see parse_plan)")
+        s.add_argument("--tau2", type=float, default=VAL200.tau2,
+                       help="planning effect heterogeneity for information fractions (default: val200)")
+        s.add_argument("--sigma2", type=float, default=VAL200.sigma2,
+                       help="planning per-trial variance, both sides (default: val200; 0 = fractions k/K)")
+        s.add_argument("--design", default="auto", choices=["auto", "obf", "spending"],
+                       help="auto: race.default_design (spending for --trial-looks, else c/sqrt(tau))")
+        s.add_argument("--alpha", type=float, default=0.05, help="spending design: one-sided alpha")
+        s.add_argument("--spending", default="obf", help="spending design: obf, pocock or power:R")
+        s.add_argument("--planned", action="store_true",
+                       help="spending design: planned information fractions instead of observed")
         if name == "drive":
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--request", help="start PlatoonBackend on this request in-process")
@@ -452,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             s.add_argument("records", nargs="+")
             s.add_argument("--tasks", required=True, help="a request.json (tasks, trials)")
+            s.add_argument("--order", choices=[o.value for o in Order],
+                           help="the evaluation's launch order (default: the request's \"order\", else task_major)")
             s.add_argument("--out")
     a = p.parse_args(argv)
     return {"drive": cmd_drive, "replay": cmd_replay}[a.cmd](a)

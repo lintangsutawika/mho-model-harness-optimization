@@ -42,6 +42,7 @@ from typing import Any, Mapping, Sequence
 from harnessforge.contracts import Order
 from harnessforge.records import read_jsonl
 from harnessforge.stats.boundaries import Design, Verdict
+from harnessforge.stats.information import Information
 from harnessforge.stats.looks import DEFAULT_CHECKPOINTS, LookSchedule
 
 __all__ = ["Operating", "Simulation", "load_rates", "simulate", "smoothed_rates"]
@@ -231,8 +232,10 @@ def _simulate_numpy(pa, pb, order, trials, counts, same, ra, sims, seed):
 def simulate(rates: Sequence[float], *, order: Order | str = Order.ATTEMPT_MAJOR,
              trials: int = 5, checkpoints: Sequence[float] = DEFAULT_CHECKPOINTS,
              reference: str = "all", reference_trials: int | None = None, shift: float = 0.0,
-             sims: int = 2000, seed: int = 0, backend: str = "python") -> Simulation:
-    """Simulate paired t at every look (see module docstring)."""
+             sims: int = 2000, seed: int = 0, backend: str = "python",
+             trial_looks: Sequence[int] | None = None, information: Information | None = None) -> Simulation:
+    """Simulate paired t at every look (see module docstring). ATTEMPT_MAJOR: `trial_looks` picks the looks
+    (trials per task; default every trial) and `information` makes their fractions I(k_j) / I(K)."""
     order = Order(order)
     if reference not in ("all", "same"):
         raise ValueError("reference must be 'all' or 'same'")
@@ -240,8 +243,13 @@ def simulate(rates: Sequence[float], *, order: Order | str = Order.ATTEMPT_MAJOR
     pa = [min(max(p, 0.0), 1.0) for p in rates]
     pb = [_shifted(p, shift) if shift else p for p in pa]
     counts = _counts(order, len(pa), trials, checkpoints)
-    fractions = (tuple(r / trials for r in range(1, trials + 1)) if order is Order.ATTEMPT_MAJOR
-                 else tuple(c / len(pa) for c in counts))
+    if order is Order.ATTEMPT_MAJOR:
+        sched = LookSchedule(order, tuple(map(str, range(len(pa)))), trials,
+                             trial_looks=None if trial_looks is None else tuple(trial_looks),
+                             information=information)
+        fractions, picks = sched.fractions, [k - 1 for k in sched.trial_counts]
+    else:
+        fractions, picks = tuple(c / len(pa) for c in counts), None
     if backend == "auto":
         try:
             import numpy  # noqa: F401
@@ -250,6 +258,8 @@ def simulate(rates: Sequence[float], *, order: Order | str = Order.ATTEMPT_MAJOR
             backend = "python"
     fn = _simulate_numpy if backend == "numpy" else _simulate_python
     t = fn(pa, pb, order, trials, counts, reference == "same", ra, sims, seed)
+    if picks is not None and len(picks) != trials:
+        t = [[row[k] for k in picks] for row in t]
     return Simulation(fractions, t, sum(pa) / len(pa), sum(pb) / len(pb))
 
 
@@ -277,6 +287,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--checkpoints", type=_floats, default=DEFAULT_CHECKPOINTS,
                     help="TASK_MAJOR look checkpoints (fractions of the task list)")
+    ap.add_argument("--trial-looks", type=lambda s: tuple(int(x) for x in s.split(",")),
+                    help="ATTEMPT_MAJOR looks at these trials per task (e.g. 2,4,8,24)")
+    ap.add_argument("--tau2", type=float, help="with --trial-looks: planning tau2 for information fractions")
+    ap.add_argument("--sigma2", type=float, help="with --trial-looks: planning sigma2 (both sides)")
     ap.add_argument("--reference", default="all", choices=["all", "same"])
     ap.add_argument("--reference-trials", type=int)
     ap.add_argument("--alpha", type=float, default=0.05)
@@ -296,9 +310,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     rates = load_rates(a.rewards, a.candidate)
+    info = Information(a.tau2 or 0.0, a.sigma2) if a.sigma2 else None
     kw: dict[str, Any] = dict(order=a.order, trials=a.trials, checkpoints=a.checkpoints,
                               reference=a.reference, reference_trials=a.reference_trials,
-                              sims=a.sims, backend=a.backend)
+                              sims=a.sims, backend=a.backend, trial_looks=a.trial_looks,
+                              information=info)
     null = simulate(rates, shift=0.0, seed=a.seed, **kw)
     alpha = a.alpha / a.k
     c_cal = null.c_for(alpha, a.first_efficacy)
@@ -326,7 +342,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name, fut in rules:
             d = Design(null.fractions, c, fut, a.first_efficacy)
             oc = sim.operating(d)
-            extra = (f" ({oc.mean_fraction * a.trials:.2f} of {a.trials} trials/task)"
+            ks = a.trial_looks or tuple(range(1, a.trials + 1))
+            if a.trial_looks and ks[-1] != a.trials:
+                ks = (*ks, a.trials)
+            mean_k = sum(p * k for p, k in zip(oc.stop_looks, ks))
+            extra = (f" ({mean_k:.2f} of {a.trials} trials/task)"
                      if Order(a.order) is Order.ATTEMPT_MAJOR else "")
             print(f"   futility {name:24s} accept {oc.accept:.3f}  mean fraction "
                   f"{oc.mean_fraction:.3f}{extra}")
