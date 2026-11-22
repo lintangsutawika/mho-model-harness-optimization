@@ -177,6 +177,11 @@ def test_lineage_accept_fresh_policy_and_label_chaining(tmp_path):
     assert l1.labels_source()["kind"] == "previous_reference" and l1.labels() == {"a": 0.5}
     _, p2 = l1.accept("B2", weak, [], tasks, 4, fresh="marginal")
     assert p2.fresh and p2.n_units == 8
+    assert l1.accept("B2", strong, [], tasks, 4, fresh="early")[1].fresh            # look 1 <= 2
+    assert not l1.accept("B2", final, [], tasks, 4, fresh="early", n_looks=4)[1].fresh
+    assert l1.accept("B2", final, [], tasks, 4, fresh="always")[1].fresh
+    assert l1.accept("B2", final, [], tasks, 4, fresh="looks")[1].fresh                # look 4 in (1, 2, 4)
+    assert not l1.accept("B2", {**weak, "look": 3}, [], tasks, 4, fresh="looks")[1].fresh
     l1.save(tmp_path / "lin.json")
     assert Lineage.load(tmp_path / "lin.json") == l1
 

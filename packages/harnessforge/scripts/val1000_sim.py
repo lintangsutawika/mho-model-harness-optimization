@@ -6,9 +6,10 @@ planning values, non-binding linear futility -1 + 2.5 t, efficacy from look 1. D
 `SpendingDesign.bounds`, the code a `Race` uses (observed fractions rounded to --resolution).
 
 Model (per replicate):
-  * 1 000 true reference rates p_i drawn from the NPMLE (Kiefer-Wolfowitz, grid of 199 rates) of the val200 seed-harness
-    results (`stats._val200`, successes out of 8): it reproduces val200's mix (35/200 always solved at 8 trials, 47
-    never, 118 mixed; mean 0.50) and its within-task variance (2 E p(1 - p) = sigma2 ~ 0.249);
+  * 1 000 true reference rates p_i drawn from a smoothed NPMLE (EMS, logit grid, smoothing 0.2) of the val200
+    seed-harness results (`stats._val200`, successes out of 8): it reproduces val200's mix (35.6/200 always solved at
+    8 trials vs 35 observed, 45.5 never vs 47, mean 0.503) and its within-task variance (2 E p(1 - p) = 0.247 vs the
+    planning 0.249), with true-rate band mix 0.30 / 0.18 / 0.17 / 0.35;
   * the candidate's rates q_i = logistic(logit p_i + s + b z_i), z ~ N(0, 1), (s, b) solved for the mean true
     difference delta and its variance across tasks tau2 (effect heterogeneity; when the shift alone gives more than
     tau2, b = 0 and the achieved tau2 is reported);
@@ -82,16 +83,23 @@ def logit(p):
 
 
 # ----------------------------------------------------------------------------------------------- population
-def npmle(succ=SUCCESSES, n=TRIALS, iters=5000):
-    grid = np.concatenate([[0.002], np.linspace(0.005, 0.995, 197), [0.998]])
-    s = np.asarray(succ)
+def npmle(succ=SUCCESSES, n=TRIALS, iters=3000, h=0.2):
+    """Smoothed NPMLE (EMS: an EM step for the mixing weights on a 241-point logit grid, then a Gaussian smoothing of
+    width h on the logit scale) of the rate distribution behind val200's successes out of 8."""
     from math import comb
+    lg = np.linspace(math.log(0.002 / 0.998), math.log(0.998 / 0.002), 241)
+    grid = 1.0 / (1.0 + np.exp(-lg))
+    s = np.asarray(succ)
     lik = np.array([[comb(n, k) * g ** k * (1 - g) ** (n - k) for g in grid] for k in s])   # tasks x grid
+    step = lg[1] - lg[0]
+    ker = np.exp(-0.5 * (np.arange(-60, 61) * step / h) ** 2)
+    ker /= ker.sum()
     w = np.full(grid.size, 1.0 / grid.size)
     for _ in range(iters):
         post = lik * w
         post /= post.sum(1, keepdims=True)
-        w = post.mean(0)
+        w = np.convolve(post.mean(0), ker, mode="same")
+        w /= w.sum()
     return grid, w
 
 
@@ -390,6 +398,7 @@ def curse_chunk(args):
     B1_top = rng.binomial(K, q1) / K          # top-up trials of B1 (used where B1 had no gate trials)
     B1_fresh = rng.binomial(K, q1) / K        # a fresh full evaluation of B1
     B2 = rng.binomial(K, q2) / K
+    B2null = rng.binomial(K, q1) / K          # a null second candidate: identical to B1
     L4 = bands_of(rng.binomial(4, p) / 4)     # step-0 labels (independent pass)
     labA = bands_of(A)                        # label chaining for gate 2: the previous reference A
     keys1, keys2 = rng.random((R, N)), rng.random((R, N))
@@ -406,15 +415,15 @@ def curse_chunk(args):
             masks1, ws1 = frontier_masks(L4, keys1, tilt)
             st = [look_stats_frontier(B1 - A, L4, masks1[j], ws1[j]) for j in range(J)]
             D1, se1 = np.stack([x[0] for x in st], 1), np.stack([x[1] for x in st], 1)
-        out[name] = {"D1": D1, "se1": se1, "masks1": masks1, "B2": B2}
+        out[name] = {"D1": D1, "se1": se1, "masks1": masks1}
         # gate 2 inputs for every possible accept look k (reuse) and fresh
         refs = {f"reuse@{k + 1}": np.where(masks1[k], B1, B1_top) for k in range(J)}
         refs["fresh"] = B1_fresh
         res = {}
         if src is not None:
             m2, w2 = frontier_masks(labA, keys2, tilt)
-        for rname, ref in refs.items():
-            d2 = B2 - ref
+        for rname, ref in list(refs.items()) + [(k + "|null", v) for k, v in refs.items()]:
+            d2 = (B2null if rname.endswith("|null") else B2) - ref
             if src is None:
                 u = look_stats_uniform(d2)
                 res[rname] = (np.stack([x[0] for x in u], 1), np.stack([x[1] for x in u], 1),
@@ -424,7 +433,6 @@ def curse_chunk(args):
                 res[rname] = (np.stack([x[0] for x in st], 1), np.stack([x[1] for x in st], 1), (ref - q1).mean(1))
         out[name]["gate2"] = res
         out[name].pop("masks1")
-        out[name].pop("B2")
     return out
 
 
@@ -439,6 +447,7 @@ def main(argv=None) -> int:
     ap.add_argument("--tau2", default="0.0025,0.0081")
     ap.add_argument("--curse-sims", type=int, default=20000)
     ap.add_argument("--curse-designs", default="uniform,frontier L4 tilt 1")
+    ap.add_argument("--only-curse", action="store_true")
     ap.add_argument("--out")
     a = ap.parse_args(argv)
     t0 = time.time()
@@ -460,7 +469,8 @@ def main(argv=None) -> int:
     effects = scenario_effects(tau2s)
     res["effects"] = {k: [float(x) if isinstance(x, (int, float)) else x for x in v] for k, v in effects.items()}
     print("# effects", json.dumps(res["effects"]), flush=True)
-    jobs = [(a.seed * 100000 + i, min(a.chunk, a.sims - lo), effects) for i, lo in enumerate(range(0, a.sims, a.chunk))]
+    jobs = [] if a.only_curse else [(a.seed * 100000 + i, min(a.chunk, a.sims - lo), effects)
+                                    for i, lo in enumerate(range(0, a.sims, a.chunk))]
     stats: dict = {}
     with ProcessPoolExecutor(a.workers) as ex:
         for part in ex.map(worker, jobs):
@@ -475,8 +485,9 @@ def main(argv=None) -> int:
             se = np.concatenate([x[1] for x in parts])
             acc, stop, _, _ = decide(D, se, design)
             row = summarize(acc, stop)
-            acc_nf, stop_nf, _, _ = decide(D, se, design, futility=False)
-            row["accept_nofut"] = float(acc_nf.mean())
+            if sc.startswith("null") or sc.startswith("mixed"):
+                acc_nf, stop_nf, _, _ = decide(D, se, design, futility=False)
+                row["accept_nofut"] = float(acc_nf.mean())
             row["mean_D_look1"] = float(D[:, 0].mean())
             row["sd_D_look1"] = float(D[:, 0].std())
             row["mean_se_look1"] = float(se[:, 0].mean())
@@ -518,7 +529,8 @@ def main(argv=None) -> int:
     if a.out:
         with open(a.out, "w") as f:
             json.dump(res, f, indent=1)
-    print_tables(res)
+    if res["rows"]:
+        print_tables(res)
     print(f"# total {time.time() - t0:.0f} s")
     return 0
 
@@ -550,20 +562,27 @@ def curse_report(parts, designs, design):
                 "P": float(sel.mean()), "n": int(sel.sum()),
                 "D1_hat_pts": float(D1[sel, k].mean() * 100),
                 "ref_bias_pts_reuse": float(bias_r[sel].mean() * 100),
-                "power2_reuse": float(acc_r[sel].mean()), "power2_fresh": float(acc_f[sel].mean())}
+                "power2_reuse": float(acc_r[sel].mean()), "power2_fresh": float(acc_f[sel].mean()),
+                "alpha2_reuse": float(g2[f"reuse@{k + 1}|null"][0][sel].mean()),
+                "alpha2_fresh": float(g2["fresh|null"][0][sel].mean())}
         # policies over all accepts
-        pol = {}
-        acc_f = g2["fresh"][0]
-        reuse_acc = np.zeros_like(acc1)
         reuse_bias = np.zeros(len(acc1))
+        early = acc1 & (stop1 <= 1)
         for k in range(J):
             m = acc1 & (stop1 == k)
-            reuse_acc[m] = g2[f"reuse@{k + 1}"][0][m]
             reuse_bias[m] = g2[f"reuse@{k + 1}"][1][m]
-        pol["never fresh (top-up)"] = float(reuse_acc[acc1].mean())
-        pol["fresh after marginal"] = float(np.where(marginal, acc_f, reuse_acc)[acc1].mean())
-        pol["always fresh"] = float(acc_f[acc1].mean())
-        rows["power2_by_policy"] = pol
+        for tag, sfx in (("power2", ""), ("alpha2", "|null")):
+            acc_f = g2["fresh" + sfx][0]
+            reuse_acc = np.zeros_like(acc1)
+            for k in range(J):
+                m = acc1 & (stop1 == k)
+                reuse_acc[m] = g2[f"reuse@{k + 1}" + sfx][0][m]
+            rows[f"{tag}_by_policy"] = {
+                "never fresh (top-up)": float(reuse_acc[acc1].mean()),
+                "fresh after marginal": float(np.where(marginal, acc_f, reuse_acc)[acc1].mean()),
+                "fresh after early accept (look <= 2)": float(np.where(early, acc_f, reuse_acc)[acc1].mean()),
+                "always fresh": float(acc_f[acc1].mean())}
+        rows["fresh_share"] = {"marginal": float(marginal[acc1].mean()), "early": float(early[acc1].mean())}
         rows["ref_bias_pts_reuse_all_accepts"] = float(reuse_bias[acc1].mean() * 100)
         rows["ref_bias_pts_reuse_marginal"] = float(reuse_bias[marginal].mean() * 100) if marginal.any() else None
         rows["ref_bias_pts_reuse_nonmarginal"] = (float(reuse_bias[acc1 & ~marginal].mean() * 100)

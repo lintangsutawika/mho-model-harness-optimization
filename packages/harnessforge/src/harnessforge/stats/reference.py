@@ -11,10 +11,15 @@ prefix, trials cancelled by the stop, env failures) are run, as a top-up.
 
 Winner's curse. A candidate accepted at an interim look was accepted BECAUSE its trials on that look's tasks came out
 high; reused as a reference, those trials overstate it, and the next candidate's paired differences are biased down on
-those tasks (docs/stats.md section 8: the bias is largest after an accept at look 1 and after a marginal accept).
+those tasks (docs/stats.md section 8.3: +0.26 to +0.40 points after an accept at look 1 or 2, about 0 after look 3,
+and -0.20 points after an accept at the final look).
 `Lineage.accept(..., fresh=...)` can therefore ask for a FRESH full evaluation of the new reference instead of a top-up:
 "never" (always top up), "marginal" (fresh after a marginal accept: at the final look, or t within `margin` of the
-efficacy boundary), "always".
+efficacy boundary), "early" (fresh after an accept at look <= `early_look`, default 2: where the simulation puts the
+upward bias), "looks" (fresh after an accept at one of `fresh_looks`, e.g. (1, 2, 4): every look except the one
+where reuse is unbiased in the simulation), "always". An accept at the FINAL look biases the reused reference DOWNWARD (the candidate was not
+accepted earlier, so its early-look trials came out low), which makes the next gate slightly anti-conservative; only
+"always" removes both directions (section 8.3).
 
 Label chaining. The frontier-weighted look order (`sampling.frontier_order`) needs per-task difficulty labels from data
 NOT used in the comparison. The comparison uses the CURRENT reference's trials, so the labels come from the PREVIOUS
@@ -35,7 +40,7 @@ from harnessforge.records import TrialRecord
 
 __all__ = ["FRESH_POLICIES", "Lineage", "TopUp", "apply_topup", "is_marginal", "topup_plan"]
 
-FRESH_POLICIES = ("never", "marginal", "always")
+FRESH_POLICIES = ("never", "marginal", "early", "looks", "always")
 CANCELLED = frozenset({"stopped", "cancelled"})
 
 
@@ -161,7 +166,8 @@ class Lineage:
         return load_labels(src["path"]) if src["path"] else {}
 
     def accept(self, candidate: str, state: Any, records: Iterable[TrialRecord], tasks: Sequence[str], trials: int,
-               *, fresh: str = "never", margin: float = 0.5, n_looks: int | None = None,
+               *, fresh: str = "never", margin: float = 0.5, n_looks: int | None = None, early_look: int = 2,
+               fresh_looks: Sequence[int] = (1, 2, 4),
                record_files: Sequence[str] = ()) -> tuple["Lineage", TopUp]:
         """`candidate` passed the gate (`state`: its CandidateState): the new lineage (candidate = current, the old
         current = previous) and the top-up plan for the candidate's val trials (a full fresh plan when the `fresh`
@@ -169,7 +175,10 @@ class Lineage:
         if fresh not in FRESH_POLICIES:
             raise ValueError(f"fresh must be one of {FRESH_POLICIES}")
         marginal = is_marginal(state, margin, n_looks)
-        go_fresh = fresh == "always" or (fresh == "marginal" and marginal)
+        look = state.get("look") if isinstance(state, Mapping) else state.look
+        early = look is not None and look <= early_look and not (n_looks is not None and look == n_looks)
+        go_fresh = (fresh == "always" or (fresh == "marginal" and marginal) or (fresh == "early" and early)
+                    or (fresh == "looks" and look in set(fresh_looks)))
         plan = topup_plan(records, candidate, tasks, trials, fresh=go_fresh)
         d = state if isinstance(state, Mapping) else state.as_dict()
         entry = {"accepted": candidate, "over": self.current, "look": d.get("look"),

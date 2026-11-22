@@ -518,7 +518,8 @@ def cmd_accept(a: argparse.Namespace) -> int:
     if state["verdict"] != "pass":
         raise SystemExit(f"{a.candidate} did not pass ({state['verdict']})")
     records = [r for p in a.records for r in read_jsonl(p)]
-    new, plan = lineage.accept(a.candidate, state, records, tasks, trials, fresh=a.fresh, margin=a.margin,
+    new, plan = lineage.accept(a.candidate, state, records, tasks, trials, fresh=a.fresh, margin=a.margin, early_look=a.early_look,
+                               fresh_looks=[int(x) for x in a.fresh_looks.split(",") if x],
                                n_looks=len(race.get("looks") or []) or None, record_files=list(a.records))
     new.save(lp)
     Path(a.out_topup).write_text(json.dumps(plan.as_dict(), indent=1))
@@ -584,7 +585,10 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--records", nargs="+", required=True, help="the candidate's gate records (JSONL)")
     c.add_argument("--tasks", required=True, help="the gate's request.json (tasks, trials)")
     c.add_argument("--fresh", default="never", choices=FRESH_POLICIES,
-                   help="re-evaluate the new reference from scratch: never, after a marginal accept, always")
+                   help="re-evaluate the new reference from scratch: never, after a marginal accept, after an "
+                        "accept at look <= --early-look, at one of --fresh-looks, always (docs/stats.md 8.3)")
+    c.add_argument("--early-look", type=int, default=2, help="--fresh early: fresh after an accept at look <= this")
+    c.add_argument("--fresh-looks", default="1,2,4", help="--fresh looks: fresh after an accept at these looks")
     c.add_argument("--margin", type=float, default=0.5, help="marginal: t - efficacy below this, or the final look")
     c.add_argument("--out-topup", required=True)
     a = p.parse_args(argv)

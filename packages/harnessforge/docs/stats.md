@@ -14,7 +14,9 @@ for the calibration CLI.
 | `spending.py` | `SpendingDesign`: Lan-DeMets alpha spending on planned or observed information (section 7) |
 | `calibrate.py` | Monte Carlo calibration (`simulate`, `Simulation.c_for`, `.operating`) and the CLI |
 | `race.py` | `Race`: K candidates vs one reference, run concurrently, as a pure state machine |
-| `gate.py` | `ValGate`: candidate vs current best on the val split (a one-candidate race) |
+| `gate.py` | `ValGate`: candidate vs current best on the val split (a one-candidate race); `val1000_schedule` (section 8) |
+| `sampling.py` | `TaskSampling`, `frontier_order`: frontier-weighted task-major look orders, Horvitz-Thompson weights (section 8) |
+| `reference.py` | reference reuse on the gate: `topup_plan`, `apply_topup`, `Lineage` (label chaining, fresh-after-marginal) |
 
 ## 1. Paired statistic
 
@@ -343,3 +345,240 @@ Plans (a) and (a2) are cheaper but cannot reach the power target (0.47, 0.62).
 
 The current task-major 4 x 4 design costs a fifth as much (13.8 rounds per node-day) but has power 0.32 at +2.4: it
 mostly finds large fixes.
+
+## 8. The val1000 search gate
+
+**Design (decided).** The search gate compares a candidate with the current reference on **val1000**: 1 000 held-out
+tmax tasks x 4 trials per side, TASK_MAJOR, looks after 250 / 500 / 750 / 1 000 tasks, Lan-DeMets alpha spending with the
+O'Brien-Fleming shape (one-sided alpha 0.05) on **observed** information, efficacy from look 1, non-binding linear futility
+-1 + 2.5 t. It replaces the val200 attempt-major (4, 8, 16, 32) design for the search gate; that code stays (val200 is kept
+for checkpoint evals and confirmatory tests).
+
+```python
+from harnessforge.stats import Race, ReferenceMode, val1000_schedule
+sched = val1000_schedule(tasks)                       # tasks: val1000 in launch order; or sampling=TaskSampling
+gate = Race(ref, [cand], sched, reference_mode=ReferenceMode.ALL_TRIALS)   # default design: LD-OBF, observed info
+```
+
+`LookSchedule` now accepts planning `information` for TASK_MAJOR (I_j = n_j / (tau2 + sigma2 / 4), I_max = 1000 / 0.0704
+= 14 215 at the val200 planning values, final SE 0.84 points), and `race.default_design` then picks
+`SpendingDesign.for_schedule` (observed information), as it does for attempt-major trial looks. Planned boundaries for 4
+equal looks: **3.75 / 2.54 / 2.02 / 1.72** (futility -0.375 / 0.25 / 0.875); exact normal-theory alpha 0.0500. CLI:
+`race_run drive ... --mode all --design spending [--sampling sampling.json]`.
+
+### 8.1 Frontier-weighted looks (`sampling.py`, toggle; default off = uniform order)
+
+With `--sampling` / `LookSchedule(sampling=TaskSampling)` every look is a **stratified sample of the full set** instead of a
+uniform prefix. Tasks are put in difficulty bands by a label pass rate, [0, .25) [.25, .5) [.5, .75) [.75, 1] (plus an
+"unlabeled" band), and each look takes from every band, over-sampling the frontier. Band priority: 0.25-0.5 > 0.5-0.75 >
+0-0.25 > 0.75-1, multipliers (2, 4, 3, 1) ** tilt for the bands in rate order (tilt 0 = proportional, tilt 1 = the
+0.25-0.5 band at 4x the sampling rate of the 0.75-1 band). At look j the cumulative per-band fraction is
+f_bj = clip(c_j m_b, floor x n_j / N, 1), c_j solved so the look has exactly n_j tasks; `floor` (default 0.5) keeps every
+band at no less than half its proportional share from look 1 on. Counts are integerised by largest remainders and never
+decrease; the last look has every task. Within a band the tasks are a seeded random permutation, so look j's tasks of
+band b are a simple random sample of the band and the inclusion probability is exactly pi_i = n_bj / N_b.
+
+**Estimator.** Hajek / Horvitz-Thompson with w_i = 1 / pi_i: D_j = sum w_i d_i / sum w_i = sum_b (N_b / N) mean_b(d), the
+full-set mean, at every look (sum w = N exactly, so Hajek = HT). SE: the stratified with-replacement (sandwich) variance
+`paired(weights=, strata=)`, SE^2 = sum_b (N_b / N)^2 s_b^2 / n_bj (no finite-population correction: tasks are treated
+as a sample from a super-population, as the plain statistic does). Observed information for the spending function is
+1 / SE^2 of this estimator. Looks whose weights are all equal (the last look; tilt 0 up to rounding) use the plain
+paired mean and sd / sqrt(n), so **the final look is the uniform full-set analysis** and a uniform order reproduces the
+existing statistic exactly. Planned fractions with a tilt include the design effect n_j sum_b (N_b / N)^2 / n_bj of
+unequal weights (equal per-task variance); the observed information decides the boundaries anyway.
+
+**Labels** (`load_labels`, `labels_from_records`): any per-task pass rate from data **not** used in the comparison:
+(a) a separate pass of a harness on val1000 (1 trial is enough to run, but see 8.3: 1-trial labels only separate 0 from
+1), (b) the previous reference's val1000 pass rates (label chaining, `Lineage.labels()`), or at step 0 the base-model
+sweep (`labels.json` of the val1000 draw, 8.4). HT stays design-unbiased for any labels (the labels fix pi, the
+within-band sampling is random); labels taken from the comparison data itself make the weights a function of the
+reference's noise, and 8.3 shows that this biases the SE downward.
+
+```bash
+python -m harnessforge.stats.sampling --tasks val1000.json --labels labels.json --tilt 0.5 --seed S --out sampling.json
+python -m harnessforge.stats.sampling --tasks val1000.json --lineage lineage.json --tilt 0.5 --seed S --out sampling.json
+```
+
+`sampling.json["tasks"]` is the launch order for the request; the race reads the design from `--sampling` (or
+`options.sampling` in the request).
+
+### 8.2 Reference reuse with top-up (`reference.py`)
+
+The gate's reference is compared on all its val1000 trials (`ReferenceMode.ALL_TRIALS`; in TASK_MAJOR this is the same
+unit set as SAME_UNITS). When candidate B is **accepted at look k**, its gate trials become the new reference's val1000
+trials: `topup_plan(records, B, tasks, 4)` lists the missing units (tasks after look k's prefix, trials cancelled by the
+stop, env failures; a unit counts when it has a finished, scored, not-cancelled record) and `apply_topup` re-indexes a
+top-up run's trials onto them (provenance in `extra`). `Lineage` (JSON) tracks the current reference, the previous one
+(its records give the next gate's labels: label chaining) and one history entry per accept (look, t, marginal, fresh,
+units reused / missing). `Lineage.accept(..., fresh=never|marginal|always)`: a fresh full evaluation of the new
+reference instead of a top-up, never / after a marginal accept (at the final look, or t - efficacy < 0.5) / always.
+
+```bash
+python -m harnessforge.race_run accept --lineage lineage.json [--reference A --step0-labels labels.json] \
+    --race race.json --candidate B --records B.records.jsonl --tasks request.json --fresh marginal --out-topup topup.json
+python -m harnessforge.race_run topup --records REF.records.jsonl --reference REF --tasks request.json --out topup.json
+```
+
+### 8.3 Simulation (`scripts/val1000_sim.py`)
+
+Model: per replicate 1 000 true reference rates from a smoothed NPMLE (EMS on a logit grid) of the val200 seed-harness
+results (8 trials per task): 35.6 always solved / 45.5 never per 200 at 8 trials (val200: 35 / 47; 118 mixed), mean
+0.503, 2 E p(1 - p) = 0.248 (planning sigma2 0.249); true-rate band mix .30 / .18 / .17 / .35. Candidate rates
+logistic(logit p + s + b z) with (s, b) solved for the mean difference and tau2 in {0.0025 (measured), 0.0081 (planning)}
+(at +14 points the shift alone gives tau2 = 0.0119, b = 0). Mixed null: +6 points on true-p [.25, .75) tasks, easy tasks
+(p >= .75) lowered so that the 1 000-task mean is exactly 0 per replicate; mixed harmful: the same with mean -1 point.
+4 Bernoulli trials per task and side. Labels from an independent pass of the reference with 4 trials (L4) or 1 trial (L1);
+"own-ref labels" = the reference's own comparison trials (a diagnostic of what not to do). Design: LD-OBF, observed
+information, I_max at the planning values, linear futility, through `SpendingDesign.bounds` (observed fractions rounded
+to 5e-3: moves the look-1 boundary by <= 0.02, later ones by < 0.01). 10 000 replicates per cell, common random numbers
+across designs (MC se: alpha 0.002, power 0.004). Units = trials per arm at the deciding look (max 4 000 = 1 000 x 4).
+
+**Sanity.** LD-OBF boundaries for 4 equal looks at one-sided 0.05: 3.7496 / 2.5399 / 2.0161 / 1.7202 (exact
+normal-theory alpha 0.0500). The classic c / sqrt(t) with c = 1.77 (efficacy from look 2, today's task-major default):
+- / 2.503 / 2.044 / 1.770, exact alpha 0.0459 (0.0460 with a look-1 boundary 3.54); the exact OBF constant for alpha 0.05
+is c = 1.733 (from look 1 or look 2). So 1.77 was conservative by about 0.004 in alpha on equal task-major looks.
+
+tau2 = 0.0025 (measured):
+
+| design | alpha null | alpha mixed null | accept mixed harmful | power +1.6 | +2.4 | +5 | +14 | E[units] null | -2 | +2.4 | +14 | E[looks] +2.4 | P(look 1) +14 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **uniform** | 0.043 | 0.041 | 0.001 | 0.558 | **0.856** | 1.000 | 1.000 | 1989 | 1190 | 2629 | 1000 | 2.63 | 1.00 |
+| frontier L4 tilt 0.5 | 0.042 | 0.041 | 0.001 | 0.558 | 0.857 | 0.999 | 1.000 | 2000 | 1200 | 2656 | 1000 | 2.66 | 1.00 |
+| frontier L4 tilt 1 | 0.041 | 0.041 | 0.002 | 0.558 | 0.853 | 0.999 | 1.000 | 2166 | 1280 | 2861 | 1000 | 2.86 | 1.00 |
+| frontier L4 tilt 2 | 0.042 | 0.041 | 0.002 | 0.559 | 0.854 | 0.998 | 1.000 | 2196 | 1300 | 2916 | 1000 | 2.92 | 1.00 |
+| frontier L1 tilt 1 | 0.042 | 0.043 | 0.002 | 0.566 | 0.859 | 0.999 | 1.000 | 2155 | 1258 | 2872 | 1000 | 2.87 | 1.00 |
+| frontier L1 tilt 2 | 0.042 | 0.042 | 0.001 | 0.561 | 0.853 | 0.998 | 1.000 | 2262 | 1353 | 2995 | 1001 | 3.00 | 1.00 |
+| frontier own-ref labels tilt 1 | **0.054** | **0.053** | 0.004 | 0.575 | 0.860 | 0.999 | 1.000 | 2059 | 1230 | 2629 | 1000 | 2.63 | 1.00 |
+| uniform, c/sqrt(t) c = 1.77 | 0.041 | 0.039 | 0.001 | 0.565 | 0.869 | 1.000 | 1.000 | 2145 | 1208 | 2790 | 2000 | 2.79 | 0.00 |
+
+tau2 = 0.0081 (planning; the nulls do not depend on tau2):
+
+| design | power +1.6 | +2.4 | +5 | +14 | E[units] -2 | +2.4 | E[looks] +2.4 |
+|---|---|---|---|---|---|---|---|
+| **uniform** | 0.545 | **0.840** | 1.000 | 1.000 | 1229 | 2762 | 2.76 |
+| frontier L4 tilt 0.5 | 0.548 | 0.840 | 1.000 | 1.000 | 1246 | 2791 | 2.79 |
+| frontier L4 tilt 1 | 0.546 | 0.840 | 1.000 | 1.000 | 1332 | 2995 | 3.00 |
+| frontier L4 tilt 2 | 0.545 | 0.841 | 0.999 | 1.000 | 1348 | 3036 | 3.04 |
+| frontier L1 tilt 1 | 0.547 | 0.845 | 0.999 | 1.000 | 1300 | 3010 | 3.01 |
+| frontier L1 tilt 2 | 0.543 | 0.840 | 0.999 | 1.000 | 1407 | 3114 | 3.11 |
+| frontier own-ref labels tilt 1 | 0.563 | 0.848 | 1.000 | 1.000 | 1268 | 2763 | 2.76 |
+| uniform, c/sqrt(t) c = 1.77 | 0.539 | 0.839 | 1.000 | 1.000 | 1234 | 2816 | 2.82 |
+
+Without futility, alpha null / mixed null: uniform 0.049 / 0.046, frontier L4 tilt 1 0.048 / 0.047, own-ref labels
+0.061 / 0.061. The look-1 estimate is centred on the full-set mean in every design (|mean D| <= 0.02 points under both
+nulls) and its SE is calibrated (null, sd of D vs mean SE in points: uniform 1.576 / 1.570, L4 tilt 1 1.731 / 1.736, L1
+tilt 2 1.840 / 1.852; mixed null L4 tilt 1 1.837 / 1.836), except with own-ref labels (mixed null 1.716 / 1.679).
+Mean observed information fraction at looks 1-3 under the null: uniform .29 / .57 / .86, L4 tilt 0.5 .28 / .56 / .84,
+L4 tilt 1 .24 / .47 / .77, L1 tilt 2 .21 / .41 / .74.
+
+Reading it:
+
+* **Alpha holds** for every valid design (0.041-0.043 with futility, <= 0.050 without), under the strong null AND the
+  mixed null (gains on mid-difficulty tasks cancelled by losses on easy ones): the HT estimator targets the full-set mean
+  at every look, so over-sampling the bands where the candidate gains does not leak into a false accept. A mixed
+  candidate with a full-set loss of 1 point is accepted 0.1-0.2% of the time.
+* **Frontier weighting buys no power and costs trials.** Power at +1.6 / +2.4 / +5 is the same as uniform within MC
+  error for every tilt and label source; expected trials grow with the tilt (+0.5-1% at tilt 0.5, +8-9% at tilt 1,
+  +10-14% at tilt 2, under the null and at +2.4). Unequal weights inflate the interim variance (design effect 1.28 at tilt 1 on the real val1000
+  labels, 8.4) by more than over-sampling the higher-variance frontier tasks saves (the Neyman gain over proportional
+  allocation is small here: the per-task variance differs between bands by about 2x, and the 0-0.25 band, which the
+  priority order puts third, is mostly near-zero-variance never-solved tasks). Less information at looks 1-2 means fewer
+  early stops. 1-trial labels can only separate 0 from 1, so with L1 "frontier" just means "label 0 before label 1"; it
+  behaves like L4.
+* **Labels must not come from the comparison data**: with the reference's own trials as labels the SE is biased low and
+  alpha is 0.054 (0.061 without futility): the weights then depend on the reference's noise in d_i. With independent
+  labels (a separate pass, or label chaining from the previous reference) everything is calibrated.
+* So the toggle stays **off by default** (uniform order). It is valid and can be switched on (tilt <= 0.5 costs nothing
+  measurable) when early looks are wanted to contain the frontier tasks for diagnostics, but not for efficiency.
+* Against the classic c = 1.77 (efficacy from look 2): LD-OBF can stop a +14-point candidate at look 1 (always, 1 000
+  trials per arm vs 2 000), uses 7% fewer trials under the null and 2-6% fewer at +2.4, at 1 point less power at +2.4
+  with tau2 = 0.0025 (0.856 vs 0.869; the same at 0.0081) and alpha 0.043 vs 0.041.
+* val1000 at 4 trials (max 4 000 trials per arm) has power 0.84-0.86 at +2.4 points and 0.55 at +1.6, and decides a
+  -2-point candidate after about 1 200 trials per arm (1.2 looks), a neutral one after about 2 000.
+
+**Winner's curse of reference reuse** (`--curse`, 20 000 replicates per design, tau2 = 0.0081): B1 at +2.4 over A (power
+0.85), then B2 gated against B1, where B1's reference trials are either reused (its gate trials on the tasks of looks
+<= k, the rest topped up with fresh trials) or a fresh full evaluation. B2 is +2.2 points over B1 (power row) or identical
+to B1 (alpha row). Bias = mean over the 1 000 tasks of the reused reference's observed rate minus B1's true rate
+(points; the final SE is about 0.84). Uniform order (frontier L4 tilt 0.5 / tilt 1 in the JSON: the same pattern):
+
+| B1 accepted at | share of accepts | B1's D at accept (true 2.4) | ref bias, reused | B2 power, reused / fresh | B2 alpha, reused / fresh |
+|---|---|---|---|---|---|
+| look 1 | 0.02 | 6.1 | +0.40 | 0.55 / 0.78 | 0.010 / 0.067 (n = 313) |
+| look 2 | 0.37 | 3.6 | +0.26 | 0.70 / 0.81 | 0.013 / 0.049 |
+| look 3 | 0.43 | 2.5 | +0.05 | 0.83 / 0.81 | 0.028 / 0.049 |
+| look 4 (final) | 0.18 | 1.9 | **-0.20** | 0.90 / 0.81 | **0.071** / 0.048 |
+
+Over all accepts, by policy (`Lineage.accept(fresh=...)`, `race_run accept --fresh`); "fresh share" = share of accepts
+that re-run the reference in full; reference trials run per accept (uniform; 4 000 = a full evaluation):
+
+| policy | B2 power | B2 alpha | worst alpha by accept look | fresh share | reference trials per accept |
+|---|---|---|---|---|---|
+| never (top-up only) | 0.789 | 0.030 | 0.071 (look 4) | 0 | 1 220 |
+| marginal (final look or t - eff < 0.5) | 0.777 | 0.034 | - | 0.57 | - |
+| early (look <= 2) | 0.834 | 0.044 | 0.071 (look 4) | 0.39 | 1 980 |
+| **looks 1, 2, 4** (`--fresh looks`) | 0.817 | 0.040 | 0.049 | 0.57 | 2 700 |
+| always | 0.811 | 0.049 | 0.049 | 1 | 4 000 |
+
+* Reuse after an **early** accept (looks 1-2, about 40% of accepts at +2.4) leaves the reference too good by 0.26-0.40
+  points (0.3-0.5 final SEs) and costs the next +2.4 candidate 11-23 points of power; it also makes the next gate
+  conservative (alpha about 0.01).
+* Reuse after a **final-look** accept leaves it too bad by 0.20 points: the candidate reached look 4 because its early
+  looks came out low. The next gate is then anti-conservative: alpha 0.071 for a null next candidate (power 0.90 instead
+  of 0.81). Reuse after a look-3 accept is nearly unbiased (+0.05; alpha 0.028 because B2 is compared on the same tasks
+  whose noise B1's acceptance selected).
+* "Fresh after a **marginal** accept" (as first proposed) points the fresh runs at the wrong accepts: most marginal
+  accepts are final-look ones (bias down, but fresh helps alpha) while the early, non-marginal accepts carry the upward
+  bias; net power 0.777, below never-fresh.
+* **Recommendation: `--fresh looks --fresh-looks 1,2,4`** (fresh unless accepted at look 3): every accept look keeps
+  alpha <= 0.05 for the next gate (worst 0.049), power 0.82, and 57% of accepts re-run the reference (2 700 reference
+  trials per accept vs 4 000 for "always"). "always" is the simple, fully clean alternative. "never" saves the most but
+  lets a final-look accept inflate the next gate's alpha to 0.07.
+
+Reproduce (about 25 min on 8 cores; `--only-curse` for the second table):
+
+    uv run --no-project -p 3.12 --with numpy --with-editable packages/harnessforge \
+        python packages/harnessforge/scripts/val1000_sim.py --sims 10000 --curse-sims 20000 --resolution 0.005 \
+        --curse-designs "uniform,frontier L4 tilt 0.5,frontier L4 tilt 1" --workers 8 --out val1000_sim.json
+
+### 8.4 The val1000 taskset (`scripts/val1000_draw.py`)
+
+On ABCI: `/groups/gai51740/aci18914wh/mho/tasksets/val1000/` (drawn in an rt_HC job; stdlib only).
+
+* **Train pool**: the 6 726 tasks of the GRPO v2 run's `dataset/` (`runs/platoon-grpo200-tmax-naive-uniform-noKL-64kcap-v2-ext--Qwen3.5-4B/dataset`,
+  = `data-harbor/tmax-v11-train-naive`). **val200** = `data-harbor/tmax-v11-val200` (200 tasks); it does not overlap the pool
+  (checked: 0 shared tasks).
+* **Difficulty data**: the Qwen3.5-4B pass-rate sweep on all validated TMax v1.1 tasks (`sweeps/tmax-passrate-hpcsb/Qwen3.5-4B/shard{0..3}`:
+  harbor, base mini-swe-agent harness, 4 attempts (one per shard), 1 800 s agent timeout, vLLM, no 64k cap). An attempt is
+  scored when its verifier wrote a reward (agent timeouts are scored: the verifier runs after them); 6 554 of the pool's
+  tasks have 4 scored attempts, 164 have 3, 7 have 1-2, 1 has none. The sweep's settings differ from the current eval
+  setup (platoon, SGLang, 64k cap, keep-thinking): that affects label quality, not validity (8.1).
+* **Draw**: strata on the sweep pass rate, 0 | (0, .5) | .5 | (.5, 1) | 1 | unlabeled; proportional allocation (largest
+  remainder) of 1 000; seeded simple random sample within each stratum (seed 20261122); the list then shuffled once
+  (its order is the uniform task-major launch order). The remaining 5 726 tasks are the screen pool.
+
+| stratum (4B sweep rate) | 0 | (0, .5) | .5 | (.5, 1) | 1 | unlabeled | mean rate |
+|---|---|---|---|---|---|---|---|
+| pool (6 726) | 2 173 | 1 021 | 921 | 1 069 | 1 541 | 1 | 0.455 |
+| val1000 | 323 | 152 | 137 | 159 | 229 | 0 | 0.455 |
+| screen pool (5 726) | 1 850 | 869 | 784 | 910 | 1 312 | 1 | |
+
+Files: `val1000.json` (tasks in launch order, per-task label rate and stratum, provenance), `val1000.tasks.txt`,
+`screen_pool.json` / `.tasks.txt`, `labels.json` (successes / scored / attempts / exception counts for all 6 926 sweep
+tasks: the step-0 difficulty labels), `manifest.json` (counts, mixes, sweep exception summary). In the gate's bands
+([0, .25) [.25, .5) [.5, .75) [.75, 1]) val1000 is 323 / 152 / 140 / 385. Frontier orders on these labels
+(`python -m harnessforge.stats.sampling --tasks val1000.json --labels val1000.json --tilt T`), tasks per band at look 1
+(250 tasks) and the look-1 design effect: tilt 0.5: 82 / 55 / 44 / 69, 1.07; tilt 1: 78 / 73 / 51 / 48, 1.28; tilt 2:
+52 / 99 / 51 / 48, 1.43 (proportional: 81 / 38 / 35 / 96).
+
+Note: val1000's mean 4B sweep rate (0.455) is below val200's seed-harness rate under the eval setup (0.50); the
+simulation (8.3) uses the val200 mix, as specified.
+
+### 8.5 Summary
+
+* Gate: val1000, 4 trials, task-major, LD-OBF on observed information (3.75 / 2.54 / 2.02 / 1.72 planned), linear
+  non-binding futility; uniform task order (the frontier toggle is valid but gives no efficiency gain on this population).
+* Power at +2.4 points 0.84-0.86, at +1.6 0.55, at +5 and +14 1.00 (+14 always at look 1); alpha 0.041-0.043 under the
+  strong and the mixed-effect null; about 2 000 trials per arm for a neutral candidate, 1 200 for a -2-point one.
+* Difficulty labels only from data outside the comparison (own-reference labels: alpha 0.054).
+* Reference reuse: top up after a look-3 accept, re-run the reference after an accept at look 1, 2 or 4.
