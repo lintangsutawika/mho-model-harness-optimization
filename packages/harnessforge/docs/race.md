@@ -40,6 +40,15 @@ request's own `trial_looks` / `plan` options), `--tau2/--sigma2` the planning va
 looks), `--alpha`, `--spending obf|pocock|power:R`, `--planned` (planned instead of observed information). Replay reads
 `order` from the request JSON (or `--order`). See docs/stats.md section 7.
 
+The val1000 search gate (docs/stats.md section 8) is task-major with `--design spending` (Lan-DeMets OBF on observed
+information; `--tau2/--sigma2` set I_max) and `--mode all` (the reference's val1000 trials are on file). A frontier-weighted
+order is made before launching, `python -m harnessforge.stats.sampling --tasks val1000.json --labels labels.json --tilt T
+--out sampling.json` (or `--lineage lineage.json` for label chaining), its `tasks` become the request's task order, and the
+race reads it with `--sampling sampling.json` (or the request's `options.sampling`). After an accept, `race_run accept
+--lineage lineage.json --race race.json --candidate B --records B.records.jsonl --tasks request.json --fresh
+never|marginal|always --out-topup topup.json` moves the lineage on and writes the top-up plan (only missing units, or a
+full fresh plan); `race_run topup` writes a plan for any reference.
+
 `--c` overrides the efficacy constant (default `recommended_c`: 1.77 for TASK_MAJOR / SAME_UNITS), `--mode all` pairs with
 all of the reference's trials, `--max-env-fail` skips infra-suspect interim looks, `--checkpoints` sets the look
 fractions.
