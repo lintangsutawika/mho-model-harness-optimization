@@ -19,6 +19,9 @@ Two schedules, one per `contracts.Order`:
   TASK_MAJOR (platoon eval: all trials of task 1, then task 2, ... in `EvalRequest.tasks` order)
       looks at task-count checkpoints (default 25/50/75/100% of the ordered task list);
       look j uses ALL trials of the first n_j tasks. Information fraction n_j / N.
+      With `sampling` (`sampling.TaskSampling`, a frontier-weighted stratified order) the looks are its sizes and
+      each look is estimated with Horvitz-Thompson weights and stratified SE (`weights`, `strata`); with
+      `information` the planned information of look j is 1 / var(HT mean) (n_j / var(d_i) for a uniform order).
 
 Env-failed trials (the sandbox never started) count as finished, so they never block a look, but
 they are not evidence: `per_task` skips them. `LookData.env_fail_frac` reports their share so a
@@ -36,6 +39,7 @@ from typing import Iterable, Iterator, Sequence
 from harnessforge.contracts import EvalRequest, Order
 from harnessforge.records import TaskStats, TrialRecord, per_task
 from harnessforge.stats.information import Information
+from harnessforge.stats.sampling import TaskSampling
 
 __all__ = ["DEFAULT_CHECKPOINTS", "Look", "LookData", "LookSchedule", "UnitIndex", "collect"]
 
@@ -197,6 +201,7 @@ class LookSchedule:
     trial_looks: tuple[int, ...] | None = None             # ATTEMPT_MAJOR only
     information: Information | None = None                 # ATTEMPT_MAJOR only
     plan: tuple[tuple[Segment, ...], ...] | None = None    # ATTEMPT_MAJOR only
+    sampling: TaskSampling | None = None                   # TASK_MAJOR only
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "order", Order(self.order))
@@ -212,10 +217,15 @@ class LookSchedule:
             raise ValueError("checkpoints must be in (0, 1]")
         if self.trial_looks is not None and self.plan is not None:
             raise ValueError("give trial_looks or plan, not both")
-        if (self.trial_looks is not None or self.plan is not None or self.information is not None) and \
-                self.order is not Order.ATTEMPT_MAJOR:
-            raise ValueError("trial_looks, plan and information need Order.ATTEMPT_MAJOR "
-                             "(task-major fractions are n_j / N)")
+        if (self.trial_looks is not None or self.plan is not None) and self.order is not Order.ATTEMPT_MAJOR:
+            raise ValueError("trial_looks and plan need Order.ATTEMPT_MAJOR (task-major looks are task prefixes)")
+        if self.sampling is not None:
+            if self.order is not Order.TASK_MAJOR:
+                raise ValueError("sampling needs Order.TASK_MAJOR")
+            if tuple(self.sampling.tasks) != self.tasks:
+                raise ValueError("sampling.tasks must be the schedule's task order")
+            n = len(self.tasks)
+            object.__setattr__(self, "checkpoints", tuple(m / n for m in self.sampling.sizes))
         if self.trial_looks is not None:
             ks = tuple(int(k) for k in self.trial_looks)
             if not ks or any(b <= a for a, b in zip(ks, ks[1:])) or ks[0] < 1 or ks[-1] > self.trials:
@@ -250,10 +260,11 @@ class LookSchedule:
                      checkpoints: Sequence[float] = DEFAULT_CHECKPOINTS,
                      trial_looks: Sequence[int] | None = None,
                      information: Information | None = None,
-                     plan: Sequence[Sequence[Segment]] | None = None) -> "LookSchedule":
+                     plan: Sequence[Sequence[Segment]] | None = None,
+                     sampling: TaskSampling | None = None) -> "LookSchedule":
         return cls(order, tuple(request.tasks), request.trials, tuple(checkpoints),
                    None if trial_looks is None else tuple(trial_looks), information,
-                   None if plan is None else tuple(tuple(lk) for lk in plan))
+                   None if plan is None else tuple(tuple(lk) for lk in plan), sampling)
 
     @property
     def planned(self) -> bool:
@@ -281,8 +292,17 @@ class LookSchedule:
     def planned_information(self, all_trials_reference: bool = False) -> tuple[float, ...] | None:
         """I_j = sum over look j's tasks of 1 / var(d_task) from `information` (None without it).
         `all_trials_reference`: the reference contributes each task's final trial count (ReferenceMode.ALL_TRIALS)."""
-        if self.information is None or self.order is not Order.ATTEMPT_MAJOR:
+        if self.information is None:
             return None
+        if self.order is Order.TASK_MAJOR:
+            v = self.information.variance(self.trials)
+            out = []
+            for lk in self.looks:
+                if self.sampling is None:
+                    out.append(len(lk.tasks) / v)
+                else:
+                    out.append(len(lk.tasks) / (v * self.sampling.design_effect(lk.number)))
+            return tuple(out)
         per = self._per_look_counts()
         final = per[-1]
         return tuple(math.fsum(1.0 / self.information.variance(c, f if all_trials_reference else None)
@@ -311,9 +331,15 @@ class LookSchedule:
                     out.append(Look(j, f, tuple(self.tasks[i] for i in keep), max(cs), final,
                                     tuple(cs[i] for i in keep)))
             return tuple(out)
-        counts = sorted({min(n, max(1, math.ceil(c * n - 1e-9))) for c in self.checkpoints} | {n})
-        return tuple(Look(j, m / n, self.tasks[:m], k, m == n)
-                     for j, m in enumerate(counts, start=1))
+        counts = (list(self.sampling.sizes) if self.sampling is not None else
+                  sorted({min(n, max(1, math.ceil(c * n - 1e-9))) for c in self.checkpoints} | {n}))
+        looks = tuple(Look(j, m / n, self.tasks[:m], k, m == n) for j, m in enumerate(counts, start=1))
+        if self.information is not None:
+            v = self.information.variance(k)
+            info = [len(lk.tasks) / v / (self.sampling.design_effect(lk.number) if self.sampling else 1.0)
+                    for lk in looks]
+            looks = tuple(replace(lk, fraction=i / info[-1]) for lk, i in zip(looks, info))
+        return looks
 
     @property
     def fractions(self) -> tuple[float, ...]:
@@ -333,11 +359,19 @@ class LookSchedule:
     def weights(self, look: Look, all_trials_reference: bool = False) -> dict[str, float] | None:
         """Inverse-variance task weights 1 / (tau2 + sigma2 / k_task) for a look of unequal depth (None when
         every task of the look has the same trials, or without `information`: the plain mean)."""
+        if self.sampling is not None:
+            return self.sampling.weights(look.number)
         if self.information is None or look.uniform:
             return None
         final = dict(self.looks[-1].per_task())
         return {t: 1.0 / self.information.variance(k, final[t] if all_trials_reference else None)
                 for t, k in look.per_task()}
+
+    def strata(self, look: Look) -> dict[str, int] | None:
+        """Task -> band for the stratified SE of a weighted (frontier-sampled) look; None otherwise."""
+        if self.sampling is None or self.sampling.weights(look.number) is None:
+            return None
+        return self.sampling.strata(look.number)
 
     def launch_order(self) -> list[Unit]:
         """The units in the order a look-major backend should launch them: look 1's units, then the units look 2

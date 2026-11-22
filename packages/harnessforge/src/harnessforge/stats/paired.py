@@ -62,7 +62,8 @@ def _value(s: TaskStats, key: str) -> float | None:
 
 
 def paired(a: Mapping[str, TaskStats], b: Mapping[str, TaskStats],
-           key: str = "reward", weights: Mapping[str, float] | None = None) -> Paired | None:
+           key: str = "reward", weights: Mapping[str, float] | None = None,
+           strata: Mapping[str, Any] | None = None) -> Paired | None:
     """Paired stats of `b` minus `a` over the tasks both have (and, for key="cost", that both
     report a cost for). None with fewer than 2 common tasks.
 
@@ -70,10 +71,16 @@ def paired(a: Mapping[str, TaskStats], b: Mapping[str, TaskStats],
     the robust (sandwich) standard error SE = sqrt(n / (n - 1) * sum w^2 (d - D)^2) / sum w. This is the
     estimator of a look whose tasks have unequal trials (inverse-variance weights from
     `LookSchedule.weights`); the SE does not rely on the weights being right, and with equal weights it is
-    the plain sd / sqrt(n)."""
+    the plain sd / sqrt(n).
+
+    `strata` (task -> stratum, with `weights`): the stratified with-replacement variance of a stratified sample
+    (`sampling.TaskSampling`: Horvitz-Thompson weights 1 / pi_i): SE^2 = sum_h n_h / (n_h - 1) sum_{i in h}
+    (u_i - mean_h u)^2 / (sum w)^2 with u_i = w_i (d_i - D). With one stratum it is the sandwich SE above. A
+    stratum with a single paired task contributes u_i^2."""
     xa: list[float] = []
     xb: list[float] = []
     ws: list[float] = []
+    hs: list[Any] = []
     for k in sorted(set(a) & set(b)):
         va, vb = _value(a[k], key), _value(b[k], key)
         if va is None or vb is None:
@@ -84,6 +91,7 @@ def paired(a: Mapping[str, TaskStats], b: Mapping[str, TaskStats],
         xa.append(va)
         xb.append(vb)
         ws.append(float(w))
+        hs.append(None if strata is None else strata.get(k))
     n = len(xa)
     if n < 2:
         return None
@@ -96,7 +104,21 @@ def paired(a: Mapping[str, TaskStats], b: Mapping[str, TaskStats],
         return Paired(n, math.fsum(xa) / n, math.fsum(xb) / n, md, sd / math.sqrt(n))
     sw = math.fsum(ws)
     md = math.fsum(w * x for w, x in zip(ws, d)) / sw
-    se = math.sqrt(n / (n - 1) * math.fsum((w * (x - md)) ** 2 for w, x in zip(ws, d))) / sw
+    if strata is None:
+        se = math.sqrt(n / (n - 1) * math.fsum((w * (x - md)) ** 2 for w, x in zip(ws, d))) / sw
+    else:
+        groups: dict[Any, list[float]] = {}
+        for w, x, h in zip(ws, d, hs):
+            groups.setdefault(h, []).append(w * (x - md))
+        v = 0.0
+        for us in groups.values():
+            m = len(us)
+            if m == 1:
+                v += us[0] ** 2
+            else:
+                mu = math.fsum(us) / m
+                v += m / (m - 1) * math.fsum((u - mu) ** 2 for u in us)
+        se = math.sqrt(v) / sw
     if se < 1e-12:
         se = 0.0
     return Paired(n, math.fsum(w * x for w, x in zip(ws, xa)) / sw, math.fsum(w * x for w, x in zip(ws, xb)) / sw,

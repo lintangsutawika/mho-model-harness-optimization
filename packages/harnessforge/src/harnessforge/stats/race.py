@@ -95,8 +95,9 @@ def recommended_c(schedule: LookSchedule, mode: "ReferenceMode | str") -> float:
 def default_design(schedule: LookSchedule, mode: "ReferenceMode | str" = "same") -> Any:
     """The race's design when none is given: for an ATTEMPT_MAJOR schedule with `trial_looks` or a `plan`, Lan-DeMets OBF
     spending at alpha 0.05 (observed information when the schedule has planning `information`), efficacy from look
-    1, linear non-binding futility; otherwise `Design` with `recommended_c`."""
-    if schedule.planned:
+    1, linear non-binding futility; the same for a TASK_MAJOR schedule with `information` (the val1000 gate);
+    otherwise `Design` with `recommended_c`."""
+    if schedule.planned or schedule.information is not None:
         from harnessforge.stats.spending import SpendingDesign
         return SpendingDesign.for_schedule(schedule, all_trials_reference=ReferenceMode(mode) is ReferenceMode.ALL_TRIALS)
     return Design.for_schedule(schedule, c=recommended_c(schedule, mode))
@@ -257,7 +258,7 @@ class Race:
             env = max(a.env_fail_frac, b.env_fail_frac)
             suspect = self.max_env_fail is not None and env > self.max_env_fail
             tr.next_look = j + 1
-            acc = paired(a.stats, b.stats, weights=self._weights(j))
+            acc = paired(a.stats, b.stats, weights=self._weights(j), strata=self.schedule.strata(self.schedule.look(j)))
             info = 1.0 / acc.se ** 2 if acc is not None and acc.se > 0 else None
             lb = d.bounds(j, info, tuple(tr.history))
             tr.bounds[j] = lb

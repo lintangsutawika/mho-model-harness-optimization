@@ -33,6 +33,14 @@ CLI (inside a job; see docs/race.md):
     python -m harnessforge.race_run drive --side A=RUN_DIR_A --side B=RUN_DIR_B --reference A --out race.json
     python -m harnessforge.race_run drive --request REQUEST.json --reference A --out race.json   # in-process
     python -m harnessforge.race_run replay records.jsonl ... --tasks request.json --reference B --out rev.json
+
+val1000 gate (task-major, LD-OBF spending on observed information; docs/stats.md section 8):
+
+    python -m harnessforge.race_run drive --side REF=... --side B=... --reference REF --mode all --design spending \
+        [--sampling sampling.json]                       # frontier-weighted order from `python -m harnessforge.stats.sampling`
+    python -m harnessforge.race_run accept --lineage lineage.json --race race.json --candidate B \
+        --records B.records.jsonl --tasks request.json --fresh marginal --out-topup topup.json
+    python -m harnessforge.race_run topup --records REF.records.jsonl --reference REF --tasks request.json --out topup.json
 """
 from __future__ import annotations
 
@@ -52,6 +60,8 @@ from harnessforge.stats.looks import LookSchedule, UnitIndex, collect
 from harnessforge.stats.paired import paired
 from harnessforge.stats.information import VAL200, Information
 from harnessforge.stats.race import Race, RaceStatus, ReferenceMode, recommended_c
+from harnessforge.stats.reference import FRESH_POLICIES, Lineage, topup_plan
+from harnessforge.stats.sampling import TaskSampling
 from harnessforge.stats.spending import SpendingDesign
 
 __all__ = ["FileRun", "RaceDriver", "replay", "side_counts", "snapshot_at"]
@@ -248,7 +258,8 @@ def look_entry(idx: UnitIndex, race: Race, c: str, j: int) -> dict[str, Any]:
     b = collect(idx, c, look)
     ref_look = sched.full(look) if race.reference_mode is ReferenceMode.ALL_TRIALS else look
     a = collect(idx, race.reference, ref_look)
-    acc = (paired(a.stats, b.stats, weights=sched.weights(look, race.reference_mode is ReferenceMode.ALL_TRIALS))
+    acc = (paired(a.stats, b.stats, weights=sched.weights(look, race.reference_mode is ReferenceMode.ALL_TRIALS),
+                  strata=sched.strata(look))
            if a.ready and b.ready else None)
     t = acc.t if acc else None
     env = max(a.env_fail_frac, b.env_fail_frac)
@@ -386,10 +397,18 @@ def _schedule(order: Order, tasks: Sequence[str], trials: int, a: argparse.Names
               raw: Mapping[str, Any] | None = None) -> LookSchedule:
     """The race's schedule: --trial-looks / --plan, else the request's own (options trial_looks / plan)."""
     checkpoints = tuple(float(x) for x in a.checkpoints.split(","))
-    if order is not Order.ATTEMPT_MAJOR:
-        return LookSchedule(order, tuple(tasks), trials, checkpoints)
     raw = raw or {}
     raw = {**raw, **raw.get("options", {})}
+    if order is not Order.ATTEMPT_MAJOR:
+        sampling = None
+        if getattr(a, "sampling", None):
+            sampling = TaskSampling.from_dict(json.loads(Path(a.sampling).read_text()))
+        elif isinstance(raw.get("sampling"), dict):
+            sampling = TaskSampling.from_dict(raw["sampling"])
+        # task-major with planning information: spending on observed information (the val1000 gate)
+        info = (Information(a.tau2, a.sigma2) if (sampling is not None or a.design == "spending") and a.sigma2 > 0
+                else None)
+        return LookSchedule(order, tuple(tasks), trials, checkpoints, information=info, sampling=sampling)
     looks = (tuple(int(x) for x in a.trial_looks.split(",")) if a.trial_looks
              else tuple(raw["trial_looks"]) if raw.get("trial_looks") and not a.plan else None)
     plan = (parse_plan(a.plan) if a.plan else tuple(tuple(tuple(seg) for seg in lk) for lk in raw["plan"])
@@ -471,6 +490,44 @@ def cmd_replay(a: argparse.Namespace) -> int:
     return 0
 
 
+def _request(path: str) -> tuple[list[str], int, dict[str, Any]]:
+    raw = json.loads(Path(path).read_text())
+    return list(raw["tasks"]), int(raw["trials"]), raw
+
+
+def cmd_topup(a: argparse.Namespace) -> int:
+    tasks, trials, _ = _request(a.tasks)
+    records = [r for p in a.records for r in read_jsonl(p)]
+    plan = topup_plan(records, a.reference, tasks, trials, fresh=a.fresh)
+    Path(a.out).write_text(json.dumps(plan.as_dict(), indent=1))
+    print(json.dumps({k: v for k, v in plan.as_dict().items() if k != "missing"}, indent=1))
+    return 0
+
+
+def cmd_accept(a: argparse.Namespace) -> int:
+    tasks, trials, _ = _request(a.tasks)
+    lp = Path(a.lineage)
+    if lp.exists():
+        lineage = Lineage.load(lp)
+    elif a.reference:
+        lineage = Lineage(a.reference, step0_labels=a.step0_labels)
+    else:
+        raise SystemExit("no lineage file: pass --reference (and --step0-labels) to create it")
+    race = json.loads(Path(a.race).read_text())
+    state = race["decisions"]["states"][a.candidate]
+    if state["verdict"] != "pass":
+        raise SystemExit(f"{a.candidate} did not pass ({state['verdict']})")
+    records = [r for p in a.records for r in read_jsonl(p)]
+    new, plan = lineage.accept(a.candidate, state, records, tasks, trials, fresh=a.fresh, margin=a.margin,
+                               n_looks=len(race.get("looks") or []) or None, record_files=list(a.records))
+    new.save(lp)
+    Path(a.out_topup).write_text(json.dumps(plan.as_dict(), indent=1))
+    print(json.dumps({"lineage": {"current": new.current, "previous": new.previous,
+                                  "labels_next": new.labels_source()["kind"]},
+                      "accept": new.history[-1]}, indent=1))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m harnessforge.race_run")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -494,6 +551,9 @@ def main(argv: list[str] | None = None) -> int:
         s.add_argument("--spending", default="obf", help="spending design: obf, pocock or power:R")
         s.add_argument("--planned", action="store_true",
                        help="spending design: planned information fractions instead of observed")
+        s.add_argument("--sampling", help="TASK_MAJOR: a frontier-weighted look order (TaskSampling JSON from "
+                                          "`python -m harnessforge.stats.sampling`; default: the request's "
+                                          "options.sampling, else uniform prefixes)")
         if name == "drive":
             g = s.add_mutually_exclusive_group(required=True)
             g.add_argument("--request", help="start PlatoonBackend on this request in-process")
@@ -509,8 +569,26 @@ def main(argv: list[str] | None = None) -> int:
             s.add_argument("--order", choices=[o.value for o in Order],
                            help="the evaluation's launch order (default: the request's \"order\", else task_major)")
             s.add_argument("--out")
+    t = sub.add_parser("topup", help="the units a reference still needs for a full evaluation")
+    t.add_argument("--records", nargs="+", required=True)
+    t.add_argument("--reference", required=True)
+    t.add_argument("--tasks", required=True, help="the gate's request.json (tasks, trials)")
+    t.add_argument("--fresh", action="store_true", help="plan a full fresh evaluation instead")
+    t.add_argument("--out", required=True)
+    c = sub.add_parser("accept", help="a candidate passed the gate: update the lineage, write its top-up plan")
+    c.add_argument("--lineage", required=True, help="lineage JSON (created with --reference when missing)")
+    c.add_argument("--reference", help="the current reference when creating the lineage")
+    c.add_argument("--step0-labels", help="labels for gates before any accept (an independent pass)")
+    c.add_argument("--race", required=True, help="the gate's race summary JSON (race_run drive --out)")
+    c.add_argument("--candidate", required=True)
+    c.add_argument("--records", nargs="+", required=True, help="the candidate's gate records (JSONL)")
+    c.add_argument("--tasks", required=True, help="the gate's request.json (tasks, trials)")
+    c.add_argument("--fresh", default="never", choices=FRESH_POLICIES,
+                   help="re-evaluate the new reference from scratch: never, after a marginal accept, always")
+    c.add_argument("--margin", type=float, default=0.5, help="marginal: t - efficacy below this, or the final look")
+    c.add_argument("--out-topup", required=True)
     a = p.parse_args(argv)
-    return {"drive": cmd_drive, "replay": cmd_replay}[a.cmd](a)
+    return {"drive": cmd_drive, "replay": cmd_replay, "topup": cmd_topup, "accept": cmd_accept}[a.cmd](a)
 
 
 if __name__ == "__main__":
