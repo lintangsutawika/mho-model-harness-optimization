@@ -16,6 +16,15 @@ proposer (mho.optimizer.agent via scripts/optimize/propose.sh) on the harnessfor
 Two proposals that both pass in one round: only the winner is accepted (their combination was never tested); the
 other's idea can be re-proposed on top of the new reference.
 
+Overlap (`overlap: true`). The proposer runs on its own endpoint, so it need not wait for the pool:
+  - when round r's gate starts, round r+1's proposers start too, on the current reference (speculative: they do not
+    see round r's verdicts). If round r accepts nothing, they ARE round r+1's proposals (no proposer wait at all);
+  - if round r accepts a winner, they are killed and moved to candidates/_superseded/, and round r+1's proposers
+    restart on the winner right after its evidence run, WHILE the winner's top-up runs (instead of after it). The
+    proposer reads a provisional frontier.json (_best = winner, metric = its gate estimate) until the top-up lands.
+  rounds/<r>.base in hfloop.json records which reference a round's proposals were built on; on restart, proposals
+  built on a reference that is no longer current are superseded the same way.
+
 State: <run>/hfloop.json (resumable: a finished step is skipped on restart). Layout:
 
     <run>/candidates/frontier.json, summary.json        proposer inputs (`_best.candidate` = current reference)
@@ -36,6 +45,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -77,6 +87,7 @@ class Config:
     probe_cmd: list[str] = field(default_factory=list)
     race_poll_s: float = 60.0
     seed: int = 20261123
+    overlap: bool = False              # propose round r+1 while round r's gate / top-up runs (see module docstring)
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
@@ -191,6 +202,7 @@ class Loop:
         self.lineage_path = self.run / "lineage.json"
         self.state: dict[str, Any] = _read_json(self.state_path, {}) or {"round": 0, "reference": START,
                                                                          "history": [], "rounds": {}}
+        self.pending: dict[int, dict[str, Any]] = {}     # round -> proposers started ahead (overlap)
 
     # -- state
     def save(self) -> None:
@@ -257,8 +269,8 @@ class Loop:
         self.write_frontier()
         return side
 
-    def ensure_evidence(self, round_: int) -> None:
-        ref = self.state["reference"]
+    def ensure_evidence(self, round_: int, ref: str | None = None) -> None:
+        ref = ref or self.state["reference"]
         dest = self.cands / ref
         if any((dest / "eval_after").glob("*/result.json")):
             return
@@ -267,12 +279,25 @@ class Loop:
         # candidate id "eval_after": harbor export writes <dest>/eval_after/<task>__r<k>/ (the proposer's input)
         self.run_evals(rid, {"eval_after": self.harness(ref)}, tasks, self.cfg.evidence_trials, harbor_export=dest)
 
+    def tags(self, round_: int) -> list[str]:
+        return [f"candidate_{round_}_{k}" for k in range(1, self.cfg.proposals + 1)]
+
     def propose(self, round_: int) -> tuple[list[str], list[str]]:
-        """K proposer jobs in parallel; returns (valid, invalid) tags."""
+        """K proposer jobs in parallel on the current reference; returns (valid, invalid) tags."""
+        return self.finish_proposers(round_, self.start_proposers(round_, self.state["reference"]))
+
+    def start_proposers(self, round_: int, base: str) -> dict[str, Any]:
+        """Launch round `round_`'s K proposers on reference `base` (frontier.json must already name it); a tag whose
+        proposal finished earlier is not relaunched. Proposals built on another base are superseded first."""
+        rs = self.state["rounds"].setdefault(str(round_), {})
+        if rs.get("base") not in (None, base):
+            self.supersede(round_, f"built on {rs['base']}, reference is now {base}")
+        rs["base"] = base
+        rs.setdefault("propose_started_at", time.time())
+        self.save()
         K = self.cfg.proposals
-        tags = [f"candidate_{round_}_{k}" for k in range(1, K + 1)]
         procs = {}
-        for k, tag in enumerate(tags, 1):
+        for k, tag in enumerate(self.tags(round_), 1):
             if (self.harness(tag) / "pyproject.toml").exists() and (self.cands / tag / "proposed.json").exists():
                 continue
             env = {**os.environ, **self.cfg.propose_env, "MHO_RUN_DIR": str(self.run), "MHO_TAG": tag,
@@ -280,21 +305,28 @@ class Loop:
                    "MICRO_SCAFFOLD_BASE": str(self.harness(START))}
             (self.cands / tag).mkdir(parents=True, exist_ok=True)
             out = open(self.cands / tag / "propose.log", "ab")
-            procs[tag] = (self.popen(self.cfg.propose_cmd, env=env, stdout=out, stderr=subprocess.STDOUT), out)
-            log(f"propose {tag} started")
-        deadline = time.monotonic() + self.cfg.propose_timeout_s
-        for tag, (p, out) in procs.items():
+            procs[tag] = (self.popen(self.cfg.propose_cmd, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                     start_new_session=True), out)
+            log(f"propose {tag} started (on {base})")
+        return {"round": round_, "base": base, "deadline": time.monotonic() + self.cfg.propose_timeout_s,
+                "procs": procs}
+
+    def finish_proposers(self, round_: int, pend: Mapping[str, Any]) -> tuple[list[str], list[str]]:
+        """Wait for proposers started by `start_proposers`; returns (valid, invalid) tags."""
+        for tag, (p, out) in pend["procs"].items():
             try:
-                rc = p.wait(timeout=max(1.0, deadline - time.monotonic()))
+                rc = p.wait(timeout=max(1.0, pend["deadline"] - time.monotonic()))
             except subprocess.TimeoutExpired:
-                p.kill()
+                _kill(p)
                 rc = "timeout"
             out.close()
             _atomic_json(self.cands / tag / "proposed.json", {"rc": rc, "at": time.time()})
             log(f"propose {tag}: rc {rc}")
+        rs = self.state["rounds"].setdefault(str(round_), {})
+        rs["propose_finished_at"] = time.time()
         valid, invalid = [], []
-        parent = self.harness(self.state["reference"])
-        for tag in tags:
+        parent = self.harness(pend["base"])
+        for tag in self.tags(round_):
             h = self.harness(tag)
             prior = h / "eval_prior"
             if prior.is_dir():            # the proposer's staged evidence: keep it out of the installed harness
@@ -304,6 +336,45 @@ class Loop:
             if not ok:
                 _atomic_json(self.cands / tag / "status.json", {"status": "invalid", "round": round_})
         return valid, invalid
+
+    def supersede(self, round_: int, why: str) -> None:
+        """Drop round `round_`'s proposals (speculative ones built on a reference that changed): kill any still
+        running, move their dirs to candidates/_superseded/r<round>-<ts>/ (kept, never deleted), reset the round."""
+        pend = self.pending.pop(round_, None)
+        for p, out in (pend or {}).get("procs", {}).values():
+            _kill(p)
+            out.close()
+        dest = self.cands / "_superseded" / f"r{round_}-{int(time.time())}"
+        moved = []
+        for tag in self.tags(round_):
+            if (self.cands / tag).exists():
+                dest.mkdir(parents=True, exist_ok=True)
+                os.replace(self.cands / tag, dest / tag)
+                moved.append(tag)
+        rs = self.state["rounds"].setdefault(str(round_), {})
+        rs.setdefault("superseded", []).append({"base": rs.get("base"), "why": why, "at": time.time(),
+                                                "dir": str(dest) if moved else None, "tags": moved})
+        for k in ("base", "proposals", "invalid", "propose_started_at", "propose_finished_at"):
+            rs.pop(k, None)
+        self.save()
+        log(f"round {round_} proposals superseded ({why}): {moved or 'none started'}")
+
+    def start_ahead(self, round_: int, base: str) -> None:
+        """Overlap: start round `round_`'s proposers now, on `base`, unless they already exist on it."""
+        if not self.cfg.overlap or round_ > self.cfg.rounds or round_ in self.pending:
+            return
+        rs = self.state["rounds"].get(str(round_), {})
+        if "proposals" in rs and rs.get("base") == base:
+            return
+        log(f"overlap: round {round_} proposers start now on {base}")
+        self.pending[round_] = self.start_proposers(round_, base)
+
+    def write_summary(self, round_: int, race: Mapping[str, Any] | None, accepted: str | None) -> None:
+        rs = self.state["rounds"].get(str(round_), {})
+        summ = _read_json(self.cands / "summary.json", []) or []
+        summ = [s for s in summ if s.get("round") != round_] + [round_summary(
+            round_, rs.get("reference_before", ""), race, rs.get("invalid", []), accepted)]
+        _atomic_json(self.cands / "summary.json", summ)
 
     def gate(self, round_: int, valid: Sequence[str]) -> dict[str, Any]:
         rdir = self.run / "rounds" / str(round_)
@@ -352,6 +423,20 @@ class Loop:
                                n_looks=len(race.get("looks") or []) or None, record_files=[str(gate_recs_path)])
         log(f"accept {winner} (look {new.history[-1]['look']}, t {new.history[-1]['t']}): "
             f"{'fresh' if plan.fresh else 'top-up'} {plan.n_units} units")
+        nxt = round_ + 1
+        if self.cfg.overlap and nxt <= self.cfg.rounds:
+            # the speculative round-r+1 proposals were built on the old reference: redo them on the winner, now,
+            # so they run during the top-up (evidence first: it is what the proposer reads)
+            # (start_proposers supersedes the ones on file; on a restart nothing of them is running)
+            if nxt in self.pending and self.pending[nxt]["base"] != winner:
+                self.supersede(nxt, f"round {round_} accepted {winner}")
+            self.ensure_evidence(nxt, winner)
+            est = (st["states"][winner].get("acc") or {}).get("B")
+            _atomic_json(self.cands / "frontier.json",
+                         {**frontier_doc(winner, est, [*self.state["history"], {"accepted": winner}]),
+                          "_provisional": "gate estimate; the full val records land after the top-up"})
+            self.write_summary(round_, race, winner)
+            self.start_ahead(nxt, winner)
         top: list[TrialRecord] = []
         for k, tasks in topup_groups(plan).items():
             d = self.run_evals(f"topup-r{round_}-{winner}-x{k}", {winner: self.harness(winner)}, tasks, k)
@@ -386,18 +471,23 @@ class Loop:
         rs = self.state["rounds"].setdefault(str(r), {})
         self.ensure_reference()
         self.ensure_evidence(r)
-        if "proposals" not in rs:
-            valid, invalid = self.propose(r)
+        ref = self.state["reference"]
+        if "proposals" not in rs or rs.get("base", ref) != ref:
+            pend = self.pending.pop(r, None)
+            if pend is None or pend["base"] != ref:
+                pend = self.start_proposers(r, ref)
+            else:
+                log(f"round {r}: using the proposals started ahead on {ref}")
+            valid, invalid = self.finish_proposers(r, pend)
             rs.update(proposals=valid, invalid=invalid)
             self.save()
+        if "accepted" not in rs:
+            self.start_ahead(r + 1, ref)     # overlap: next round's proposers run during this gate
         race = self.gate(r, rs["proposals"]) if rs["proposals"] else None
         if "accepted" not in rs:
             rs["accepted"] = self.accept(r, race) if race else None
             self.save()
-        summ = _read_json(self.cands / "summary.json", []) or []
-        summ = [s for s in summ if s.get("round") != r] + [round_summary(r, rs.get("reference_before", ""), race,
-                                                                         rs["invalid"], rs["accepted"])]
-        _atomic_json(self.cands / "summary.json", summ)
+        self.write_summary(r, race, rs["accepted"])
         log(f"round {r} done: accepted {rs['accepted']}")
 
     def drive(self) -> None:
@@ -408,6 +498,21 @@ class Loop:
             self.round(r)
             self.state["round"] = r
             self.save()
+
+
+def _kill(p: Any) -> None:
+    """Stop a proposer and its children (it runs in its own session: uv -> python -> tools)."""
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except (AttributeError, TypeError, OSError):
+        try:
+            p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        p.wait(timeout=30)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _differs(a: Path, b: Path) -> bool:
