@@ -204,3 +204,119 @@ def test_proposer_diff_tolerates_non_utf8(tmp_path):
     out = tmp_path / "d.patch"
     agent._write_diff(a, b, out)
     assert "changed" in out.read_text()
+
+
+# ----------------------------------------------------------------------------------------------- overlap
+class Recorder:
+    """Fake proposer launcher + evals runner that log one shared event list (to check what ran when)."""
+
+    def __init__(self, loop):
+        self.loop, self.events, self.evals = loop, [], FakeEvals()
+
+    def run(self, cmd, **kw):
+        if "harnessforge.evals" in cmd and "run" in cmd:
+            self.events.append(("evals", json.loads(Path(cmd[cmd.index("run") + 1]).read_text())["run_id"]))
+        return self.evals(cmd, **kw)
+
+    def popen(self, cmd, env, **kw):
+        import shutil
+        loop, tag = self.loop, env["MHO_TAG"]
+        best = json.loads((loop.cands / "frontier.json").read_text())["_best"]["candidate"]
+        self.events.append(("propose", tag, best))
+        h = loop.harness(tag)
+        if h.exists():
+            shutil.rmtree(h)
+        shutil.copytree(loop.harness(best), h)
+        (h / "src" / f"{tag}.py").write_text("# change\n")
+        loop_ = self
+
+        class P:
+            def wait(self, timeout=None):
+                loop_.events.append(("propose_done", tag))
+                return 0
+        return P()
+
+
+def _race(r, winner=None):
+    st = {f"candidate_{r}_{k}": {"verdict": "fail", "look": 1, "acc": {"d": -0.01, "se": 0.01, "t": -1.0, "B": 0.5}}
+          for k in (1, 2)}
+    if winner:
+        st[winner] = {"verdict": "pass", "look": 2, "acc": {"d": 0.05, "se": 0.01, "t": 5.0, "B": 0.62},
+                      "efficacy": 2.6, "fraction": 0.5}
+    return {"looks": [{}] * 4, "decisions": {"states": st, "winner": winner, "done": True}}
+
+
+def _overlap_loop(tmp_path, rounds, winners):
+    _start(tmp_path)
+    loop = Loop(cfg(tmp_path, overlap=True, rounds=rounds, proposals=2, propose_cmd=["x"]), "http://ep")
+    rec_ = Recorder(loop)
+    loop.runner, loop.popen = rec_.run, rec_.popen
+
+    def gate(r, valid):
+        rec_.events.append(("gate", r))
+        w = winners.get(r)
+        if w:
+            d = loop.evals_dir(f"gate-r{r}")
+            d.mkdir(parents=True, exist_ok=True)
+            write_jsonl(d / "records.jsonl", [rec(w, t, i) for t in TASKS[:4] for i in range(4)])
+        return _race(r, w)
+    loop.gate = gate
+    return loop, rec_
+
+
+def test_overlap_no_accept_uses_proposals_started_during_the_gate(tmp_path):
+    loop, r = _overlap_loop(tmp_path, rounds=2, winners={})
+    loop.drive()
+    ev = r.events
+    props = [e for e in ev if e[0] == "propose"]
+    assert [e[1] for e in props] == ["candidate_1_1", "candidate_1_2", "candidate_2_1", "candidate_2_2"]
+    assert all(e[2] == START for e in props)
+    # round 2's proposers were launched before round 1's gate ran, and never relaunched
+    assert ev.index(("propose", "candidate_2_1", START)) < ev.index(("gate", 1))
+    assert loop.state["rounds"]["2"]["base"] == START and loop.state["rounds"]["2"]["proposals"] == [
+        "candidate_2_1", "candidate_2_2"]
+    assert not (loop.cands / "_superseded").exists()
+
+
+def test_overlap_accept_supersedes_and_reproposes_on_winner_during_topup(tmp_path):
+    loop, r = _overlap_loop(tmp_path, rounds=2, winners={1: "candidate_1_1"})
+    loop.drive()
+    ev = r.events
+    props2 = [e for e in ev if e[0] == "propose" and e[1].startswith("candidate_2_")]
+    assert [e[2] for e in props2] == [START, START, "candidate_1_1", "candidate_1_1"]   # speculative, then redone
+    first_topup = next(i for i, e in enumerate(ev) if e[0] == "evals" and e[1].startswith("topup-r1"))
+    evid = ev.index(("evals", "evidence-r2-candidate_1_1"))
+    relaunch = [i for i, e in enumerate(ev) if e == ("propose", "candidate_2_1", "candidate_1_1")][0]
+    assert evid < relaunch < first_topup            # winner's evidence, then proposers, THEN the top-up
+    sup = loop.state["rounds"]["2"]["superseded"]
+    assert sup[0]["base"] == START and sup[0]["tags"] == ["candidate_2_1", "candidate_2_2"]
+    assert all((Path(sup[0]["dir"]) / t / "harness").is_dir() for t in sup[0]["tags"])   # moved aside, not deleted
+    assert loop.state["rounds"]["2"]["base"] == "candidate_1_1"
+    fr = json.loads((loop.cands / "frontier.json").read_text())
+    assert fr["_best"]["candidate"] == "candidate_1_1" and "_provisional" not in fr   # final after the top-up
+
+
+def test_restart_supersedes_proposals_built_on_a_stale_reference(tmp_path):
+    loop, r = _overlap_loop(tmp_path, rounds=1, winners={})
+    loop.ensure_reference()
+    # a previous job finished round 1's proposals on START, then the reference moved on (accepted elsewhere)
+    loop.state["rounds"]["1"] = {"base": START, "proposals": ["candidate_1_1"], "invalid": []}
+    (loop.cands / "candidate_1_1").mkdir(parents=True)
+    import shutil
+    shutil.copytree(loop.harness(START), loop.harness("other"))
+    write_static_side(loop.ref_side("other"), "other", [rec("other", t, i) for t in TASKS for i in range(4)], TASKS, 4)
+    loop.state["reference"] = "other"
+    loop.write_frontier()
+    loop.drive()
+    assert loop.state["rounds"]["1"]["base"] == "other"
+    assert loop.state["rounds"]["1"]["superseded"][0]["base"] == START
+
+
+def test_no_overlap_by_default(tmp_path):
+    _start(tmp_path)
+    loop = Loop(cfg(tmp_path, rounds=2, proposals=2, propose_cmd=["x"]), "http://ep")
+    r = Recorder(loop)
+    loop.runner, loop.popen = r.run, r.popen
+    loop.gate = lambda rr, v: (r.events.append(("gate", rr)), _race(rr))[1]
+    loop.drive()
+    assert r.events.index(("gate", 1)) < r.events.index(("propose", "candidate_2_1", START))
