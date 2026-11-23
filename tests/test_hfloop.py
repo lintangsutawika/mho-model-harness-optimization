@@ -188,3 +188,19 @@ def test_propose_validity_and_eval_prior_moved_out(tmp_path):
     assert valid == ["candidate_1_1"] and invalid == ["candidate_1_2"]          # an unchanged copy is not a proposal
     assert not (loop.harness("candidate_1_1") / "eval_prior").exists()
     assert (loop.cands / "candidate_1_1" / "eval_prior" / "x.json").exists()
+
+
+def test_proposer_diff_tolerates_non_utf8(tmp_path):
+    """mho.optimizer.agent._write_diff must not crash on non-UTF-8 bytes (staged trial output in the workspace)."""
+    import importlib
+    import types
+    sys.modules.setdefault("harness", types.ModuleType("harness"))
+    sys.modules["harness"].scaffold = types.SimpleNamespace(DEFAULT_BASE=tmp_path, _IGNORE=None)
+    agent = importlib.import_module("mho.optimizer.agent")
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(), b.mkdir()
+    (a / "x.txt").write_bytes(b"same\n")
+    (b / "x.txt").write_bytes(b"changed \x95 byte\n")
+    out = tmp_path / "d.patch"
+    agent._write_diff(a, b, out)
+    assert "changed" in out.read_text()
