@@ -1,0 +1,14 @@
+{
+ "_comment": "naive_ext_64kcap_v2_dppo.json (DPPO, TMax 4B loss) on tmax-v11-train-mixed4b-all0 (4,946 tasks: base 4B mixed + all-0; all-1 dropped) instead of tmax-v11-train-naive (6,726). Everything else identical, uniform sampler. Rollouts: a 3-node pool n3dppo2, all 3 nodes lent (the original lent 3 of a 4-node pool); sandboxes on fleet sbh-dppo2 (same shape as sbh-grpo).",
+ "extends": "naive_ext_64kcap_v2_dppo.json",
+ "run_id": "platoon-grpo200-tmax-mixed4b-all0-uniform-noKL-64kcap-v2-dppo-ext--Qwen3.5-4B",
+ "data": {"dataset": "/home/aci18914wh/mho-model-harness-optimization/data-harbor/tmax-v11-train-mixed4b-all0"},
+ "rollout": {"pool_spec": "/home/aci18914wh/hf-dev/pool/scripts/pool-n3dppo2.json", "lend_nodes": [0, 1, 2]},
+ "sandboxes": {"hosts_spec": "/home/aci18914wh/hf-dev/train/sandboxhost-dppo2.json"},
+ "labels": {
+  "data": "tmax-v11-train-mixed4b-all0: base Qwen3.5-4B mixed (1-3 of 4) + all-0 tasks of the SAIL pass-rate sweep; all-1 dropped",
+  "compares_to": "platoon-grpo200-tmax-naive-uniform-noKL-64kcap-v2-dppo-ext--Qwen3.5-4B (same config, full 6,726-task naive pool)"
+ },
+ "stats": {"wandb": {"tags": ["no-KL", "external-engines", "platoon", "ctx64k-rolloutcap", "remote-sbx640", "toolcap64",
+                              "tito", "keepthink-tmpl", "ctxlimit-end", "v2", "dppo-tv0.1", "mixed4b-all0"]}}
+}
