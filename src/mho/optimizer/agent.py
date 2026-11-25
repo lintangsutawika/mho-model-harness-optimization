@@ -18,6 +18,13 @@ across iterations; each proposer still emits one output.
     MICRO_SCAFFOLD_BASE  the original/immutable base scaffold (for diff_from_base); default
                        scaffold.DEFAULT_BASE when unset.
     OPTIMIZER_MODEL / OPTIMIZER_LLM_API_KEY / OPTIMIZER_LLM_BASE_URL   the proposer LLM
+    OPTIMIZER_MAX_INPUT_TOKENS / OPTIMIZER_MAX_OUTPUT_TOKENS   optional limits for the proposer LLM
+                       (needed for self-hosted models litellm has no model info for)
+    OPTIMIZER_CONDENSE_AT_TOKENS   optional: enable OpenHands' LLMSummarizingCondenser, which
+                       summarizes older history once the conversation passes this many tokens,
+                       and also on a context-window-exceeded error. Unset = no condenser.
+    OPTIMIZER_CONDENSE_MAX_EVENTS / OPTIMIZER_CONDENSE_KEEP_FIRST   condenser event cap (240) and
+                       leading events never summarized (2: system prompt + instructions)
   out (harness):
     a VALID installable micro-swe-agent snapshot at <RUN>/candidates/<tag>/harness,
     plus two git-format patches in <candidate>/../diff: diff_from_base.patch + diff_from_parent.patch.
@@ -302,6 +309,45 @@ A directory you leave unchanged or broken is re-proposed by a separate session, 
 """
 
 
+def _env_int(env, name: str) -> int | None:
+    v = (env.get(name) or "").strip()
+    if not v:
+        return None
+    n = int(v)
+    if n <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {v!r}")
+    return n
+
+
+def _llm_limits(env=os.environ) -> dict:
+    """Optional LLM(max_input_tokens=, max_output_tokens=) from the env (unset keys omitted)."""
+    out = {}
+    for key, name in (("max_input_tokens", "OPTIMIZER_MAX_INPUT_TOKENS"),
+                      ("max_output_tokens", "OPTIMIZER_MAX_OUTPUT_TOKENS")):
+        n = _env_int(env, name)
+        if n is not None:
+            out[key] = n
+    return out
+
+
+def _condenser_config(env=os.environ) -> dict | None:
+    """LLMSummarizingCondenser kwargs (minus llm), or None when OPTIMIZER_CONDENSE_AT_TOKENS is unset.
+
+    max_tokens triggers a summary before a request would overflow; keep_first keeps the system
+    prompt and the task instructions verbatim so the proposer never loses its brief."""
+    at = _env_int(env, "OPTIMIZER_CONDENSE_AT_TOKENS")
+    if at is None:
+        return None
+    lim = _llm_limits(env)
+    if "max_input_tokens" in lim and at >= lim["max_input_tokens"]:
+        raise ValueError("OPTIMIZER_CONDENSE_AT_TOKENS must be below OPTIMIZER_MAX_INPUT_TOKENS")
+    max_events = _env_int(env, "OPTIMIZER_CONDENSE_MAX_EVENTS") or 240
+    keep_first = int((env.get("OPTIMIZER_CONDENSE_KEEP_FIRST") or "2").strip())
+    if not 0 <= keep_first < max_events // 2 - 1:
+        raise ValueError("OPTIMIZER_CONDENSE_KEEP_FIRST must be >= 0 and leave room below max_events // 2")
+    return {"max_tokens": at, "max_size": max_events, "keep_first": keep_first}
+
+
 def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
@@ -313,7 +359,14 @@ def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     model = os.environ.get("OPTIMIZER_MODEL", None)
     api_key = os.environ.get("OPTIMIZER_LLM_API_KEY", None)
     base_url = os.environ.get("OPTIMIZER_LLM_BASE_URL", None)
-    llm = LLM(model=model, api_key=api_key, base_url=base_url)
+    llm = LLM(model=model, api_key=api_key, base_url=base_url, **_llm_limits())
+    condenser = None
+    ccfg = _condenser_config()
+    if ccfg is not None:
+        from openhands.sdk.context.condenser import LLMSummarizingCondenser
+        # Same endpoint, separate usage id so summary tokens are reported apart from the agent's.
+        condenser = LLMSummarizingCondenser(llm=llm.model_copy(update={"usage_id": "condenser"}), **ccfg)
+        print(f"[propose] condenser on: {ccfg}", flush=True)
     # Load the propose-harness skill (AgentSkills standard) so the SDK exposes it in
     # <available_skills> and auto-injects its content when triggered. `Skill.load` directly
     # on SKILL.md is used because load_skills_from_dir's dir discovery did not pick it up.
@@ -330,6 +383,7 @@ def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
             Tool(name=TaskTrackerTool.name),
         ],
         agent_context=agent_context,
+        condenser=condenser,
     )
     # Operate IN-PLACE on the candidate dir. Passing a bare string coerces OpenHands into a
     # default/isolated workspace, so the agent's edits never touch our dir (candidate == parent).
