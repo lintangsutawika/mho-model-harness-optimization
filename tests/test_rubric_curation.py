@@ -133,3 +133,17 @@ def test_run_cli_writes_curated_and_summary(tmp_path, monkeypatch):
     assert sorted(p.name for p in cur.iterdir()) == ["index_r1.json", "index_r2.json"]
     summary = json.loads((run / "candidates" / "summary.json").read_text())
     assert summary[0]["candidate"] == "candidate_1_0_1" and len(summary[0]["runs"]["index"]) == 2
+
+
+def test_generate_keeps_the_agent_session(tmp_path, monkeypatch):
+    from mho.optimizer import agent
+    seen = {}
+
+    def fake_run(workspace, instructions, skill_dir, persistence_dir=None):
+        seen["dir"] = persistence_dir
+        (workspace / "candidate_1_0_1" / "rubric.md").write_text(RUBRIC)
+
+    monkeypatch.setattr(agent, "_run_openhands", fake_run)
+    rec = rc.generate(tmp_path / "run", "candidate_1_0_1")
+    assert rec["ok"]
+    assert seen["dir"] == tmp_path / "run" / "candidates" / "candidate_1_0_1" / "conversation"

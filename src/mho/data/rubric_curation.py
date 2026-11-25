@@ -10,6 +10,7 @@ Run layout (same candidates/ archive as the harness loop; tasks are referenced, 
   <RUN>/candidates/<tag>/rubric.md     written by the agent: one yes/no question per bullet
   <RUN>/candidates/<tag>/CANDIDATE.md  the hypothesis behind it
   <RUN>/candidates/<tag>/propose.json  agent tokens / cost
+  <RUN>/candidates/<tag>/conversation/<id>/events/*.json   the agent's full session
   <RUN>/candidates/<tag>/curated/<index>_r<k>.json   one judge pass (scores, selections, cost)
   <RUN>/candidates/summary.json        one row per candidate
 
@@ -242,7 +243,8 @@ def generate(run: Path, tag: str) -> dict:
             f"`./{tag}/rubric.md` and the hypothesis behind it to `./{tag}/CANDIDATE.md`.\n")
     t0 = time.perf_counter()
     llm = agent._run_openhands(cand_root, agent._build_instructions(
-        agent._instructions_md("rubric"), note), agent._skill_dir("rubric"))
+        agent._instructions_md("rubric"), note), agent._skill_dir("rubric"),
+        persistence_dir=cand / "conversation")
     m = getattr(llm, "metrics", None)
     usage = getattr(m, "accumulated_token_usage", None)
     rec = {"seconds": round(time.perf_counter() - t0, 1),

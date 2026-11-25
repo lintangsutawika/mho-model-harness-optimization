@@ -309,7 +309,8 @@ A directory you leave unchanged or broken is re-proposed by a separate session, 
 """
 
 
-def _run_openhands(workspace: Path, instructions: str, skill_dir: Path):
+def _run_openhands(workspace: Path, instructions: str, skill_dir: Path,
+                   persistence_dir: Path | None = None):
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
     from openhands.sdk.skills.skill import Skill
@@ -341,7 +342,9 @@ def _run_openhands(workspace: Path, instructions: str, skill_dir: Path):
     # Operate IN-PLACE on the candidate dir. Passing a bare string coerces OpenHands into a
     # default/isolated workspace, so the agent's edits never touch our dir (candidate == parent).
     # LocalWorkspace(working_dir=...) roots the agent's Terminal/FileEditor tools at our snapshot.
-    conversation = Conversation(agent=agent, workspace=LocalWorkspace(working_dir=str(workspace)))
+    # persistence_dir keeps every event (messages, tool calls, outputs) as JSON; secrets are redacted.
+    conversation = Conversation(agent=agent, workspace=LocalWorkspace(working_dir=str(workspace)),
+                                persistence_dir=None if persistence_dir is None else str(persistence_dir))
     conversation.send_message(instructions)
     conversation.run()
     return llm   # its .metrics hold the session's tokens and cost
