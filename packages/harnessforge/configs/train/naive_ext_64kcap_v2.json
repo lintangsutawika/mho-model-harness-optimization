@@ -1,0 +1,58 @@
+{
+ "_comment": "The 64kcap naive GRPO run with every change from step 0 (no mid-run changes): 64k context enforced at rollout, end-at-limit (PLATOON_MIN_COMPLETION_TOKENS 2048), TITO stitching + Qwen3.5 keep-thinking template (platoon-tito2 venv, PRs #65/#66), 64 tool-call cap (micro-swe-agent step_limit, TMax 4B), remote sandboxes (6 rt_HC x 96 + 112 local, 640 concurrent), sysdeps bundle instead of per-trial apt, TP2 + expandable segments, no KL, online W&B, recovery checkpoints every 5 steps, driver stall guard (1200 s without a step, or any unrequested non-zero exit: stack dump / log tail, stop, driver restart from the latest recovery checkpoint; at most 8 auto-restarts); platoon train loop fails loudly when cancelled from within (patches/platoon-trainloop-cancel.patch).",
+ "extends": "naive_ext_64kcap.json",
+ "run_id": "platoon-grpo200-tmax-naive-uniform-noKL-64kcap-v2-ext--Qwen3.5-4B",
+ "harnessforge_src": "/home/aci18914wh/hf-dev/train/harnessforge-v2/src",
+ "labels": {
+  "kl": "none (no-KL)",
+  "context": "65536 enforced at rollout; a call cut at the window ends the trajectory (end-at-limit)",
+  "toolcap": "64 tool calls from step 0 (micro-swe-agent agent.step_limit 64); matches TMax 4B",
+  "prompts": "TITO stitching + Qwen3.5 keep-thinking template (platoon-tito2 venv) from step 0",
+  "rollout": "external: n4hf72 nodes 1-3; sandboxes: 6 rt_HC hosts x 96 + 112 local, 640 concurrent",
+  "compares_to": "grpo200-tmax-naive-4node-64k--Qwen3.5-4B (rollouts uncapped at 262k, training truncated to 64k; KL 0.01)"
+ },
+ "harness": {
+  "agent_config": "/home/aci18914wh/hf-dev/train/harnessforge-v2/configs/train/agent-toolcap64.yaml"
+ },
+ "sandboxes": {
+  "mode": "remote",
+  "hosts_spec": "/home/aci18914wh/hf-dev/train/harnessforge-v2/configs/sandboxhost/grpo-train.json",
+  "local_slots": 112
+ },
+ "driver": {
+  "platoon": "/home/aci18914wh/hf-dev/train/platoon-tito2-venv/bin/platoon",
+  "env": {
+   "PLATOON_MIN_COMPLETION_TOKENS": "2048"
+  },
+  "stall_timeout": 1200,
+  "stall_startup_grace": 3600,
+  "stall_stop_wait": 600,
+  "max_auto_restarts": 8
+ },
+ "train": {
+  "max_concurrent_rollouts": 640,
+  "renderer_kwargs": {
+   "chat_template": "/home/aci18914wh/hf-dev/train/platoon-tito2-venv/templates/qwen3.5-keep-thinking-v1.jinja"
+  }
+ },
+ "checkpoint": {
+  "every": 50,
+  "recovery_every": 5
+ },
+ "stats": {
+  "wandb": {
+   "tags": [
+    "no-KL",
+    "external-engines",
+    "platoon",
+    "ctx64k-rolloutcap",
+    "remote-sbx640",
+    "toolcap64",
+    "tito",
+    "keepthink-tmpl",
+    "ctxlimit-end",
+    "v2"
+   ]
+  }
+ }
+}

@@ -17,7 +17,9 @@ One candidate cycle, over a train subset S that is fixed until a new iteration s
                 (MHO_PROPOSE_TAGS); a sibling it leaves invalid is re-proposed on its own
       build   : the kind's job, if any (model: train the current model) [kind.build_stage]
       eval_b  : evaluate the candidate pair on the SAME S                -> ts_B
-                train gate: utils.gate, B vs A paired per task (--gate-z)
+                train gate: utils.gate, B vs A paired per task (--gate-z); with --seq-gate
+                a sequential test instead (utils.seq): B is looked at after each attempt
+                round while its eval runs, and stopped early once it clearly passes or fails
                 [only kinds with train_gate: a model candidate was trained on the train data,
                  so it goes from build straight to selection]
       select  : of the siblings that passed, the one with the largest paired t (train gate)
@@ -78,6 +80,7 @@ from utils import alloc
 from utils.gate import (GateConfig, decide, decide_dirs, env_failures, paired, per_task_dirs,
                         task_mean)
 from utils.scores import metric_of, score_trials
+from utils.seq import SeqConfig, decide_look, look_pt, parse_futility
 from utils.state import _candidate_hypothesis, _sample_subset
 
 SCHEMA = 4
@@ -131,6 +134,7 @@ class Loop:
                  schedule: list[tuple[str, int]],
                  submit_eval: Callable[..., str], submit_propose: Callable[..., str | None],
                  submit_hold: Callable[..., str] | None = None,
+                 submit_eval_group: Callable[..., str] | None = None,
                  score_fn: Callable[[Path], dict] = score_trials,
                  sleep: Callable[[float], None] = time.sleep, poll_seconds: float = 60):
         unknown = {k for k, _ in schedule} - set(kinds)
@@ -140,6 +144,7 @@ class Loop:
         self.kinds, self.schedule = kinds, schedule
         self._submit_eval, self._submit_propose = submit_eval, submit_propose
         self._submit_hold = submit_hold
+        self._submit_eval_group = submit_eval_group
         self.score_fn, self.sleep, self.poll_seconds = score_fn, sleep, poll_seconds
         self.gate_cfg = GateConfig.from_args(args)
         self.cands = run_dir / "candidates"
@@ -322,6 +327,9 @@ class Loop:
         st = self.st
         st["try"] += 1
         self._reset_candidate()
+        if st["subset"] is None:                  # a kind without eval_a: just start over
+            self._new_iteration()
+            return
         if count_try:
             st["subset"]["tries"] += 1
         if st["subset"]["tries"] >= self.args.ts_repropose_limit:
@@ -402,6 +410,17 @@ class Loop:
                               out_dir=self.tag_dir(st["subset"]["a_tag"]), job_name="eval_before")
         raise AssertionError(f"no submit for stage {stage!r}")
 
+    def _stop_file(self, tag: str) -> Path:
+        """Creating it asks the running eval_b of `tag` to stop (scripts/optimize/eval.sh)."""
+        return self.tag_dir(tag) / "eval_after.stop"
+
+    def _seq_cfg(self) -> SeqConfig | None:
+        if not getattr(self.args, "seq_gate", False):
+            return None
+        return SeqConfig(k=int(self.args.trials),
+                         c=float(getattr(self.args, "seq_c", None) or SeqConfig(1).c),
+                         futility=parse_futility(getattr(self.args, "seq_futility", None)))
+
     def _link_a_traces(self, tag: str) -> None:
         """Each sibling is its own candidate dir; give it the subset's A traces so every
         candidate is self-contained for the proposer (eval_before + eval_after)."""
@@ -426,9 +445,15 @@ class Loop:
                 raise LoopAbort("propose job not configured (MHO_PROPOSE_JOB unset)")
             return jid
         if stage == "eval_b":
+            self._stop_file(tag).unlink(missing_ok=True)
+            m["seq_look"] = 0
             return self._eval(self._cand_pair(tag), data=st["subset"]["dir"],
                               out_dir=self.tag_dir(tag), job_name="eval_after", logs=logs)
         if stage == self.kind.build_stage:
+            if not self.kind.proposes and m["attempt"] == 1:
+                st["propose_count"] += 1          # the budget counts candidates of every kind
+                print(f"  [{st['kind']} {st['propose_count']}/{self.args.iterations}] {tag}",
+                      flush=True)
             return self.kind.submit_build(self, self.tag_dir(tag), self.pair, logs)
         raise AssertionError(f"no submit for sibling stage {stage!r}")
 
@@ -553,8 +578,9 @@ class Loop:
         n = self._round_size()
         base = self.tag
         tags = [base] if n == 1 else [base + chr(ord("a") + k) for k in range(n)]
+        first = "propose" if self.kind.proposes else self.kind.build_stage
         st["round"] = {"members": [
-            {"tag": t, "i": k, "n": n, "stage": "propose", "job": None, "attempt": 1,
+            {"tag": t, "i": k, "n": n, "stage": first, "job": None, "attempt": 1,
              "ts_B": None, "train_gate": None, "status": "running"}
             for k, t in enumerate(tags)]}
         if self._joint(n):
@@ -633,13 +659,20 @@ class Loop:
             self._save()
         progressed = self._step_joint() if st["round"].get("joint") else False
         waiting = {m["tag"] for m in self._joint_members()}
+        progressed = self._submit_eval_b_group() or progressed
         for m in st["round"]["members"]:
             if m["status"] != "running" or m["tag"] in waiting:
                 continue
+            if m["job"] is None and self._group_size() > 1 and m["stage"] == "eval_b":
+                continue        # submitted together by _submit_eval_b_group once siblings are ready
             if m["job"] is None:
                 print(f"{_now()} iter {st['iteration']} {m['stage']} {m['tag']} -> submit"
                       + (f" (attempt {m['attempt']})" if m["attempt"] > 1 else ""))
                 m["job"] = self._submit_member(m)
+                self._save()
+                progressed = True
+                continue
+            if m["stage"] == "eval_b" and self._seq_step(m):
                 self._save()
                 progressed = True
                 continue
@@ -657,6 +690,53 @@ class Loop:
             return True
         if not progressed:
             self.sleep(self.poll_seconds)
+        return True
+
+    def _group_size(self) -> int:
+        """--eval-group G > 1: the round's eval_b jobs are submitted as ONE node job of up to G
+        harnesses sharing one served model (jobs.submit_eval_group). 1 = one job per sibling."""
+        if self._submit_eval_group is None:
+            return 1
+        return max(1, int(getattr(self.args, "eval_group", 1) or 1))
+
+    def _submit_eval_b_group(self) -> bool:
+        """Submit the siblings waiting at eval_b as grouped node jobs, but only once no running
+        sibling is still before eval_b (proposing/building), so a round's harnesses share a node.
+        Returns True if anything was submitted."""
+        g = self._group_size()
+        if g <= 1:
+            return False
+        st = self.st
+        running = [m for m in st["round"]["members"] if m["status"] == "running"]
+        if any(m["stage"] != "eval_b" for m in running):
+            return False
+        waiting = [m for m in running if m["job"] is None]
+        if not waiting:
+            return False
+        for k in range(0, len(waiting), g):
+            chunk = waiting[k:k + g]
+            tags = [m["tag"] for m in chunk]
+            print(f"{_now()} iter {st['iteration']} eval_b group {', '.join(tags)} -> submit"
+                  + (" (retry)" if any(m["attempt"] > 1 for m in chunk) else ""))
+            rows = [{"harness": self._cand_pair(m["tag"]).harness, "out_dir": self.tag_dir(m["tag"]),
+                     "job_name": "eval_after",
+                     "logs": self.log_path(m["tag"], "eval_b", m["attempt"])} for m in chunk]
+            for m in chunk:
+                self._stop_file(m["tag"]).unlink(missing_ok=True)
+            name = f"{chunk[0]['tag']}-eval_after-group" + (f"-attempt{chunk[0]['attempt']}"
+                                                            if chunk[0]["attempt"] > 1 else "")
+            pair = self.pair
+            conc = int(getattr(self.args, "group_concurrent", 0) or self.args.concurrent)
+            jid = self._submit_eval_group(
+                self.sched, rows, model=pair.model or self.args.model, data=st["subset"]["dir"],
+                n_trials=self.args.trials, n_concurrent=conc,
+                group_file=self.run_dir / "logs" / f"{name}.json",
+                logs=self.run_dir / "logs" / f"{name}.out", job_name="eval_after",
+                base_model=self.args.model if pair.model else None)
+            for m in chunk:
+                m["job"], m["group"] = jid, tags
+                m["seq_look"] = 0
+            self._save()
         return True
 
     def _member_done(self, m: dict, rc: int) -> None:
@@ -683,6 +763,10 @@ class Loop:
                 self._finish("no_proposal", m, reason=why)
                 if st["propose_fails"] >= MAX_INFRA_FAILS:
                     st["propose_fails"] = 0
+                    # Persist the reset counter and this member's no_proposal before aborting (as
+                    # _infra_fail does): otherwise a restart replays the stale failures from the
+                    # old state.json and aborts again at once.
+                    self._save()
                     raise LoopAbort(f"ABORT: {MAX_INFRA_FAILS} consecutive proposals produced "
                                     f"no candidate; check {self.run_dir}/logs/*-propose.out.")
                 return
@@ -725,9 +809,14 @@ class Loop:
             return
         m["ts_B"] = self._score("eval_b", tag)
         ts_A = st["subset"]["ts_A"]
+        seq = self._seq_cfg()
+        z = seq.efficacy(seq.k) if seq else self.gate_cfg.z
         dec = decide_dirs(self._out_dir("eval_a"), self._out_dir("eval_b", tag),
-                          z=self.gate_cfg.z, cfg=self.gate_cfg, fallback=(ts_A, m["ts_B"]))
+                          z=z, cfg=self.gate_cfg, fallback=(ts_A, m["ts_B"]))
         m["train_gate"] = dec.fields()
+        if seq:
+            m["train_gate"]["seq"] = {"look": seq.k, "verdict": "pass" if dec.accept else "fail",
+                                      "bound": round(z, 3), "futility": None}
         self._event(stage="train_gate", tag=tag, **dec.fields())
         if dec.accept:
             print(f"  train gate PASS [{dec.path}] {tag} (B {m['ts_B']:.4f} vs A {ts_A:.4f}): "
@@ -738,6 +827,68 @@ class Loop:
                   f"not run on val")
             m.update(status="out", outcome="train_fail")
             self._finish("train_fail", m)
+
+    def _a_pt(self) -> dict:
+        key = self.st["subset"]["a_tag"]
+        if getattr(self, "_a_pt_cache", (None,))[0] != key:
+            self._a_pt_cache = (key, per_task_dirs([self._out_dir("eval_a")],
+                                                   self.gate_cfg.cost_metric))
+        return self._a_pt_cache[1]
+
+    def _n_subset_tasks(self) -> int:
+        d = self.st["subset"]["dir"]
+        if getattr(self, "_n_tasks_cache", (None,))[0] != d:
+            n = sum(1 for p in Path(d).iterdir() if p.is_dir()) if Path(d).is_dir() else 0
+            self._n_tasks_cache = (d, n)
+        return self._n_tasks_cache[1]
+
+    def _seq_step(self, m: dict) -> bool:
+        """--seq-gate: take every look of sibling `m`'s running eval_b that is ready (look r =
+        the first r launched trials of every task, all finished). A clear pass or fail ends the
+        sibling now and asks its eval to stop; the last look is the job's own end
+        (_member_eval_b, at the design's last boundary). Returns True if `m` was decided."""
+        cfg = self._seq_cfg()
+        if cfg is None or self.st["subset"] is None:
+            return False
+        tag, out = m["tag"], self._out_dir("eval_b", m["tag"])
+        a = self._a_pt()
+        n_tasks = self._n_subset_tasks()
+        if not a or not n_tasks:
+            return False
+        while m.get("seq_look", 0) + 1 < cfg.k:
+            r = m.get("seq_look", 0) + 1
+            b, info = look_pt(out, r, n_tasks, self.gate_cfg.cost_metric)
+            if b is None:
+                return False
+            if info["n"] and info["env_bad"] / info["n"] > ENV_FAIL_MAX:
+                return False          # likely a bad node: let the job end and be retried
+            dec = decide_look(a, b, r, cfg)
+            m["seq_look"] = r
+            self._event(stage="seq_look", tag=tag, **dec.fields())
+            print(f"{_now()} [seq] {tag} {dec.reason} -> {dec.verdict}")
+            if dec.verdict == "continue":
+                continue
+            m["ts_B"] = task_mean(b)
+            m["train_gate"] = dec.fields()
+            m["stopped_job"] = m["job"]
+            try:
+                self._stop_file(tag).parent.mkdir(parents=True, exist_ok=True)
+                self._stop_file(tag).touch()
+            except OSError as e:
+                print(f"  could not ask {tag}'s eval to stop: {e}")
+            ts_A = self.st["subset"]["ts_A"]
+            self.st["infra_fails"] = 0
+            if dec.verdict == "pass":
+                print(f"  train gate PASS [seq look {r}/{cfg.k}] {tag} (B {m['ts_B']:.4f} vs A "
+                      f"{ts_A:.4f}); stopping its eval")
+                m.update(status="pass", job=None, attempt=1)
+            else:
+                print(f"  train gate FAIL [seq look {r}/{cfg.k}] {tag} (B {m['ts_B']:.4f} vs A "
+                      f"{ts_A:.4f}); stopping its eval, not run on val")
+                m.update(status="out", outcome="train_fail", job=None, attempt=1)
+                self._finish("train_fail", m, look=r)
+            return True
+        return False
 
     @staticmethod
     def _rank(m: dict) -> tuple:
@@ -767,7 +918,27 @@ class Loop:
             print(f"  selected {win['tag']} for val ({len(passed)}/{len(members)} passed the "
                   f"train gate)")
         st.update(cur=win["tag"], ts_B=win["ts_B"], train_gate=win["train_gate"], round=None)
+        if self.kind.accept_on_train:
+            self._accept_on_train()
+            return
         self._goto("eval_val")
+
+    def _accept_on_train(self) -> None:
+        """--harness-accept train: the selected sibling becomes the current pair on its train
+        gate alone. No val eval; its train-subset score stands in for the frontier metric."""
+        st = self.st
+        cand, ts_B = self._cand_pair(), st["ts_B"]
+        prev = self._best_metric()
+        self._update_frontier(ts_B, accept=True)
+        self.kind.on_accept(self.tag_dir(), self.run_dir, cand)
+        st["pair"] = cand.as_dict()
+        self._write_best_pair()
+        print(f"  accepted {self.tag} on the train gate alone (no val eval)")
+        self._finish("accepted", path="train_only", train_score=ts_B, prev_best=prev,
+                     pair=cand.as_dict())
+        st["version"] += 1
+        st["try"] = 1
+        self._new_iteration()
 
     def _done_eval_val(self, ok: bool, rc: int) -> None:
         """Uniform val eval (--no-val-adaptive): one job, one look at --gate-z."""
@@ -802,6 +973,11 @@ class Loop:
 
     def _adaptive(self) -> bool:
         return bool(getattr(self.args, "val_adaptive", False)) and Path(self.args.val_data).is_dir()
+
+    def _val_looks(self) -> bool:
+        """Adaptive val looks for this candidate? Not for an always-accepted kind: there is no
+        decision to make early, and its uniform eval is the reported score."""
+        return self._adaptive() and not (self.st.get("kind") and self.kind.always_accept)
 
     def _val_dirs(self, tag: str) -> list[Path]:
         """Every val eval dir of `tag`: evaluation/<tag> plus its groups / top-ups
@@ -1032,15 +1208,19 @@ class Loop:
         lk = f" look {look}" if look else ""
         print(f"  val gate{lk} {'PASS [' + str(dec.path) + ']' if dec.accept else 'FAIL'} "
               f"(val {val:.4f} vs {ref} {best}): {dec.reason}")
+        accept, path = dec.accept, dec.path
+        if not accept and self.kind.always_accept:
+            accept, path = True, "always"
+            print(f"  {self.st['kind']} candidates are always accepted (the gate is only recorded)")
         cand = self._cand_pair()
         trials = int(sum(r["n"] for r in g["b"].values())) if g["b"] else None
-        if self._update_frontier(val, accept=dec.accept):
+        if self._update_frontier(val, accept=accept):
             self.kind.on_accept(self.tag_dir(), self.run_dir, cand)
             st["pair"] = cand.as_dict()
             self._write_best_pair()
-            self._finish("accepted", val=val, prev_best=best, path=dec.path, look=look,
+            self._finish("accepted", val=val, prev_best=best, path=path, look=look,
                          val_trials=trials, val_gate=dec.fields(), pair=cand.as_dict())
-            fill = self._plan_fill() if self._adaptive() else None
+            fill = self._plan_fill() if self._val_looks() else None
             if fill:
                 st["val"] = fill
                 return
@@ -1116,7 +1296,7 @@ class Loop:
         st = self.st
         if st["stage"] == "round":
             return self._step_round()
-        if st["stage"] == "eval_val" and self._adaptive() and not st.get("job"):
+        if st["stage"] == "eval_val" and self._val_looks() and not st.get("job"):
             return self._step_val()
         job = st["job"]
         if job:
@@ -1133,6 +1313,11 @@ class Loop:
         # a candidate already proposed always runs to its terminal outcome.
         if st["stage"] == "eval_a" and not self._budget_left():
             return False
+        if st["stage"] == "eval_a" and not self.kinds[self._scheduled_kind()].proposes:
+            # nothing to propose from: no subset / A traces needed, go straight to the build
+            self._goto("round")
+            self._save()
+            return True
         print(f"{_now()} iter {st['iteration']} {st['stage']} {self.tag} -> submit"
               + (f" (attempt {st['attempt']})" if st["attempt"] > 1 else ""))
         jid = self._submit()

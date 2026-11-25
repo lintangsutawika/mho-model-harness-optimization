@@ -45,6 +45,18 @@ class Kind(ABC):
     # May the loop run several sibling candidates of this kind at once (--proposals)? Off for
     # kinds whose build is heavy (model: a training run per sibling).
     parallel: bool = True
+    # Does a candidate start with a proposer job? Off for kinds whose candidate is fully
+    # determined by the current pair (a model candidate with --model-source sample: train the
+    # current model with the current harness on the task reward).
+    # Such a kind skips eval_a (no subset evidence is needed) and starts at its build stage.
+    proposes: bool = True
+    # Accept every candidate that gets a val score, without the val gate (WHALE's weight
+    # updates are always kept). Its val eval is a plain uniform one (no adaptive looks).
+    always_accept: bool = False
+    # Accept the round's selected sibling on the train gate alone: no val eval at all (an
+    # experiment: with --gate-z 0 every B > A on the train subset is kept). The frontier
+    # then holds that candidate's train-subset score, not a val score.
+    accept_on_train: bool = False
 
     @abstractmethod
     def proposal_ok(self, cand_dir: Path) -> tuple[bool, str]:

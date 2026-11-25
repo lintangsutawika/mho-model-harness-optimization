@@ -13,6 +13,11 @@ kinds:
     model-only    : model candidates (fixed harness)
     model-harness : --harness-proposals harness, then --model-proposals model, repeating
 
+Model candidates are configured by --model-source (propose: the sigma proposer | sample: the
+task reward, no proposer) x --model-objective (grpo | rsft), plus --model-accept and
+--model-steps (mho/kinds/model.py). E.g. WHALE = --mode model-harness --model-source sample
+--model-objective rsft --model-accept always.
+
 Data: --train-data is the local train task dir (each iteration evaluates a fresh random
 --propose-sample subset of it: the proposer's evidence and the train gate), --val-data the
 held-out val split (the accept gate).
@@ -28,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 from mho.jobs import (AGENT_IMPORT, EVAL_SCRIPT, LOG_VERBOSE, POLL_SECONDS,  # noqa: F401
-                      PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_hold,
+                      PROPOSE_JOB, TRAIN_SCRIPT, Scheduler, submit_eval, submit_hold, submit_eval_group,
                       submit_propose, submit_train)
 from mho.kinds import HarnessKind, ModelKind
 from mho.loop import Loop
@@ -117,6 +122,35 @@ def main(argv: list[str] | None = None) -> None:
                         "parent, same train subset); the best one that passes the train gate "
                         "goes to val. Kinds that are not parallel (model) always use 1. "
                         "Env: MHO_PROPOSALS.", metavar="M")
+    p.add_argument("--model-source", choices=["propose", "sample"],
+                   default=os.environ.get("MHO_MODEL_SOURCE", "propose"),
+                   help="model candidates' training signal. propose: the proposer writes model "
+                        "specs, realized into sigma rewards for the train tasks. sample: no "
+                        "proposer; the train tasks' own verifier reward (WHALE). "
+                        "Env: MHO_MODEL_SOURCE.")
+    p.add_argument("--model-objective", choices=["grpo", "rsft"],
+                   default=os.environ.get("MHO_MODEL_OBJECTIVE", "grpo"),
+                   help="how a model candidate's rollouts update the weights. grpo: policy "
+                        "gradient. rsft: rejection-sampling fine-tuning, an SFT step on the "
+                        "successful rollouts only (MHO_RSFT_THRESHOLD [0.5]). lr: MHO_TRAIN_LR "
+                        "[1e-6, as in WHALE]. Env: MHO_MODEL_OBJECTIVE.")
+    p.add_argument("--model-accept", choices=["gate", "always"],
+                   default=os.environ.get("MHO_MODEL_ACCEPT", "gate"),
+                   help="gate: a model candidate must pass the val gate. always (WHALE): every "
+                        "candidate that produces a checkpoint becomes the current model (its val "
+                        "score is still recorded). Env: MHO_MODEL_ACCEPT.")
+    p.add_argument("--harness-accept", choices=["gate", "train"],
+                   default=os.environ.get("MHO_HARNESS_ACCEPT", "gate"),
+                   help="gate: a harness candidate that passes the train gate must also pass the "
+                        "val gate. train (experiment): accept the round's best sibling on the "
+                        "train gate alone, no val eval (with --gate-z 0: any B > A). Env: "
+                        "MHO_HARNESS_ACCEPT.")
+    p.add_argument("--model-steps", type=int,
+                   default=int(os.environ.get("MHO_MODEL_STEPS", 0)) or None,
+                   help="rollout+update steps per model candidate (NUM_ROLLOUT; one step = a "
+                        "batch of TRAIN_BATCH_SIZE prompts x N_SAMPLES_PER_PROMPT rollouts, "
+                        "GLOBAL_BATCH_SIZE per update). Default: train.sh's. Each candidate is "
+                        "one --iterations unit and is evaluated on val. Env: MHO_MODEL_STEPS.")
     p.add_argument("--propose-mode", choices=["joint", "independent"],
                    default=os.environ.get("MHO_PROPOSE_MODE", "independent"),
                    help="how a round's M siblings are proposed. independent (default): M "
@@ -174,6 +208,30 @@ def main(argv: list[str] | None = None) -> None:
                    default=_g["cost_metric"],
                    help="cost for the cheaper path: agent output tokens per trial (default; "
                         "independent of node load) or agent wall seconds. Env: MHO_GATE_COST.")
+    p.add_argument("--eval-group", dest="eval_group", type=int,
+                   default=int(os.environ.get("MHO_EVAL_GROUP_SIZE", 1)),
+                   help="harness rounds: evaluate up to G siblings' train-sample evals (eval_b) in "
+                        "ONE node job sharing one served model (same model, different harness). "
+                        "1 = one job per sibling. Env: MHO_EVAL_GROUP_SIZE.", metavar="G")
+    p.add_argument("--group-concurrent", dest="group_concurrent", type=int,
+                   default=int(os.environ.get("MHO_GROUP_CONCURRENT", 0)),
+                   help="trials in parallel PER member of a grouped eval (default: --concurrent). "
+                        "Env: MHO_GROUP_CONCURRENT.")
+    p.add_argument("--seq-gate", dest="seq_gate", action=argparse.BooleanOptionalAction,
+                   default=os.environ.get("MHO_SEQ_GATE", "0") not in ("", "0", "false"),
+                   help="sequential train gate (utils.seq): look at each sibling's eval_b after "
+                        "every attempt round (the first r launched trials of every task) and "
+                        "stop it as soon as it clearly passes (t > c*sqrt(K/r)) or fails "
+                        "(t <= --seq-futility[r]); the last look passes at t > c. Replaces "
+                        "--gate-z on the train gate. Env: MHO_SEQ_GATE=1.")
+    p.add_argument("--seq-c", dest="seq_c", type=float,
+                   default=float(os.environ.get("MHO_SEQ_C", 1.72)),
+                   help="sequential gate efficacy constant (1.72 = 5%% one-sided false accepts "
+                        "for 5 trials, like the fixed z=1.645 test). Env: MHO_SEQ_C.")
+    p.add_argument("--seq-futility", dest="seq_futility",
+                   default=os.environ.get("MHO_SEQ_FUTILITY", "-0.5,0,0.5,1.0"),
+                   help="sequential gate: stop B as failed if t <= these after attempt rounds "
+                        "1,2,... (comma list). Env: MHO_SEQ_FUTILITY.")
     p.add_argument("--run-name", default=None, help="stable name so a killed run can resume its state.json")
     p.add_argument("--skip-baseline", action="store_true")
     p.add_argument("--fresh", action="store_true", help="ignore any existing state.json and restart the run")
@@ -200,11 +258,16 @@ def main(argv: list[str] | None = None) -> None:
     run_dir = RUNS_DIR / args.run_name
     _tee_driver_log(run_dir / "logs" / "run.out")
     try:
-        kinds = {"harness": HarnessKind(),
+        kinds = {"harness": HarnessKind(accept=args.harness_accept),
                  "model": ModelKind(train_data=args.train_data, trainer=args.trainer,
-                                    submit_train=submit_train)}
+                                    submit_train=submit_train, source=args.model_source,
+                                    objective=args.model_objective, accept=args.model_accept,
+                                    steps=args.model_steps)}
+        if args.mode != "harness-only":
+            print(f"model candidates: {kinds['model'].describe()}", flush=True)
         Loop(args, run_dir, Scheduler(), kinds=kinds, schedule=schedule_for(args),
              submit_eval=submit_eval, submit_propose=submit_propose, submit_hold=submit_hold,
+             submit_eval_group=submit_eval_group,
              poll_seconds=POLL_SECONDS).run()
     except Exception:
         import traceback as _tb

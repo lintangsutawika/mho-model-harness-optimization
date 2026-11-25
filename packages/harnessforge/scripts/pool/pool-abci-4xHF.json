@@ -1,0 +1,15 @@
+{
+ "pool_id": "main",
+ "state_root": "~/hf-dev/pool/state",
+ "sif": "/home/<user>/mho-model-harness-optimization/miles_latest.sif",
+ "binds": ["/groups", "/home/<user>/hf-dev/pool/emptyroot:/root"],
+ "policy": {"id": "qwen3.5-4b", "path": "Qwen/Qwen3.5-4B"},
+ "router_args": {"policy": "cache_aware"},
+ "spec": {
+  "nodes": 4, "gpus_per_node": 8, "tp": 1, "served_name": "policy", "max_context": 262144,
+  "engine_args": {"tool-call-parser": "qwen3_coder", "mem-fraction-static": 0.85,
+                  "enable-metrics": true},
+  "launcher": {"kind": "pbs", "queue": "R9920261300", "account": "gai51740",
+               "resource_type": "rt_HF", "walltime": "24:00:00"}
+ }
+}

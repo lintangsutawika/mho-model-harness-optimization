@@ -1,0 +1,42 @@
+--- a/platoon/train/trainer/rl.py
++++ b/platoon/train/trainer/rl.py
+@@ -543,10 +543,16 @@
+         try:
+             async with asyncio.TaskGroup() as tg:
+                 tg.create_task(
+-                    _train_loop(self, tg, shared_state, start.step, end_batch, train_workflow), name="train_loop"
++                    _fail_if_cancelled_from_within(
++                        _train_loop(self, tg, shared_state, start.step, end_batch, train_workflow), "train loop"
++                    ),
++                    name="train_loop",
+                 )
+                 if shared_state.eval_loop_running:
+-                    tg.create_task(_eval_loop(self, shared_state, eval_workflow), name="eval_loop")
++                    tg.create_task(
++                        _fail_if_cancelled_from_within(_eval_loop(self, shared_state, eval_workflow), "eval loop"),
++                        name="eval_loop",
++                    )
+         except* TerminateTrainLoop:
+             pass
+         except* (KeyboardInterrupt, asyncio.CancelledError, TrainInterrupted):
+@@ -590,3 +596,20 @@
+         service_client_factory=policy.new_service_client,
+         **(pins or {"named": lambda: named_state_paths(run_dir, policy.id, keep=keep)}),
+     )
++
++
++async def _fail_if_cancelled_from_within(coro, name: str):
++    """Run a loop of the training task group; when a ``CancelledError`` escapes it while its own task is not being
++    cancelled (an awaited future or inner task was cancelled by someone else), log where and raise ``RuntimeError``
++    instead.  A task group ignores a child that ends cancelled: without this the run would wait forever on the
++    dispatcher and the rollout groups, with no step and no error (harnessforge: the 64kcap hangs of 2026-11-20/21)."""
++
++    try:
++        return await coro
++    except asyncio.CancelledError:
++        task = asyncio.current_task()
++        if task is None or task.cancelling():
++            raise
++        logger.exception(f"The {name} was cancelled from within (an awaited future was cancelled, its task was not); "
++                         "failing the run instead of hanging")
++        raise RuntimeError(f"the {name} was cancelled from within") from None

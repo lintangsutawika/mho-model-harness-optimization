@@ -1,0 +1,4 @@
+# TMax 4B: "64 maximum tool calls" (allenai/tmax-4b, arXiv 2606.23321 sec. 4.1).
+# micro-swe-agent counts model calls; a response with several tool calls is rare (0.11 per trajectory).
+agent:
+  step_limit: 64

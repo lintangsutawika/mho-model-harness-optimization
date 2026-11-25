@@ -1,0 +1,11 @@
+{
+ "_comment": "Topology check for naive.json: same nodes (1 trainer + 3 rollout), driver and sandboxes on the head node, shared image cache, harbor system deps on; one small step only.",
+ "extends": "naive.json",
+ "run_id": "platoon-grpo-fullcheck1",
+ "gateway": {"walltime": "1:30:00"},
+ "train": {"batch_size": 4, "max_training_steps": 2, "max_concurrent_rollouts": 64,
+           "workflow_config": {"group_size": 8}},
+ "checkpoint": {"every": 0},
+ "export": {"every": 1},
+ "stats": {"wandb": {"mode": "disabled"}}
+}

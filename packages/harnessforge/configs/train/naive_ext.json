@@ -1,0 +1,36 @@
+{
+ "_comment": "naive.json with rollouts on lent pool engines (n4hf72 nodes 1-3, 24 engines) attached to a 1-node miles-tinker trainer (--rollout-external, disk-delta). No KL-to-reference term: labelled no-KL. New run dir; nothing from the stopped run 2995027 is reused.",
+ "extends": "naive.json",
+ "run_id": "platoon-grpo200-tmax-naive-uniform-noKL-ext--Qwen3.5-4B",
+ "labels": {
+  "kl": "none (no-KL)",
+  "rollout": "external: n4hf72 nodes 1-3",
+  "compares_to": "grpo200-tmax-naive-4node-64k--Qwen3.5-4B (had KL 0.01 low_var_kl)"
+ },
+ "harnessforge_src": "/home/aci18914wh/hf-dev/train/harnessforge-ext/src",
+ "rollout": {
+  "mode": "external",
+  "pool_spec": "/home/aci18914wh/hf-dev/pool/scripts/pool-n4hf72.json",
+  "lend_nodes": [
+   1,
+   2,
+   3
+  ],
+  "engine_local_dir": "/dev/shm/{user}-hftrain-{run_id}-{launch}/engine-local",
+  "drain_timeout": 1800
+ },
+ "gateway": {
+  "miles_src": "/home/aci18914wh/hf-dev/train/miles-tinker-ext-run",
+  "walltime": "72:00:00",
+  "weight_sync": "disk-delta"
+ },
+ "stats": {
+  "wandb": {
+   "tags": [
+    "no-KL",
+    "external-engines",
+    "platoon"
+   ]
+  }
+ }
+}

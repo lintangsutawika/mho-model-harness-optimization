@@ -1,0 +1,33 @@
+{
+ "_comment": "Full naive comparison run (uniform sampler) vs grpo200-tmax-naive-4node-64k--Qwen3.5-4B: 1 trainer + 3 rollout rt_HF nodes, platoon client + sandboxes on the trainer node. See docs/train.md for what differs (no KL-to-reference).",
+ "extends": "abci-base.json",
+ "run_id": "platoon-grpo200-tmax-naive-uniform--Qwen3.5-4B",
+ "gateway": {
+  "rollout_nodes": 3,
+  "walltime": "72:00:00"
+ },
+ "driver": {
+  "where": "gateway",
+  "seed_image_cache": null,
+  "image_cache": "/groups/gai51740/aci18914wh/mho/hpc-sandbox-images"
+ },
+ "train": {
+  "batch_size": 8,
+  "max_training_steps": 200,
+  "max_staleness": 4,
+  "max_concurrent_rollouts": 160,
+  "workflow_config": {
+   "group_size": 32
+  },
+  "group_admission": "informative",
+  "refill": {
+   "max_groups_per_step": 8.0
+  }
+ },
+ "checkpoint": {
+  "every": 50
+ },
+ "export": {
+  "every": 10
+ }
+}

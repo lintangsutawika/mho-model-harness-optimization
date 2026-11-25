@@ -1,0 +1,30 @@
+[project]
+name = "harnessforge"
+version = "0.0.1"
+description = "Optimize agent harnesses and the models that run them: sequentially tested harness search, a persistent model pool, and RL/RSFT training on top of platoon."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []          # the core (records, contracts, statistics) is stdlib-only
+
+[project.optional-dependencies]
+# Evaluation and training through platoon (harbor environments, hpc-sandbox sandboxes, Tinker API)
+platoon = ["platoon[tinker,hpc]>=0.6,<0.7"]
+# Model pool client/launcher helpers
+pool = ["httpx>=0.27"]
+# Probing harness dirs (micro-swe-agent's runtime deps; litellm is stubbed by the probes)
+bench = ["jinja2>=3.1", "pydantic>=2", "pyyaml>=6", "tenacity>=8"]
+# Faster Monte Carlo for `python -m harnessforge.stats.calibrate --backend numpy` (optional)
+calibrate = ["numpy>=1.24"]
+# HF export of disk-delta weight versions (harnessforge.train.export); the miles images ship these
+train = ["numpy>=1.24", "zstandard>=0.22"]
+dev = ["pytest>=8", "harnessforge[bench,train]"]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harnessforge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

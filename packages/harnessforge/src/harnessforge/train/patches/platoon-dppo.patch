@@ -1,0 +1,59 @@
+platoon 0.6.0 + tinker 0.16.1, client side of the dppo loss (harnessforge.train.losses.dppo, registered in the
+trainer through miles-tinker's custom-loss hook as loss_fn "dppo"):
+(a) tinker's LossFnType admits "dppo" (the SDK validates loss_fn against a Literal before sending),
+(b) platoon treats dppo with config keys {divergence, threshold, ratio_cap} as zero for zero advantages (the
+zero-advantage datum filter and the group admission check behave as under ppo),
+(c) platoon logs the loss's per-request sums (forward_backward metrics dppo_*:sum) per microbatch: optim/dppo_masked_frac, optim/dppo_capped_frac,
+optim/dppo_divergence_mean, optim/dppo_tokens.
+Apply after platoon-tito.patch and platoon-tito2.patch, in the site-packages directory that holds platoon/ and tinker/:
+patch -p1 < platoon-dppo.patch
+diff -ruN a/platoon/train/objectives/api.py b/platoon/train/objectives/api.py
+--- a/platoon/train/objectives/api.py
++++ b/platoon/train/objectives/api.py
+@@ -26,6 +26,8 @@
+     Be conservative until their semantics are explicitly supported here.
+     """
+ 
++    if loss_fn == "dppo":  # miles-tinker dppo: -A * mask * min(ratio, cap) * log pi, no other term
++        return not (set(loss_fn_config) - {"divergence", "threshold", "ratio_cap"})
+     return loss_fn in {"cispo", "ppo", "importance_sampling"} and not (
+         set(loss_fn_config) - {"clip_low_threshold", "clip_high_threshold"}
+     )
+diff -ruN a/platoon/train/objectives/policy_gradient.py b/platoon/train/objectives/policy_gradient.py
+--- a/platoon/train/objectives/policy_gradient.py
++++ b/platoon/train/objectives/policy_gradient.py
+@@ -92,7 +92,25 @@
+             metrics["optim/clip_frac_high"] = flat_clipped_high.sum().item() / total_tokens
+             metrics["optim/clip_frac_total"] = (flat_clipped_low | flat_clipped_high).sum().item() / total_tokens
+ 
++    if loss_fn == "dppo":
++        metrics.update(dppo_metrics(getattr(forward_backward_result, "metrics", None) or {}))
++
+     return metrics
++
++
++def dppo_metrics(result_metrics: dict[str, float]) -> dict[str, float]:
++    """miles-tinker's dppo loss reports per-request sums over the tokens it trains (advantage != 0): tokens, masked
++    tokens (outside the divergence trust region and moving away), tokens whose ratio hit the cap, and the summed
++    divergence.  Fractions and the mean divergence over those tokens; nothing if the server sent no stats."""
++    tokens = result_metrics.get("dppo_tokens:sum")
++    if not tokens:
++        return {}
++    return {
++        "optim/dppo_masked_frac": result_metrics.get("dppo_masked_tokens:sum", 0.0) / tokens,
++        "optim/dppo_capped_frac": result_metrics.get("dppo_capped_tokens:sum", 0.0) / tokens,
++        "optim/dppo_divergence_mean": result_metrics.get("dppo_divergence:sum", 0.0) / tokens,
++        "optim/dppo_tokens": float(tokens),
++    }
+ 
+ 
+ class PolicyGradient:
+diff -ruN a/tinker/types/loss_fn_type.py b/tinker/types/loss_fn_type.py
+--- a/tinker/types/loss_fn_type.py
++++ b/tinker/types/loss_fn_type.py
+@@ -8,4 +8,5 @@
+     "ppo",
+     "cispo",
+     "dro",
++    "dppo",  # miles-tinker dppo loss (platoon-dppo.patch)
+ ]

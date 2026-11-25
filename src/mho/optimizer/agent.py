@@ -111,8 +111,10 @@ def _derive_paths(candidate_dir: Path) -> dict[str, Path]:
     # Parent = the frontier-best candidate's harness dir. The baseline (iter 0) never
     # materializes a harness (it is only an eval), so fall back to the base scaffold when the
     # best candidate has no harness yet.
-    parent = (run / "candidates" / best_tag / "harness") if best_tag else Path("")
-    if not parent or not (parent / "pyproject.toml").exists():
+    # No frontier yet (--skip-baseline): best_tag is empty. Never fall back to Path(""): it is
+    # the cwd (the MHO repo, which has a pyproject.toml), not the base scaffold.
+    parent = (run / "candidates" / best_tag / "harness") if best_tag else None
+    if parent is None or not (parent / "pyproject.toml").exists():
         parent = _original_base()
     cand_trials: list[Path] = []
     _tags = sorted((d for d in (run / "candidates").glob("candidate_*") if d.is_dir()),
@@ -193,7 +195,7 @@ def _diff_only_vcs(a: Path, b: Path) -> bool:
     """True if a and b differ ONLY in excluded (VCS/cache) paths -- i.e. no real code change.
     Uses the same filter as the emitted diffs."""
     r = subprocess.run(["git", "diff", "--no-index", "--no-color", str(a), str(b)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, errors="replace")
     return _filter_diff(r.stdout).strip() == ""
 
 
@@ -203,7 +205,7 @@ def _write_diff(a: Path, b: Path, out: Path) -> None:
     error."""
     r = subprocess.run(
         ["git", "diff", "--no-index", "--no-color", str(a), str(b)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, errors="replace",   # staged trial output can hold non-UTF-8 bytes
     )
     if r.returncode > 1:
         print(f"[propose] WARN: git diff {a} {b} failed rc={r.returncode}: {r.stderr[:200]}", file=sys.stderr)

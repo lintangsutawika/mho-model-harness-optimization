@@ -1,0 +1,44 @@
+{
+ "task_000032_a50f9293/0": {
+  "finished": true,
+  "reward": 0.0,
+  "env_failed": false,
+  "error": null,
+  "output_tokens": 5358
+ },
+ "task_000035_1d654148/0": {
+  "finished": true,
+  "reward": 0.0,
+  "env_failed": false,
+  "error": "scored:agent_timeout",
+  "output_tokens": 59893
+ },
+ "task_000035_1d654148/1": {
+  "finished": true,
+  "reward": 0.0,
+  "env_failed": false,
+  "error": "scored:context_overflow",
+  "output_tokens": 37135
+ },
+ "task_000663_dff2c340/0": {
+  "finished": true,
+  "reward": 1.0,
+  "env_failed": false,
+  "error": null,
+  "output_tokens": 19762
+ },
+ "task_004429_adeee318/1": {
+  "finished": true,
+  "reward": 0.0,
+  "env_failed": false,
+  "error": "scored:harness_crash",
+  "output_tokens": 16532
+ },
+ "task_009561_689cbf6c/0": {
+  "finished": false,
+  "reward": null,
+  "env_failed": false,
+  "error": null,
+  "output_tokens": null
+ }
+}

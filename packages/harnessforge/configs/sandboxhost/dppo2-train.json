@@ -1,0 +1,25 @@
+{
+ "_comment": "sbh-dppo2: sandbox hosts of the DPPO mixed4b-all0 run (mixed4b_all0_ext_64kcap_v2_dppo.json), same shape as grpo-train.json (6 rt_HC x 96 pods + 112 local slots on the trainer = 688 >= 640). Deployed on ABCI as ~/hf-dev/train/sandboxhost-dppo2.json (the path the run config names).",
+ "fleet_id": "sbh-dppo2",
+ "state_root": "~/hf-dev/sandboxhosts/state",
+ "hosts": 6,
+ "slots_per_host": 96,
+ "lease_s": 900,
+ "python": "/home/aci18914wh/hf-dev/remote-sandboxes/venv/bin/python",
+ "harnessforge_src": "/home/aci18914wh/hf-dev/train/harnessforge-dppo/src",
+ "provider_options": {
+  "image_cache": "/groups/gai51740/aci18914wh/mho/hpc-sandbox-images",
+  "max_starting": 16,
+  "fakeroot": true,
+  "allow_network_none": true,
+  "sysdeps": "/groups/gai51740/aci18914wh/mho/sysdeps/jammy-harbor-deps-2"
+ },
+ "launcher": {
+  "kind": "pbs",
+  "queue": "R9920261300",
+  "account": "gai51740",
+  "resource_type": "rt_HC",
+  "walltime": "72:00:00",
+  "name_prefix": "hfsbh"
+ }
+}

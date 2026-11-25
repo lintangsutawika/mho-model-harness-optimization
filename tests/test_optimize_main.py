@@ -53,3 +53,29 @@ def test_val_data_is_required(tmp_path):
     with pytest.raises(SystemExit):
         ol.main(["--mode", "harness-only", "--model", "m", "--train-data", str(train),
                  "--val-data", ""])
+
+
+def test_model_flags_configure_the_model_kind(tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeLoop:
+        def __init__(self, args, run_dir, sched, *, kinds, schedule, **kw):
+            seen.update(kind=kinds["model"], schedule=schedule)
+
+        def run(self):
+            pass
+
+    monkeypatch.setattr(ol, "Loop", FakeLoop)
+    monkeypatch.setattr(ol, "RUNS_DIR", tmp_path / "runs")
+    monkeypatch.setattr(ol, "_tee_driver_log", lambda path: None)
+    train = tmp_path / "train"
+    (train / "p0").mkdir(parents=True)
+    ol.main(["--mode", "model-harness", "--harness-proposals", "12", "--model-proposals", "1",
+             "--model", "m",
+             "--train-data", str(train), "--val-data", str(tmp_path / "val"), "--run-name", "w",
+             "--model-source", "sample", "--model-objective", "rsft", "--model-accept", "always",
+             "--model-steps", "20"])
+    k = seen["kind"]
+    assert seen["schedule"] == [("harness", 12), ("model", 1)]
+    assert (k.source, k.objective, k.steps, k.proposes, k.always_accept) == (
+        "sample", "rsft", 20, False, True)

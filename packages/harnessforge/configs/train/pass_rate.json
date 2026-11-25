@@ -1,0 +1,7 @@
+{
+ "_comment": "Variant of naive.json with platoon's experimental pass_rate (Thompson) task sampler. Not to be run before the naive comparison.",
+ "extends": "naive.json",
+ "run_id": "platoon-grpo200-tmax-passrate--Qwen3.5-4B",
+ "train": {"task_sampler": "pass_rate",
+           "task_sampler_options": {"explore": 0.2, "max_draws_per_epoch": 3, "seed": 0}}
+}

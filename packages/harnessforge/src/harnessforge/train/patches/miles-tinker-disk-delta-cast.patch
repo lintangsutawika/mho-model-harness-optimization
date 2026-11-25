@@ -1,0 +1,80 @@
+diff --color -ru a/miles/backends/training_utils/weight_update/protocols/delta.py b/miles/backends/training_utils/weight_update/protocols/delta.py
+--- a/miles/backends/training_utils/weight_update/protocols/delta.py	2026-09-06 22:54:43
++++ b/miles/backends/training_utils/weight_update/protocols/delta.py	2026-11-19 02:29:02
+@@ -23,7 +23,7 @@
+ from miles.backends.training_utils.weight_update.session import check_weight_sync_results
+ from miles.backends.training_utils.weight_update.utils import get_data_replica_rank_and_size
+ from miles.utils import async_utils
+-from miles.utils.disk_delta import NUM_WORKERS, checksum, make_tensor_reader, overwrite_encode
++from miles.utils.disk_delta import NUM_WORKERS, _tensor_locations, checksum, make_tensor_reader, overwrite_encode
+ from miles.utils.distributed_utils import get_gloo_group
+ 
+ logger = logging.getLogger(__name__)
+@@ -59,6 +59,9 @@
+ }
+ 
+ 
++_FLOAT_SAFETENSORS_DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "F16": torch.float16}
++
++
+ def _safetensors_dtype(dtype: torch.dtype) -> str:
+     try:
+         return _SAFETENSORS_DTYPE_BY_TORCH_DTYPE[dtype]
+@@ -88,6 +91,11 @@
+         self.delta_encoding = args.update_weight_delta_encoding
+         self.checksum_algorithm = args.update_weight_delta_checksum
+         self._snapshot: dict[str, np.ndarray] = {}
++        # name -> dtype the checkpoint stores it in, when the trainer emits another float dtype
++        # (Qwen3.5 keeps e.g. linear_attn.norm.weight in F32; Megatron trains it in BF16): such
++        # tensors are cast (losslessly upcast) to the checkpoint's dtype so the raw-byte deltas
++        # apply to the engines' checkpoint files
++        self._cast: dict[str, torch.dtype] = {}
+         self._baseline_captured = False
+         # Post-write hook: object-store-backed shared filesystems lack cross-host
+         # read-after-write consistency, so written files need an explicit step
+@@ -127,6 +135,8 @@
+     def send_bucket(self, bucket: list[tuple[str, torch.Tensor]]) -> None:
+         """Submit each tensor of the bucket to the diff/compress pool (pipelined with the gather)."""
+         for name, tensor in bucket:
++            if name in self._cast:
++                tensor = tensor.to(self._cast[name])
+             flat = tensor.detach().contiguous().view(torch.uint8).reshape(-1)
+             nbytes = int(flat.numel())
+             if self._use_pinned and nbytes <= self._max_bytes:
+@@ -182,10 +192,12 @@
+         dist.barrier(group=get_gloo_group())
+ 
+         read_hf = None
++        ckpt_dtypes: dict[str, str] = {}
+         local_error: ValueError | None = None
+         if self.is_sender:
+             try:
+                 read_hf = make_tensor_reader(self.args.hf_checkpoint)  # index the HF headers once
++                ckpt_dtypes = {k: v[3] for k, v in _tensor_locations(self.args.hf_checkpoint).items()}
+             except ValueError as error:
+                 local_error = error
+ 
+@@ -195,6 +207,11 @@
+             assert read_hf is not None
+             try:
+                 for name, tensor in bucket:
++                    emitted = _safetensors_dtype(tensor.dtype)
++                    stored = ckpt_dtypes.get(name, emitted)
++                    if stored != emitted and stored in _FLOAT_SAFETENSORS_DTYPES and emitted in _FLOAT_SAFETENSORS_DTYPES:
++                        self._cast[name] = _FLOAT_SAFETENSORS_DTYPES[stored]
++                        tensor = tensor.to(self._cast[name])
+                     try:
+                         baseline = read_hf(
+                             name,
+@@ -253,9 +270,10 @@
+                 # TODO: temporarily weaken checkers; should enhance and fix related logics
+                 _update_weight_version_if_unset(self.rollout_engines, "0")
+             logger.info(
+-                "[disk delta] captured baseline snapshot of %d tensors from %s",
++                "[disk delta] captured baseline snapshot of %d tensors from %s (%d cast to the checkpoint dtype)",
+                 len(self._snapshot),
+                 self.args.hf_checkpoint,
++                len(self._cast),
+             )
+         dist.barrier(group=get_gloo_group())
+ 

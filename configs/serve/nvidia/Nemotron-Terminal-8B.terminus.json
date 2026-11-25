@@ -1,0 +1,15 @@
+{
+  "_model": "nvidia/Nemotron-Terminal-8B",
+  "_note": "Serving for harbor's Terminus 2 agent (the harness the model was trained with): plain JSON in the message content, no tool calls. --reasoning-parser qwen3 moves <think>...</think> out of content so the Terminus JSON parser sees only the action. Native ctx 40960 (the paper's standard Qwen3-8B setting).",
+  "extra_args": [
+    "--enable-chunked-prefill",
+    "--max-num-batched-tokens",
+    "32768",
+    "--enable-prefix-caching",
+    "--reasoning-parser",
+    "qwen3"
+  ],
+  "spec_config": null,
+  "max_model_len": 40960,
+  "native_max_context": 40960
+}
