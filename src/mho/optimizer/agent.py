@@ -25,6 +25,14 @@ across iterations; each proposer still emits one output.
                        and also on a context-window-exceeded error. Unset = no condenser.
     OPTIMIZER_CONDENSE_MAX_EVENTS / OPTIMIZER_CONDENSE_KEEP_FIRST   condenser event cap (240) and
                        leading events never summarized (2: system prompt + instructions)
+    OPTIMIZER_LLM_TIMEOUT_S  optional per-call LLM timeout (OpenHands default 300 s; raise it when the
+                       proposer shares a busy self-hosted pool)
+    OPTIMIZER_MAX_ITERATIONS optional agent steps per run (OpenHands default 500)
+    OPTIMIZER_NUDGES   optional: if a session ends (finished, step limit, error) while the candidate
+                       is still unchanged or broken, send up to N follow-up messages telling it to
+                       implement now, and continue the same conversation. Unset/0 = off.
+    OPTIMIZER_STEP_BUDGET    optional: append a working-budget note (about N tool calls; edit early;
+                       read traces instead of re-running task environments) to the instructions.
   out (harness):
     a VALID installable micro-swe-agent snapshot at <RUN>/candidates/<tag>/harness,
     plus two git-format patches in <candidate>/../diff: diff_from_base.patch + diff_from_parent.patch.
@@ -320,10 +328,11 @@ def _env_int(env, name: str) -> int | None:
 
 
 def _llm_limits(env=os.environ) -> dict:
-    """Optional LLM(max_input_tokens=, max_output_tokens=) from the env (unset keys omitted)."""
+    """Optional LLM(max_input_tokens=, max_output_tokens=, timeout=) from the env (unset keys omitted)."""
     out = {}
     for key, name in (("max_input_tokens", "OPTIMIZER_MAX_INPUT_TOKENS"),
-                      ("max_output_tokens", "OPTIMIZER_MAX_OUTPUT_TOKENS")):
+                      ("max_output_tokens", "OPTIMIZER_MAX_OUTPUT_TOKENS"),
+                      ("timeout", "OPTIMIZER_LLM_TIMEOUT_S")):
         n = _env_int(env, name)
         if n is not None:
             out[key] = n
@@ -348,7 +357,31 @@ def _condenser_config(env=os.environ) -> dict | None:
     return {"max_tokens": at, "max_size": max_events, "keep_first": keep_first}
 
 
-def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
+def _budget_note(env=os.environ) -> str:
+    """Working-budget paragraph appended to the instructions when OPTIMIZER_STEP_BUDGET is set."""
+    n = _env_int(env, "OPTIMIZER_STEP_BUDGET")
+    if n is None:
+        return ""
+    return (f"\n\n## Working budget\nYou have about {n} tool calls and a wall-clock limit for this session. "
+            f"Spend at most about {n // 3} on analysis, then make your code change; leave the rest for "
+            "checking it imports and writing CANDIDATE.md. A session that ends with the harness unchanged "
+            "produces nothing. Read the recorded traces and logs instead of re-running task environments "
+            "yourself (no servers, port forwards or long scripts from the tasks): those commands time out "
+            "and use up the session.\n")
+
+
+NUDGE = ("Your session stopped, but {what}. Stop analysing now. Implement your best hypothesis as a code "
+         "change in {where}, check that it still imports, write CANDIDATE.md, then finish. Use the terminal "
+         "and file_editor tools directly (skills are already loaded; do not call invoke_skill through the "
+         "terminal).")
+
+
+def _run_openhands(workspace: Path, instructions: str, skill_dir: Path,
+                   unfinished=None) -> None:
+    """Run one proposer conversation. `unfinished()` -> (what, where) | None says whether the candidate
+    still needs work; with OPTIMIZER_NUDGES > 0 the same conversation is resumed with a nudge that many
+    times. An error in the last attempt is re-raised (as before)."""
+    instructions = instructions + _budget_note()
     # Lazy import: only the actual proposal needs the SDK (env must provide it).
     from openhands.sdk import LLM, Agent, AgentContext, Conversation, LocalWorkspace, Tool
     from openhands.sdk.skills.skill import Skill
@@ -388,9 +421,29 @@ def _run_openhands(workspace: Path, instructions: str, skill_dir: Path) -> None:
     # Operate IN-PLACE on the candidate dir. Passing a bare string coerces OpenHands into a
     # default/isolated workspace, so the agent's edits never touch our dir (candidate == parent).
     # LocalWorkspace(working_dir=...) roots the agent's Terminal/FileEditor tools at our snapshot.
-    conversation = Conversation(agent=agent, workspace=LocalWorkspace(working_dir=str(workspace)))
-    conversation.send_message(instructions)
-    conversation.run()
+    conv_kw = {}
+    max_iter = _env_int(os.environ, "OPTIMIZER_MAX_ITERATIONS")
+    if max_iter is not None:
+        conv_kw["max_iteration_per_run"] = max_iter
+    conversation = Conversation(agent=agent, workspace=LocalWorkspace(working_dir=str(workspace)), **conv_kw)
+    nudges = _env_int(os.environ, "OPTIMIZER_NUDGES") or 0
+    message = instructions
+    for attempt in range(nudges + 1):
+        conversation.send_message(message)
+        err = None
+        try:
+            conversation.run()
+        except Exception as e:  # LLM timeout, context error, ...: the conversation can be resumed
+            err = e
+        todo = unfinished() if (unfinished is not None and attempt < nudges) else None
+        if todo is None:
+            if err is not None:
+                raise err
+            return
+        what, where = todo
+        print(f"[propose] nudge {attempt + 1}/{nudges}: {what}"
+              + (f" (session ended with {type(err).__name__})" if err is not None else ""), flush=True)
+        message = NUDGE.format(what=what, where=where)
 
 
 def _py_files(root: Path) -> list[Path]:
@@ -456,7 +509,17 @@ def main() -> int:
               f"{note.split('Your focus: ')[1].splitlines()[0]}", flush=True)
     if kind == "harness":
         note = target_note(tag) + note
-    _run_openhands(cand_root, _build_instructions(_instructions_md(kind), note), _skill_dir(kind))
+    unfinished = None
+    if kind == "harness":
+        def unfinished():
+            ok, reason = _validate_candidate(harness_dst, parent)
+            if not ok:
+                return f"candidate {tag}'s harness is invalid ({reason})", str(harness_dst)
+            if _diff_only_vcs(parent, harness_dst):
+                return f"candidate {tag}'s harness is still identical to its parent", str(harness_dst)
+            return None
+    _run_openhands(cand_root, _build_instructions(_instructions_md(kind), note), _skill_dir(kind),
+                   unfinished=unfinished)
 
     if kind == "model":
         from mho.optimizer import model_spec
@@ -515,9 +578,16 @@ def _main_joint(cand_root: Path, base: str, tags: list[str]) -> int:
     print(f"[propose] joint session: {len(tags)} candidates {', '.join(tags)} from {parent}",
           flush=True)
     try:
+        def unfinished():
+            left = [t for t, u in zip(tags, units)
+                    if not _validate_candidate(u / "harness", parent)[0] or _diff_only_vcs(parent, u / "harness")]
+            if not left:
+                return None
+            return (f"{len(left)} of {len(tags)} candidates are still unchanged or invalid ({', '.join(left)})",
+                    ", ".join(str(cand_root / t / "harness") for t in left))
         _run_openhands(cand_root, _build_instructions(_instructions_md("harness"),
                                                       joint_note(base, tags)),
-                       _skill_dir("harness"))
+                       _skill_dir("harness"), unfinished=unfinished)
     except Exception as e:   # a crash part way still keeps the candidates already written
         import traceback
         traceback.print_exc()
